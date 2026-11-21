@@ -18,14 +18,12 @@
 //! metric means. Errors are captured the same way the transport captures
 //! them: `Error: <message_with_hint>` with `isError: true`.
 //!
-//! ## Loud degradation for features other lanes are building
+//! ## Loud degradation when a capability is missing
 //!
-//! Master today has no `leindex run` tool (brief §4.4, lane F), no session
-//! dedup on reads (§4.1, lane E), and `leindex_git` mutations are
-//! preview-only (`git_handler.rs` `PLAN_NEXT_HINT`, lane D). Where a task
-//! script reaches for such a feature this arm records
-//! `UNSUPPORTED in this build` as the call result — the task then fails its
-//! success assertion honestly instead of the harness faking a result.
+//! On the integrated roadmap tree every capability the corpus reaches for is
+//! real (lane F's `run`, lane E's session dedup, lane D's git mutations). The
+//! `UNSUPPORTED in this build` marker stays in [`metrics`] so a build that
+//! loses one records it honestly instead of faking a result.
 
 use anyhow::{Context, Result};
 use leindex::cli::ProjectRegistry;

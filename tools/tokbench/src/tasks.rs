@@ -3,11 +3,12 @@
 //! Every task is a scripted sequence of tool calls written the way a
 //! disciplined agent would do it — bounded reads, targeted greps, find-all-
 //! callers-before-edit — NOT a strawman. The success assertion per task is
-//! defined once and applied to both arms identically. Where the LEINDEX arm
-//! needs a feature other lanes are building (brief §4.4 `run` from lane F,
-//! §4.1 session dedup from lane E, §5 git mutations from lane D) the script
-//! records `UNSUPPORTED in this build` and fails the task honestly instead
-//! of faking a result.
+//! defined once and applied to both arms identically. On the integrated tree
+//! every capability a task needs is real: §4.4 `run` (lane F), §4.1 session
+//! dedup (lane E), §5 git mutations (lane D), §3.4/§4.3 multi-file atomic
+//! batch (lane B). The `UNSUPPORTED in this build` marker still exists in
+//! `metrics::TaskMetrics::unsupported` — kept so a future build that loses a
+//! capability degrades LOUDLY instead of faking a result.
 //!
 //! Tasks run against independent materialized copies of the pinned fixture
 //! (one per arm per task) so mutation tasks cannot leak state into each

@@ -41,8 +41,9 @@ pub fn markdown(run: &CorpusRun, counter: &Counter) -> String {
     ));
     out.push_str(
         "Round trips = tool calls; tokens = tool OUTPUT tokens (what the model pays to re-read every turn). \
-Task 3 and task 4 LEINDEX degrade loudly on master (`UNSUPPORTED in this build`) — they need brief \
-§4.4 `run` (lane F) and §5 git mutations (lane D), wired at integration.\n\n",
+Every task runs a REAL LeIndex capability on this build: task 3 through `leindex_manage action=run` \
+(brief §4.4) and task 4 through the git mutation flow (brief §5), so no task degrades to an \
+`UNSUPPORTED` marker.\n\n",
     );
     out.push_str("| task | NATIVE tok | LEINDEX tok | reduction | NATIVE rt | LEINDEX rt | native ok | leindex ok | verdict |\n");
     out.push_str("|---|---:|---:|---:|---:|---:|:---:|:---:|:---:|\n");
