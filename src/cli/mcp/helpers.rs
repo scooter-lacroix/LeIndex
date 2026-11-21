@@ -151,7 +151,7 @@ pub(crate) fn wrap_live_with_meta(result: Value, project_root: &std::path::Path)
 /// the project write lock can neither block the read nor attach its state.
 /// Lane A's `wrap_*` functions are untouched; this is the read-path variant
 /// the SPEC assigns to E.
-pub(crate) fn wrap_read_live_meta(result: Value, project_root: &std::path::Path) -> Value {
+pub(crate) fn wrap_read_live_meta(mut result: Value, project_root: &std::path::Path) -> Value {
     let storage_path = crate::cli::leindex::resolve_existing_storage_path(project_root)
         .unwrap_or_else(|| project_root.join(".leindex"));
     let health = crate::cli::index_freshness::load_health(&storage_path);
@@ -178,10 +178,7 @@ pub(crate) fn wrap_read_live_meta(result: Value, project_root: &std::path::Path)
                 .entry("freshness".to_string())
                 .or_insert_with(|| Value::Object(serde_json::Map::new()));
             if let Some(freshness_obj) = freshness.as_object_mut() {
-                freshness_obj.insert(
-                    "status".to_string(),
-                    Value::String(status_text.to_string()),
-                );
+                freshness_obj.insert("status".to_string(), Value::String(status_text.to_string()));
                 if let Some(generation) = generation {
                     freshness_obj.insert("generation".to_string(), serde_json::json!(generation));
                 }

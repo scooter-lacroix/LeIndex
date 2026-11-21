@@ -52,6 +52,15 @@ fn apply_request_args(args: &Value) -> Result<ApplyRequest, JsonRpcError> {
     }
 }
 
+/// The session key the read ledger records edits under (§4.1): the transport
+/// injects `_session` (the MCP session id); direct CLI calls land under the
+/// process-scoped key, matching how reads record.
+fn session_id_for_ledger(args: &Value) -> &str {
+    args.get("_session")
+        .and_then(Value::as_str)
+        .unwrap_or("__process__")
+}
+
 async fn apply_atomic(
     path: &std::path::Path,
     original: &str,
@@ -748,6 +757,17 @@ tree-sitter parse of every edited file after the write."
                     .collect::<Vec<_>>()
             );
         }
+
+        // §4.1/§6.9 (lane E): a durable edit invalidates this session's
+        // cached reads for the file and is listed by the session-reads
+        // resource. Fire-and-forget: ledger failures can never fail an edit.
+        let edited_primary = plan
+            .files
+            .first()
+            .map(|f| f.canonical_path.clone())
+            .unwrap_or_default();
+        crate::cli::mcp::read_paths::session_ledger()
+            .record_edit(session_id_for_ledger(&args), &edited_primary);
 
         if !pdg_loaded {
             annotate_degraded_pdg(&mut response);

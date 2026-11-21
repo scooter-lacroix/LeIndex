@@ -234,6 +234,20 @@ impl ProjectRwLock {
         }
     }
 
+    /// Try to acquire a read guard without blocking.
+    ///
+    /// Returns `Err` if the lock is already held. Used by read paths (brief
+    /// §3.10) so a live filesystem read never queues behind a background
+    /// reindex holding the write lock: enrichment is skipped, bytes still
+    /// served. Symmetric with [`Self::try_write`].
+    #[allow(clippy::result_unit_err)]
+    pub fn try_read(&self) -> Result<ProjectReadGuard<'_>, ()> {
+        match self.inner.try_lock() {
+            Ok(guard) => Ok(ProjectReadGuard { inner: guard }),
+            Err(_) => Err(()),
+        }
+    }
+
     /// Acquire a write guard for the `LeIndex`.
     ///
     /// Use for operations that mutate the `LeIndex` (e.g. PDG swap, indexing).
