@@ -730,9 +730,25 @@ impl HybridEmbedder {
         Self::TfIdfOnly(embedder)
     }
 
-    /// Create a hybrid embedder with local ONNX neural embeddings via worker
+    /// Create a hybrid embedder with local ONNX neural embeddings via worker.
+    ///
+    /// Gated on the canonical neural kill switch: `LEINDEX_FEATURE_NEURAL_SEARCH`
+    /// off, or `[neural] enabled = false`, must refuse local embedder
+    /// construction the same way the remote ladder refuses under
+    /// `RemoteEmbeddings` off. Without this gate, a daemon client cached by an
+    /// earlier caller re-armed local neural scoring for every later consumer
+    /// of the process — including tests that pinned the flag off — because
+    /// the flag was only consulted at decision sites, never at construction.
     #[cfg(feature = "onnx")]
     pub fn hybrid_local(tfidf: TfIdfEmbedder, neural_weight: Option<f32>) -> Result<Self, String> {
+        if !crate::feature_flags::is_neural_enabled(
+            crate::config::LeIndexConfig::load_cached().neural.enabled,
+        ) {
+            return Err(
+                "neural search disabled (LEINDEX_FEATURE_NEURAL_SEARCH / [neural] enabled)"
+                    .to_string(),
+            );
+        }
         Ok(Self::HybridLocal {
             tfidf,
             neural: EmbeddingClient::new(),

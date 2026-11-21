@@ -1251,6 +1251,12 @@ mod cache;
 
 pub use cache::ConfigGuard;
 
+/// Test-only handle to the process-global config cache sandbox, so tests
+/// outside this module (generation read equivalence, setup routes) can pin
+/// the ambient config the same way the config tests do.
+#[cfg(test)]
+pub(crate) use cache::CacheSandbox;
+
 const V2_CONFIG_TEMPLATE: &str = include_str!("../config.yaml");
 
 pub(crate) fn remove_nulls(value: &mut YamlValue) {

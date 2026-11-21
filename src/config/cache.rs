@@ -290,7 +290,7 @@ impl From<ConfigGuard> for Arc<LeIndexConfig> {
 ///
 /// The caller must hold the config tests' `ENV_LOCK` for as long as this lives.
 #[cfg(test)]
-pub(super) struct CacheSandbox {
+pub(crate) struct CacheSandbox {
     previous: Option<Arc<LeIndexConfig>>,
     previous_stamp: u64,
     previous_probe: Option<Duration>,
@@ -300,7 +300,7 @@ pub(super) struct CacheSandbox {
 #[cfg(test)]
 impl CacheSandbox {
     /// Take ownership of the process-global cache and env state.
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let previous = CACHED_CONFIG
             .write()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -324,7 +324,7 @@ impl CacheSandbox {
 
     /// Reopen the probe throttle so the next `load_cached()` stats the file
     /// instead of short-circuiting on the throttle window.
-    pub(super) fn reopen_throttle(&self) {
+    pub(crate) fn reopen_throttle(&self) {
         set_last_probe(None);
     }
 }

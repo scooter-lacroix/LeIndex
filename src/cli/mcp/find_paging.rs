@@ -14,7 +14,7 @@
 //! * `offset` keeps working unchanged — a caller who prefers explicit
 //!   offsets never needs a token.
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -35,23 +35,26 @@ struct Store {
 struct Entry {
     tool: &'static str,
     args: Value,
+    /// Per-file resume cursors the token replays (`Null` when none).
+    cursors: Value,
     at: Instant,
 }
 
 fn store() -> &'static Mutex<Store> {
-    static STORE: std::sync::LazyLock<Mutex<Store>> =
-        std::sync::LazyLock::new(|| {
-            Mutex::new(Store {
-                order: Vec::new(),
-                entries: HashMap::new(),
-            })
-        });
+    static STORE: std::sync::LazyLock<Mutex<Store>> = std::sync::LazyLock::new(|| {
+        Mutex::new(Store {
+            order: Vec::new(),
+            entries: HashMap::new(),
+        })
+    });
     &STORE
 }
 
 /// The arguments a continuation replays: the original call minus the paging
-/// keys, which the token itself carries.
-const PAGING_KEYS: &[&str] = &["offset", "next_offset", "next"];
+/// keys, which the token itself carries. `resume_cursors` is a paging key
+/// too: the token owns the per-file resume state (§4.2e/§6.8), and a stable
+/// query hash must not churn with it.
+const PAGING_KEYS: &[&str] = &["offset", "next_offset", "next", "resume_cursors"];
 
 fn hash_args(args: &Value) -> u64 {
     use std::collections::hash_map::DefaultHasher;
@@ -79,6 +82,18 @@ fn continuation_args(args: &Value) -> Value {
 /// resumed call replays the query exactly and takes its position only from
 /// the token.
 pub fn issue(tool: &'static str, args: &Value, next_offset: usize) -> String {
+    issue_with_cursors(tool, args, next_offset, &Value::Null)
+}
+
+/// `issue` for hit pages whose stream carries per-file resume cursors
+/// (`SearchOutput::resume`): the token replays them so the next page skips
+/// exactly what earlier pages already delivered, per file.
+pub fn issue_with_cursors(
+    tool: &'static str,
+    args: &Value,
+    next_offset: usize,
+    cursors: &Value,
+) -> String {
     let stored = continuation_args(args);
     if stored.is_null() {
         return String::new();
@@ -99,6 +114,7 @@ pub fn issue(tool: &'static str, args: &Value, next_offset: usize) -> String {
         Entry {
             tool,
             args: stored,
+            cursors: cursors.clone(),
             at: Instant::now(),
         },
     );
@@ -106,12 +122,16 @@ pub fn issue(tool: &'static str, args: &Value, next_offset: usize) -> String {
 }
 
 /// A continuation recovered from a token.
+#[derive(Debug)]
 pub struct Continuation {
     /// The stored arguments (no paging keys); merge the caller's
     /// `project_path` (and any other explicit overrides) over this.
     pub args: Value,
     /// The position the token encodes.
     pub offset: usize,
+    /// Per-file resume cursors the token replays (empty/Null for pages
+    /// whose stream needs none).
+    pub cursors: Value,
 }
 
 /// Resolve a token issued by `tool`. `None` with a reason when the token is
@@ -131,7 +151,8 @@ pub fn resume(tool: &'static str, token: &str) -> Result<Continuation, String> {
     };
     let Some(entry) = guard.entries.get(&hash) else {
         return Err(
-            "next token is stale or from another process; re-send the query with offset".to_string(),
+            "next token is stale or from another process; re-send the query with offset"
+                .to_string(),
         );
     };
     if entry.tool != tool {
@@ -147,23 +168,28 @@ pub fn resume(tool: &'static str, token: &str) -> Result<Continuation, String> {
     Ok(Continuation {
         args: entry.args.clone(),
         offset,
+        cursors: entry.cursors.clone(),
     })
 }
 
 /// Merge a resumed continuation with the caller's arguments: the stored
 /// query wins; the caller's `project_path` (and any other keys they
-/// explicitly sent) overlay it; the position comes from the token.
-pub fn merge(stored: &Value, caller: &Value, offset: usize) -> Value {
+/// explicitly sent) overlay it; the position and the per-file resume
+/// cursors come from the token.
+pub fn merge(stored: &Value, caller: &Value, offset: usize, cursors: &Value) -> Value {
     let mut merged = stored.clone();
     if let (Some(base), Some(over)) = (merged.as_object_mut(), caller.as_object()) {
         for (key, value) in over {
-            if key != "offset" && key != "next" {
+            if key != "offset" && key != "next" && key != "resume_cursors" {
                 base.insert(key.clone(), value.clone());
             }
         }
     }
     if let Some(base) = merged.as_object_mut() {
         base.insert("offset".to_string(), json!(offset));
+        if cursors.is_object() && !cursors.as_object().is_none_or(Map::is_empty) {
+            base.insert("resume_cursors".to_string(), cursors.clone());
+        }
     }
     merged
 }
@@ -200,10 +226,35 @@ mod tests {
     fn test_merge_overlay_keeps_query_and_takes_token_offset() {
         let stored = json!({"pattern": "needle", "case": "smart"});
         let caller = json!({"project_path": "/elsewhere", "offset": 999, "next": "x"});
-        let merged = merge(&stored, &caller, 25);
+        let merged = merge(&stored, &caller, 25, &Value::Null);
         assert_eq!(merged["pattern"], "needle");
         assert_eq!(merged["project_path"], "/elsewhere");
         assert_eq!(merged["offset"], 25);
         assert!(merged.get("next").is_none());
+    }
+
+    #[test]
+    fn test_cursors_round_trip_through_issue_and_merge() {
+        let args = json!({"pattern": "needle", "per_file_cap": 20});
+        let cursors = json!({"0:src/a.rs": 20, "0:src/b.rs": 20});
+        let token = issue_with_cursors("leindex_find", &args, 20, &cursors);
+        let resumed = resume("leindex_find", &token).expect("fresh token resumes");
+        assert_eq!(resumed.cursors, cursors, "the token replays the cursors");
+        let merged = merge(
+            &resumed.args,
+            &json!({"project_path": "/p"}),
+            20,
+            &resumed.cursors,
+        );
+        assert_eq!(
+            merged["resume_cursors"], cursors,
+            "merge injects the token's cursors for the next page"
+        );
+        // Bare `issue` stays cursor-free: pages whose stream needs none
+        // must not grow a stale resume state.
+        let plain = issue("leindex_find", &args, 50);
+        let resumed_plain = resume("leindex_find", &plain).unwrap();
+        let merged_plain = merge(&resumed_plain.args, &json!({}), 50, &resumed_plain.cursors);
+        assert!(merged_plain.get("resume_cursors").is_none());
     }
 }

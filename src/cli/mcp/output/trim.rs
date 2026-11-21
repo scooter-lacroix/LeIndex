@@ -139,6 +139,14 @@ pub(crate) fn trim_search(data: &Value) -> Value {
     if let Some(v) = data.get("has_more") {
         out.insert("has_more".to_string(), v.clone());
     }
+    // §6.8: the continuation token rides with the paging metadata so the
+    // model's follow-up call can pass `next` alone.
+    if let Some(v) = data.get("next_offset") {
+        out.insert("next_offset".to_string(), v.clone());
+    }
+    if let Some(v) = data.get("next") {
+        out.insert("next".to_string(), v.clone());
+    }
     if let Some(v) = data.get("suggestion") {
         out.insert("suggestion".to_string(), v.clone());
     }
@@ -173,6 +181,9 @@ pub(crate) fn trim_structural(data: &Value) -> Value {
         // an allowlist that dropped it made the note the only evidence.
         "stopped_by_deadline",
         "stats",
+        // §6.8: the continuation token rides with the paging metadata.
+        "next_offset",
+        "next",
         "note",
     ] {
         if let Some(v) = data.get(key) {
