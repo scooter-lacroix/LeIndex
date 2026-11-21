@@ -1,7 +1,8 @@
 //! Report rendering: the markdown table for stdout, the JSON report file,
 //! and the gate verdict lines (brief §4.6 / §7 output contract).
 
-use crate::metrics::{task_passes_gate, token_reduction_pct, CorpusRun};
+use crate::metrics::{task_passes_gate, token_reduction_pct};
+use crate::tasks::CorpusRun;
 use crate::tokens::Counter;
 use serde_json::json;
 
@@ -145,6 +146,6 @@ pub fn gate_lines(run: &CorpusRun) -> Vec<String> {
         } else {
             "FAIL — at least one task missing ≥40% token reduction, more round trips, lower success, or UNSUPPORTED in this build"
         }
-    );
+    ));
     lines
 }

@@ -47,7 +47,7 @@ fn measure(m: &mut TaskMetrics, counter: &Counter, mode: Mode, tool: &str, text:
 /// Ground-truth 1-based line of `needle` inside fixture file `path`,
 /// computed from the pinned corpus (never hardcoded).
 pub fn corpus_line_of(path: &str, needle: &str) -> Option<usize> {
-    let (_, content) = SOURCE_FILES.iter().find(|(p, _)| p == path)?;
+    let (_, content) = SOURCE_FILES.iter().find(|(p, _)| *p == path)?;
     Some(content.lines().position(|l| l.contains(needle))? + 1)
 }
 
@@ -55,7 +55,8 @@ pub fn corpus_line_of(path: &str, needle: &str) -> Option<usize> {
 const TOP_P_FIELD_OLD: &str = "    /// Sampling temperature; `None` lets the upstream default apply.\n    pub temperature: Option<f32>,\n}";
 const TOP_P_FIELD_NEW: &str = "    /// Sampling temperature; `None` lets the upstream default apply.\n    pub temperature: Option<f32>,\n    /// Nucleus sampling cap; `None` lets the upstream default apply.\n    pub top_p: Option<f32>,\n}";
 const TOP_P_INIT_OLD: &str = "            temperature: None,\n        }\n    }";
-const TOP_P_INIT_NEW: &str = "            temperature: None,\n            top_p: None,\n        }\n    }";
+const TOP_P_INIT_NEW: &str =
+    "            temperature: None,\n            top_p: None,\n        }\n    }";
 const SERVER_THREAD_OLD: &str = "pub fn build_chat_request(model: &str, prompt: &str) -> ChatCompletionRequestBody {\n    ChatCompletionRequestBody::new(";
 const SERVER_THREAD_NEW: &str = "pub fn build_chat_request(model: &str, prompt: &str) -> ChatCompletionRequestBody {\n    let mut body = ChatCompletionRequestBody::new(";
 const SERVER_THREAD_OLD2: &str = "            content: prompt.to_string(),\n        }],\n    )\n}";
@@ -83,8 +84,8 @@ pub fn task1_native(fixture: &Path, counter: &Counter) -> TaskMetrics {
     match read {
         Ok(text) => {
             measure(&mut m, counter, Mode::Read, "Read", &text);
-            m.success =
-                grep.contains("crates/api/src/lib.rs") && text.contains("ChatCompletionRequestBody");
+            m.success = grep.contains("crates/api/src/lib.rs")
+                && text.contains("ChatCompletionRequestBody");
             if !m.success {
                 m.note = "struct not located+read".into();
             }
@@ -115,7 +116,8 @@ pub fn task1_leindex(
     match lookup {
         Ok(text) => {
             measure(&mut m, counter, Mode::Find, "leindex_symbol_lookup", &text);
-            if text.contains("crates/api/src/lib.rs") && text.contains("ChatCompletionRequestBody") {
+            if text.contains("crates/api/src/lib.rs") && text.contains("ChatCompletionRequestBody")
+            {
                 m.success = true;
                 return m;
             }
@@ -175,8 +177,13 @@ pub fn task2_native(fixture: &Path, counter: &Counter) -> TaskMetrics {
     };
 
     // Find the struct, read it, then edit each site.
-    let Some(grep) = native::grep_content("pub struct ChatCompletionRequestBody", fixture, 0, Some("*.rs"), true)
-    else {
+    let Some(grep) = native::grep_content(
+        "pub struct ChatCompletionRequestBody",
+        fixture,
+        0,
+        Some("*.rs"),
+        true,
+    ) else {
         m.note = crate::leindex_arm::SKIPPED_NO_RG.to_string();
         return m;
     };
@@ -190,9 +197,27 @@ pub fn task2_native(fixture: &Path, counter: &Counter) -> TaskMetrics {
     }
     if !edit(&mut m, counter, &lib, TOP_P_FIELD_OLD, TOP_P_FIELD_NEW)
         || !edit(&mut m, counter, &lib, TOP_P_INIT_OLD, TOP_P_INIT_NEW)
-        || !edit(&mut m, counter, &server, SERVER_THREAD_OLD, SERVER_THREAD_NEW)
-        || !edit(&mut m, counter, &server, SERVER_THREAD_OLD2, SERVER_THREAD_NEW2)
-        || !edit(&mut m, counter, &openai, OPENAI_THREAD_OLD, OPENAI_THREAD_NEW)
+        || !edit(
+            &mut m,
+            counter,
+            &server,
+            SERVER_THREAD_OLD,
+            SERVER_THREAD_NEW,
+        )
+        || !edit(
+            &mut m,
+            counter,
+            &server,
+            SERVER_THREAD_OLD2,
+            SERVER_THREAD_NEW2,
+        )
+        || !edit(
+            &mut m,
+            counter,
+            &openai,
+            OPENAI_THREAD_OLD,
+            OPENAI_THREAD_NEW,
+        )
     {
         return m;
     }
@@ -219,9 +244,21 @@ pub fn task2_leindex(
     let mut m = TaskMetrics::new(2);
     let pp = fixture.display().to_string();
     let lib = fixture.join("crates/api/src/lib.rs").display().to_string();
-    let server = fixture.join("crates/server/src/lib.rs").display().to_string();
-    let openai = fixture.join("crates/provider-openai/src/lib.rs").display().to_string();
-    let mut apply = |m: &mut TaskMetrics, rt: &Runtime, arm: &LeIndexArm, counter: &Counter, path: &str, old: &str, new: &str| {
+    let server = fixture
+        .join("crates/server/src/lib.rs")
+        .display()
+        .to_string();
+    let openai = fixture
+        .join("crates/provider-openai/src/lib.rs")
+        .display()
+        .to_string();
+    let apply = |m: &mut TaskMetrics,
+                 rt: &Runtime,
+                 arm: &LeIndexArm,
+                 counter: &Counter,
+                 path: &str,
+                 old: &str,
+                 new: &str| {
         match arm.call(
             rt,
             "leindex_edit_apply",
@@ -262,12 +299,47 @@ pub fn task2_leindex(
         }
     }
     let pp2 = pp.clone();
-    if !apply(&mut m, rt, arm, counter, &lib, TOP_P_FIELD_OLD, TOP_P_FIELD_NEW)
-        || !apply(&mut m, rt, arm, counter, &lib, TOP_P_INIT_OLD, TOP_P_INIT_NEW)
-        || !apply(&mut m, rt, arm, counter, &server, SERVER_THREAD_OLD, SERVER_THREAD_NEW)
-        || !apply(&mut m, rt, arm, counter, &server, SERVER_THREAD_OLD2, SERVER_THREAD_NEW2)
-        || !apply(&mut m, rt, arm, counter, &openai, OPENAI_THREAD_OLD, OPENAI_THREAD_NEW)
-    {
+    if !apply(
+        &mut m,
+        rt,
+        arm,
+        counter,
+        &lib,
+        TOP_P_FIELD_OLD,
+        TOP_P_FIELD_NEW,
+    ) || !apply(
+        &mut m,
+        rt,
+        arm,
+        counter,
+        &lib,
+        TOP_P_INIT_OLD,
+        TOP_P_INIT_NEW,
+    ) || !apply(
+        &mut m,
+        rt,
+        arm,
+        counter,
+        &server,
+        SERVER_THREAD_OLD,
+        SERVER_THREAD_NEW,
+    ) || !apply(
+        &mut m,
+        rt,
+        arm,
+        counter,
+        &server,
+        SERVER_THREAD_OLD2,
+        SERVER_THREAD_NEW2,
+    ) || !apply(
+        &mut m,
+        rt,
+        arm,
+        counter,
+        &openai,
+        OPENAI_THREAD_OLD,
+        OPENAI_THREAD_NEW,
+    ) {
         return m;
     }
     // Verify with the count output mode.
@@ -330,7 +402,10 @@ pub fn task3_native(fixture: &Path, counter: &Counter) -> TaskMetrics {
                 .and_then(|line| line.parse::<usize>().ok());
             m.success = located == failing_test_line();
             if !m.success {
-                m.note = format!("failing line parsed as {located:?}, want {:?}", failing_test_line());
+                m.note = format!(
+                    "failing line parsed as {located:?}, want {:?}",
+                    failing_test_line()
+                );
             }
         }
         Err(e) => m.note = format!("cargo test failed: {e}"),
@@ -338,13 +413,11 @@ pub fn task3_native(fixture: &Path, counter: &Counter) -> TaskMetrics {
     m
 }
 
-pub fn task3_leindex(counter: &Counter) -> TaskMetrics {
+pub fn task3_leindex() -> TaskMetrics {
     // Master has no `leindex run` tool (brief §4.4). Lane F builds it; the
     // harness degrades loudly instead of shelling out (that would defeat the
     // measurement: the whole point is LeIndex owning test-output reading).
-    let mut m = TaskMetrics::unsupported(3, "leindex run (brief §4.4, lane F)");
-    let _ = counter;
-    m
+    TaskMetrics::unsupported(3, "leindex run (brief §4.4, lane F)")
 }
 
 // ── Task 4: stage and commit specific files ─────────────────────────────────
@@ -359,8 +432,7 @@ pub fn task4_native(fixture: &Path, counter: &Counter) -> TaskMetrics {
     let outbound = fixture.join("crates/server/src/outbound.rs");
     let replace = |path: &Path, old: &str, new: &str| -> Result<String> {
         let content = std::fs::read_to_string(path)?;
-        let replaced = replace_first(&content, old, new)
-            .context("task4 edit anchor not found")?;
+        let replaced = replace_first(&content, old, new).context("task4 edit anchor not found")?;
         std::fs::write(path, &replaced)?;
         Ok(replaced)
     };
@@ -368,11 +440,15 @@ pub fn task4_native(fixture: &Path, counter: &Counter) -> TaskMetrics {
         m.note = format!("setup edit failed: {e}");
         return m;
     }
-    if let Err(e) = replace(&outbound, "/// Send the assembled request body", "/// Send the assembled request body\n/// tokbench staging marker: outbound (must stay unstaged)") {
+    if let Err(e) = replace(
+        &outbound,
+        "/// Send the assembled request body",
+        "/// Send the assembled request body\n/// tokbench staging marker: outbound (must stay unstaged)",
+    ) {
         m.note = format!("setup edit failed: {e}");
         return m;
     }
-    let mut git_step = |m: &mut TaskMetrics, counter: &Counter, args: &[&str]| -> Option<String> {
+    let git_step = |m: &mut TaskMetrics, counter: &Counter, args: &[&str]| -> Option<String> {
         match native::git(args, fixture) {
             Ok(text) => {
                 measure(m, counter, Mode::Git, "git", &text);
@@ -384,16 +460,46 @@ pub fn task4_native(fixture: &Path, counter: &Counter) -> TaskMetrics {
             }
         }
     };
-    let status = git_step(&mut m, counter, &["status", "--short"])?;
-    let _ = status;
-    git_step(&mut m, counter, &["add", "crates/server/src/routes.rs"])?;
-    let commit = git_step(
-        &mut m,
-        counter,
-        &["commit", "-m", "tokbench: stage routes only"],
-    )?;
-    let log = git_step(&mut m, counter, &["log", "--oneline", "-1"])?;
-    let after = git_step(&mut m, counter, &["status", "--short"])?;
+    if git_step(&mut m, counter, &["status", "--short"]).is_none() {
+        return m;
+    }
+    if git_step(&mut m, counter, &["add", "crates/server/src/routes.rs"]).is_none() {
+        return m;
+    }
+    // Pinned commit timestamps, same reason as the fixture's initial commit:
+    // the hash `git log` prints is measured text.
+    let commit = match Command::new("git")
+        .args(["commit", "-m", "tokbench: stage routes only"])
+        .envs([
+            ("GIT_AUTHOR_DATE", "2026-01-01T00:00:01Z"),
+            ("GIT_COMMITTER_DATE", "2026-01-01T00:00:01Z"),
+        ])
+        .current_dir(fixture)
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout).into_owned();
+            measure(&mut m, counter, Mode::Git, "git", &text);
+            text
+        }
+        Ok(output) => {
+            m.note = format!(
+                "git commit failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return m;
+        }
+        Err(e) => {
+            m.note = format!("git commit failed: {e}");
+            return m;
+        }
+    };
+    let Some(log) = git_step(&mut m, counter, &["log", "--oneline", "-1"]) else {
+        return m;
+    };
+    let Some(after) = git_step(&mut m, counter, &["status", "--short"]) else {
+        return m;
+    };
     m.success = log.contains("tokbench: stage routes only")
         && after.contains("outbound.rs")
         && !after.contains("routes.rs")
@@ -412,8 +518,14 @@ pub fn task4_leindex(
 ) -> TaskMetrics {
     let mut m = TaskMetrics::new(4);
     let pp = fixture.display().to_string();
-    let routes = fixture.join("crates/server/src/routes.rs").display().to_string();
-    let outbound = fixture.join("crates/server/src/outbound.rs").display().to_string();
+    let routes = fixture
+        .join("crates/server/src/routes.rs")
+        .display()
+        .to_string();
+    let outbound = fixture
+        .join("crates/server/src/outbound.rs")
+        .display()
+        .to_string();
     // Same two setup edits, through the LeIndex editor.
     for (path, old, new) in [
         (&routes, T4_ROUTES_OLD, T4_ROUTES_NEW),
@@ -435,7 +547,11 @@ pub fn task4_leindex(
             }
         }
     }
-    match arm.call(rt, "leindex_git", json!({ "action": "status", "project_path": pp })) {
+    match arm.call(
+        rt,
+        "leindex_git",
+        json!({ "action": "status", "project_path": pp }),
+    ) {
         Ok(text) => measure(&mut m, counter, Mode::Git, "leindex_git status", &text),
         Err(e) => {
             m.note = format!("git status failed: {e}");
@@ -491,7 +607,11 @@ pub fn task4_leindex(
             return m;
         }
     };
-    let after = match arm.call(rt, "leindex_git", json!({ "action": "status", "project_path": pp })) {
+    let after = match arm.call(
+        rt,
+        "leindex_git",
+        json!({ "action": "status", "project_path": pp }),
+    ) {
         Ok(text) => {
             measure(&mut m, counter, Mode::Git, "leindex_git status", &text);
             text
@@ -519,6 +639,12 @@ const CALLER_FILES: [&str; 4] = [
 
 pub fn task5_native(fixture: &Path, counter: &Counter) -> TaskMetrics {
     let mut m = TaskMetrics::new(5);
+    // Disciplined agent: list the files first, then the exact lines.
+    let Some(files) = native::grep_files("build_chat_request", fixture, true) else {
+        m.note = crate::leindex_arm::SKIPPED_NO_RG.to_string();
+        return m;
+    };
+    measure(&mut m, counter, Mode::Find, "Grep", &files);
     let Some(grep) = native::grep_content("build_chat_request", fixture, 0, Some("*.rs"), true)
     else {
         m.note = crate::leindex_arm::SKIPPED_NO_RG.to_string();
@@ -538,10 +664,7 @@ pub fn task5_native(fixture: &Path, counter: &Counter) -> TaskMetrics {
             }
         }
     }
-    let files_found = CALLER_FILES
-        .iter()
-        .filter(|f| grep.contains(f))
-        .count();
+    let files_found = CALLER_FILES.iter().filter(|f| grep.contains(*f)).count();
     m.success = files_found == CALLER_FILES.len() && grep.lines().count() >= 7;
     if !m.success {
         m.note = format!("callers found in {files_found}/4 files");
@@ -568,10 +691,26 @@ pub fn task5_leindex(
     match lookup {
         Ok(text) => {
             measure(&mut m, counter, Mode::Find, "leindex_symbol_lookup", &text);
-            let files_found = CALLER_FILES.iter().filter(|f| text.contains(*f)).count();
-            m.success = files_found == CALLER_FILES.len();
-            if !m.success {
-                m.note = format!("callers found in {files_found}/4 files");
+            // Disciplined cross-check before editing: the caller graph can
+            // miss qualified-path calls (`crate::build_chat_request`), so a
+            // careful agent sweeps literal references too. Measured as-is.
+            match arm.call(
+                rt,
+                "leindex_find",
+                json!({ "pattern": "build_chat_request", "regex": false, "project_path": fixture.display().to_string() }),
+            ) {
+                Ok(find_text) => {
+                    measure(&mut m, counter, Mode::Find, "leindex_find", &find_text);
+                    let files_found = CALLER_FILES
+                        .iter()
+                        .filter(|f| text.contains(*f) || find_text.contains(*f))
+                        .count();
+                    m.success = files_found == CALLER_FILES.len();
+                    if !m.success {
+                        m.note = format!("callers found in {files_found}/4 files");
+                    }
+                }
+                Err(e) => m.note = format!("find cross-check failed: {e}"),
             }
         }
         Err(e) => m.note = format!("symbol_lookup failed: {e}"),
@@ -581,7 +720,7 @@ pub fn task5_leindex(
 
 // ── Task 6: re-read a region after an edit (dedup case) ─────────────────────
 
-const T6_READ_OFFSET: usize = 20;
+const T6_READ_OFFSET: usize = 14;
 const T6_READ_LIMIT: usize = 12;
 
 pub fn task6_native(fixture: &Path, counter: &Counter) -> TaskMetrics {
@@ -602,11 +741,7 @@ pub fn task6_native(fixture: &Path, counter: &Counter) -> TaskMetrics {
             return m;
         }
     };
-    let replaced = match replace_first(
-        &content,
-        T4_ROUTES_OLD,
-        T4_ROUTES_NEW,
-    ) {
+    let replaced = match replace_first(&content, T4_ROUTES_OLD, T4_ROUTES_NEW) {
         Some(r) => r,
         None => {
             m.note = "edit anchor not found".into();
@@ -640,7 +775,10 @@ pub fn task6_leindex(
 ) -> TaskMetrics {
     let mut m = TaskMetrics::new(6);
     let pp = fixture.display().to_string();
-    let routes = fixture.join("crates/server/src/routes.rs").display().to_string();
+    let routes = fixture
+        .join("crates/server/src/routes.rs")
+        .display()
+        .to_string();
     let read_args = json!({
         "file_path": routes,
         "start_line": T6_READ_OFFSET,
@@ -752,18 +890,34 @@ pub fn task7_leindex(
 
 // ── shared parsing helpers ──────────────────────────────────────────────────
 
-/// Parse ripgrep `count` output ("N:path") into (total lines, distinct files).
-/// LeIndex `output=count` reuses the same shape, so one parser serves both.
+/// Parse verification counts from either arm:
+/// - ripgrep `count` output: `N:path` lines → (sum of N, number of files);
+/// - LeIndex `leindex_find output=count`: a JSON payload with
+///   `total_matches` / `total_files` (the structured tier is returned
+///   verbatim for count mode) → read the fields directly.
 pub fn parse_count_output(text: &str) -> (usize, usize) {
+    let trimmed = text.trim();
+    if trimmed.starts_with('{') {
+        if let Ok(data) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let (Some(m), Some(f)) = (
+                data.get("total_matches").and_then(|v| v.as_u64()),
+                data.get("total_files").and_then(|v| v.as_u64()),
+            ) {
+                return (m as usize, f as usize);
+            }
+        }
+    }
     let mut lines = 0usize;
     let mut files = 0usize;
-    for l in text.lines() {
+    for l in trimmed.lines() {
         let l = l.trim();
         if l.is_empty() {
             continue;
         }
-        if let Some((count, _path)) = l.split_once(':') {
-            if let Ok(n) = count.trim().parse::<usize>() {
+        // rg count lines are `path:count` — the count is after the LAST
+        // colon (paths may not contain one, but don't rely on it).
+        if let Some(idx) = l.rfind(':') {
+            if let Ok(n) = l[idx + 1..].trim().parse::<usize>() {
                 lines += n;
                 files += 1;
                 continue;
@@ -777,10 +931,14 @@ pub fn parse_count_output(text: &str) -> (usize, usize) {
 }
 
 /// Heuristic: does this response say zero matches? Covers the bare
-/// "0 match(es)" family and empty output.
+/// "0 match(es)" family, empty output, and the JSON payload form
+/// (`"total_matches": 0`) that `leindex_find` returns for zero results.
 pub fn has_no_matches(text: &str) -> bool {
     let t = text.trim();
     if t.is_empty() {
+        return true;
+    }
+    if t.contains("\"total_matches\": 0") || t.contains("\"total_matches\":0") {
         return true;
     }
     t.starts_with('0')
@@ -809,12 +967,29 @@ pub struct CorpusRun {
 
 /// Run all 7 tasks for both arms. Each (task, arm) pair gets a fresh
 /// materialized fixture copy.
+///
+/// The scratch root is FIXED, down to the path text: fixture paths appear
+/// verbatim in measured tool output (git status lines, LeIndex file
+/// headers, rg result lines), so a random or PID-suffixed root would change
+/// every path-bearing text between runs and jitter token counts. The root
+/// is swept on entry and exit; the harness is a serial dev tool and does
+/// not support concurrent invocations.
 pub fn run_all(rt: &Runtime, counter: &Counter) -> Result<CorpusRun> {
-    let scratch = tempfile::TempDir::new().context("tokbench scratch dir")?;
+    let scratch_dir = std::env::temp_dir().join("tokbench-scratch");
+    let _ = std::fs::remove_dir_all(&scratch_dir);
+    std::fs::create_dir_all(&scratch_dir).context("tokbench scratch dir")?;
+    let run = run_all_in(&scratch_dir, rt, counter);
+    // Clean up even when a task returns Err; best-effort on the sweep.
+    let _ = std::fs::remove_dir_all(&scratch_dir);
+    run
+}
+
+/// Body of [`run_all`] against an explicit scratch root.
+fn run_all_in(scratch: &Path, rt: &Runtime, counter: &Counter) -> Result<CorpusRun> {
     let mut tasks = Vec::new();
 
     for task in 1..=7 {
-        let native_fixture = scratch.path().join(format!("t{task}-native"));
+        let native_fixture = scratch.join(format!("t{task}-native"));
         std::fs::create_dir_all(&native_fixture)?;
         corpus::materialize(&native_fixture)?;
         let native_metrics = match task {
@@ -829,9 +1004,15 @@ pub fn run_all(rt: &Runtime, counter: &Counter) -> Result<CorpusRun> {
 
         // Task 3 LEINDEX needs no fixture (unsupported before any call).
         let leindex_metrics = if task == 3 {
-            task3_leindex(counter)
+            task3_leindex()
         } else {
-            let fixture = scratch.path().join(format!("t{task}-leindex"));
+            // Sweep the scratch root between arms: indexing the previous
+            // arm's fixture persists per-project state (generation counter,
+            // freshness) under `<fixture>/.leindex`, which would otherwise
+            // leak run-to-run drift into the next arm's measured text.
+            let _ = std::fs::remove_dir_all(scratch);
+            std::fs::create_dir_all(scratch)?;
+            let fixture = scratch.join(format!("t{task}-leindex"));
             std::fs::create_dir_all(&fixture)?;
             corpus::materialize(&fixture)?;
             let arm = LeIndexArm::new();

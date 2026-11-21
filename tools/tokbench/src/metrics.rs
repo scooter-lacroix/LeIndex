@@ -9,26 +9,6 @@ use crate::leindex_arm::UNSUPPORTED_IN_THIS_BUILD;
 use serde::Serialize;
 use std::collections::BTreeMap;
 
-/// Which arm produced a record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Arm {
-    /// Claude Code native tools, emulated byte-faithfully.
-    Native,
-    /// LeIndex MCP handlers, in-process, model-visible text.
-    LeIndex,
-}
-
-impl Arm {
-    /// Column label.
-    pub fn label(self) -> &'static str {
-        match self {
-            Arm::Native => "NATIVE",
-            Arm::LeIndex => "LEINDEX",
-        }
-    }
-}
-
 /// The tool mode of a call (brief §4.6 per-mode token share).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -105,10 +85,7 @@ impl TaskMetrics {
     pub fn record(&mut self, call: &Call) {
         self.tokens += call.tokens;
         self.round_trips += 1;
-        *self
-            .by_mode
-            .entry(call.mode.key().to_string())
-            .or_default() += call.tokens;
+        *self.by_mode.entry(call.mode.key().to_string()).or_default() += call.tokens;
     }
 
     /// Mark the task unsupported in this build (loud, never faked). The

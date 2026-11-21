@@ -250,3 +250,94 @@ The following corrections were applied after the full source code review:
 - **impact_analysis**: The `depth` parameter is now functional. Previous measurements
   used unbounded traversal; bounded traversal may return fewer results for deeply
   nested dependency chains, slightly reducing response token counts.
+
+---
+
+## Reproducible benchmark: `cargo xtask tokbench` (2026-11-20 baseline)
+
+The tables above are analyst estimates. This section documents the **deterministic,
+reproducible harness** that replaces them over time: `tokbench` (crates:
+`tools/tokbench`) replays a pinned 7-task corpus (roadmap brief §4.6) against two
+arms and counts **real tokenizer output tokens** — not estimates.
+
+### How to run
+
+```bash
+cargo xtask tokbench                 # markdown table to stdout + JSON report
+cargo xtask tokbench -- --output /tmp/tokbench.json     # with JSON report
+cargo xtask tokbench gate            # exits non-zero unless every task has
+                                     # ≥40% fewer tokens, ≤ round trips, and
+                                     # equal success (not wired into CI)
+```
+
+The harness is fully offline: the fixture workspace is GENERATED from an embedded
+const (pinned by sha256 `corpus_hash`, reported in every run), the NATIVE arm
+shells out to the real `rg`/`git`/`cargo` binaries, and the LEINDEX arm calls the
+real MCP tool handlers in-process through `handle_tool_call` — the exact
+transport dispatch path (router resolution, payload trimming,
+`render_tool_output_plain`), so the captured text is what the model would see on
+the wire. Format sources for every NATIVE emulation (Read `cat -n` rendering,
+ripgrep modes, Edit message, git CLI) are documented in
+`tools/tokbench/src/native.rs`.
+
+### What is measured
+
+- **Tool-output tokens** per call, counted with the LeIndex embedder
+  `tokenizer.json` (the real BPE tokenizer already in the workspace lockfile).
+  If the tokenizer file is absent the harness falls back to chars/4 and labels
+  every number `ESTIMATE` in the report header — it never presents an estimate
+  as tokenizer-derived. Both arms always use the same counter.
+- **Round trips**: number of tool calls (the session-cost driver).
+- **Success**: a scripted correctness assertion per task, applied identically
+  to both arms (e.g. "the commit exists and only the right file is staged").
+- **Per-mode token share** (read / find / edit / git / run) per arm.
+
+### Determinism
+
+Six of the seven tasks reproduce byte-identical JSON across consecutive runs.
+The harness pins everything that leaks into measured text: rg runs with
+`--sort=path`, fixture commits use fixed git timestamps (the commit hash lands
+in `git log` output), and the scratch root is stable instead of a random
+tempdir (fixture paths appear in git status and LeIndex file headers). The
+residual variance is ±0.1% on task 4's git-mode text: LeIndex responses embed
+live timing fields (e.g. `stats.millis` in find payloads) that vary run to
+run. Token counts are counted over the exact wire text — the harness never
+normalizes or strips measured output to look more deterministic.
+
+### Master baseline (2026-11-20, corpus `4641bb306a…`, real tokens)
+
+| task | NATIVE tok | LEINDEX tok | reduction | NATIVE rt | LEINDEX rt | both ok | verdict |
+|---|---:|---:|---:|---:|---:|:---:|:---:|
+| 1 find+read request builder | 453 | 227 | **49.9%** | 2 | 1 | ✓ | PASS |
+| 2 add field through 3 sites | 565 | 2012 | 0.0% | 8 | 8 | ✓ | FAIL |
+| 3 read failing test output | 254 | — | — | 1 | 0 | leindex UNSUPPORTED | FAIL |
+| 4 stage+commit specific files | 61 | — | — | 5 | 4 | leindex UNSUPPORTED | FAIL |
+| 5 find every caller first | 753 | 562 | 25.4% | 4 | 2 | ✓ | FAIL |
+| 6 re-read region after edit | 302 | 771 | 0.0% | 3 | 3 | ✓ | FAIL |
+| 7 zero-result regex-lookalike | 72 | 240 | 0.0% | 2 | 2 | ✓ | FAIL |
+| **total** | **2460** | **4722** | — | **25** | **20** | | |
+
+Per-mode share (NATIVE → LEINDEX): read 1472→1166 (−20.8%), find 631→1392,
+edit 42→1761, git 61→403, run 254→0.
+
+### Reading the baseline honestly
+
+- **Task 1 passes the gate today**: one `leindex_symbol_lookup` replaces
+  grep+read at half the tokens and half the round trips.
+- **Task 5 fails on the gate, not correctness**: the caller graph + literal
+  cross-check found all 4 caller files at 25.4% reduction — real, but under the
+  40% threshold. The literal find is needed because the master caller graph
+  misses `crate::`-qualified calls.
+- **Tasks 2/6/7 are real master findings, not harness artifacts**: the edit-apply
+  success message echoes a ~13-line "Surrounding region" per edit (5 edits in
+  task 2 → 1761 edit-mode tokens vs 42 for Claude Code's short message), the
+  re-read resends the full region without lane E's session dedup, and a
+  zero-result search returns a JSON envelope (~3× the tokens of rg's empty
+  output). These are exactly the costs lanes D/E/F and the wire-format work are
+  targeting; the baseline is the number to beat.
+- **Tasks 3/4 degrade loudly by design**: master has no `leindex run` tool
+  (brief §4.4, lane F) and `leindex_git` mutations are preview-only (brief §5,
+  lane D). The harness marks them `UNSUPPORTED in this build` and fails the
+  gate for those tasks rather than faking a result. They turn green when those
+  lanes land and the corpus is re-run on the integration branch.
+

@@ -35,7 +35,9 @@ impl Counter {
     /// Build the counter from the default search paths.
     pub fn load() -> Self {
         match candidate_tokenizer_paths().into_iter().find_map(|path| {
-            tokenizers::Tokenizer::from_file(&path).ok().map(|t| (path, t))
+            tokenizers::Tokenizer::from_file(&path)
+                .ok()
+                .map(|t| (path, t))
         }) {
             Some((_path, tokenizer)) => Self {
                 kind: TokenCounter::Tokenizer,
@@ -56,9 +58,7 @@ impl Counter {
     /// Human-readable provenance for report headers.
     pub fn provenance(&self) -> &'static str {
         match self.kind {
-            TokenCounter::Tokenizer => {
-                "real tokens (LeIndex embedder tokenizer.json)"
-            }
+            TokenCounter::Tokenizer => "real tokens (LeIndex embedder tokenizer.json)",
             TokenCounter::Estimate => "ESTIMATE chars/4 (tokenizer.json not found)",
         }
     }
@@ -83,13 +83,18 @@ fn candidate_tokenizer_paths() -> Vec<PathBuf> {
     let Some(home) = std::env::var_os("HOME") else {
         return Vec::new();
     };
-    vec![PathBuf::from(home)
-        .join(".leindex")
-        .join("models")
-        .join("tokenizer.json")]
+    vec![
+        PathBuf::from(home)
+            .join(".leindex")
+            .join("models")
+            .join("tokenizer.json"),
+    ]
 }
 
 /// The house estimate: ceil(chars / 4), matching `headtohead.py`'s W6 model.
+/// Only reachable when the tokenizer file is absent (Counter falls back) or
+/// a tokenizer encode errors; tests exercise it directly.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn estimate_tokens(text: &str) -> usize {
     text.chars().count().div_ceil(4)
 }

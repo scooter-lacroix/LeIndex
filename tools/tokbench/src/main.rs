@@ -34,34 +34,29 @@ use std::path::PathBuf;
     about = "Deterministic offline benchmark: LeIndex vs Claude Code native tools"
 )]
 struct Args {
+    /// Path to write the JSON report to (accepted before or after the
+    /// subcommand; honored by both `run` and `gate`).
+    #[arg(long, global = true)]
+    output: Option<PathBuf>,
+    /// Defaults to `run` when omitted.
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Run the full 7-task corpus on both arms, print the markdown table,
     /// optionally write the JSON report.
-    Run {
-        /// Path to write the JSON report to.
-        #[arg(long)]
-        output: Option<PathBuf>,
-    },
+    Run,
     /// Same run, plus gate verdicts; exits non-zero unless every task has
     /// ≥40% fewer tool-output tokens, ≤ round trips and equal success.
-    Gate {
-        /// Path to write the JSON report to.
-        #[arg(long)]
-        output: Option<PathBuf>,
-    },
+    Gate,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let (gate_mode, output) = match args.command {
-        Commands::Run { output } => (false, output),
-        Commands::Gate { output } => (true, output),
-    };
+    let output = args.output;
+    let gate_mode = matches!(args.command, Some(Commands::Gate));
 
     let counter = tokens::Counter::load();
     eprintln!("tokbench: token counter: {}", counter.provenance());
@@ -93,9 +88,10 @@ fn main() -> Result<()> {
         for line in report::gate_lines(&run) {
             eprintln!("{line}");
         }
-        let all_pass = run.tasks.iter().all(|(n, l)| {
-            metrics::task_passes_gate(n, l)
-        });
+        let all_pass = run
+            .tasks
+            .iter()
+            .all(|(n, l)| metrics::task_passes_gate(n, l));
         if !all_pass {
             anyhow::bail!("tokbench gate FAILED");
         }

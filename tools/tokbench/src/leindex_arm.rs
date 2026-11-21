@@ -32,7 +32,6 @@ use leindex::cli::ProjectRegistry;
 use leindex::cli::mcp::handlers::{ToolHandler, all_tool_handlers};
 use leindex::cli::mcp::protocol::JsonRpcRequest;
 use serde_json::{Value, json};
-use std::path::Path;
 use std::sync::Arc;
 
 /// Marker recorded when a task step needs a capability master does not have.
@@ -74,12 +73,7 @@ impl LeIndexArm {
     /// `tool` uses the canonical handler name (`leindex_find`, …) or a router
     /// name (`leindex_git`) with `mode`/`action` in `args` — routing and
     /// normalization happen inside `handle_tool_call`, identical to the wire.
-    pub fn call(
-        &self,
-        rt: &tokio::runtime::Runtime,
-        tool: &str,
-        args: Value,
-    ) -> Result<String> {
+    pub fn call(&self, rt: &tokio::runtime::Runtime, tool: &str, args: Value) -> Result<String> {
         let request: JsonRpcRequest = serde_json::from_value(json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -109,36 +103,6 @@ fn text_of_response(response: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
-}
-
-/// Extract a JSON pointer-ish field out of a handler response. The wire text
-/// is rendered prose; scripts that need a structured field (a preview token,
-/// a commit hash) must get it from the handler `Value` the way the transport
-/// sees it, so this re-runs the response through the same JSON the transport
-/// received. Returns `None` when the field is absent.
-pub fn response_field(response_text: &str, key: &str) -> Option<String> {
-    // Rendered responses embed values inline; scripts only rely on fields
-    // that appear verbatim in the text (hashes, tokens).
-    for line in response_text.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed
-            .strip_prefix(key)
-            .and_then(|rest| rest.strip_prefix(':'))
-        {
-            return Some(rest.trim().trim_matches('`').to_string());
-        }
-        // `key: value` with the key mid-line (e.g. "preview_token: abc")
-        if let Some(idx) = trimmed.find(&format!("{key}:")) {
-            let rest = trimmed[idx + key.len() + 1..].trim();
-            return Some(rest.trim_matches('`').to_string());
-        }
-    }
-    None
-}
-
-/// Absolute path of a fixture file, as the tools expect it.
-pub fn fixture_path(fixture: &Path, relative: &str) -> String {
-    fixture.join(relative).display().to_string()
 }
 
 #[cfg(test)]

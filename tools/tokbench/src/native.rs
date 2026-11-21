@@ -11,11 +11,11 @@
 //! - **Grep** (`grep_content`/`grep_files`/`grep_count`): Claude Code's Grep
 //!   shells out to ripgrep and returns its text verbatim — content mode with
 //!   `-n` line numbers, `-C N` context, `--color=never --no-heading -S`
-//!   (smart case), plus the `files_with_matches` (`-l`) and `count` (`-c`)
-//!   output modes; `-F` for literal-pattern searches. Ripgrep is invoked FOR
-//!   REAL. When `rg` is not installed these functions return `None` and
-//!   callers must skip the call loudly (`rg not available — skipped`),
-//!   never fabricate output.
+//!   (smart case) and `--sort=path` (deterministic order), plus the
+//!   `files_with_matches` (`-l`) and `count` (`-c`) output modes; `-F` for
+//!   literal-pattern searches. Ripgrep is invoked FOR REAL. When `rg` is not
+//!   installed these functions return `None` and callers must skip the call
+//!   loudly (`rg not available — skipped`), never fabricate output.
 //! - **Edit** (`edit_message`): Claude Code's Edit returns a short success
 //!   message; the emulated string mirrors its shape. The file mutation is
 //!   performed for real by the task runner; only the message is emulated.
@@ -27,7 +27,7 @@
 //! explicit offset/limit are the model-visible behaviors, and `rg`/`git`
 //! are invoked exactly as Claude Code would invoke them.
 
-use std::io::Write;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::process::Command;
 
@@ -43,7 +43,7 @@ pub fn read_lines(
     let max_lines = limit.unwrap_or(2000);
     let mut out = String::new();
     for (idx, line) in content.lines().enumerate().skip(start - 1).take(max_lines) {
-        let _ = write!(out, "{:>6}\t{}\n", idx + 1, line);
+        let _ = writeln!(out, "{:>6}\t{}", idx + 1, line);
     }
     Ok(out)
 }
@@ -58,7 +58,11 @@ pub fn grep_content(
     fixed_strings: bool,
 ) -> Option<String> {
     let mut cmd = rg_command()?;
-    cmd.arg(pattern)
+    // --sort=path pins output line order: rg's default walk order is
+    // filesystem-dependent, which would leak nondeterminism into token
+    // counts. Claude Code's Grep accepts the same flag.
+    cmd.arg("--sort=path")
+        .arg(pattern)
         .arg("-n")
         .arg("--color=never")
         .arg("--no-heading")
@@ -79,7 +83,11 @@ pub fn grep_content(
 /// Claude Code `Grep`, `output_mode: "files_with_matches"` — real ripgrep.
 pub fn grep_files(pattern: &str, root: &Path, fixed_strings: bool) -> Option<String> {
     let mut cmd = rg_command()?;
-    cmd.arg(pattern).arg("-l").arg("--color=never").arg("-S");
+    cmd.arg("--sort=path")
+        .arg(pattern)
+        .arg("-l")
+        .arg("--color=never")
+        .arg("-S");
     if fixed_strings {
         cmd.arg("-F");
     }
@@ -90,7 +98,11 @@ pub fn grep_files(pattern: &str, root: &Path, fixed_strings: bool) -> Option<Str
 /// Claude Code `Grep`, `output_mode: "count"` — real ripgrep.
 pub fn grep_count(pattern: &str, root: &Path, fixed_strings: bool) -> Option<String> {
     let mut cmd = rg_command()?;
-    cmd.arg(pattern).arg("-c").arg("--color=never").arg("-S");
+    cmd.arg("--sort=path")
+        .arg(pattern)
+        .arg("-c")
+        .arg("--color=never")
+        .arg("-S");
     if fixed_strings {
         cmd.arg("-F");
     }

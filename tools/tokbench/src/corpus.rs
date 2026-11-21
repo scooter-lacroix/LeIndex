@@ -45,10 +45,7 @@ license = "MIT"
 debug = 0
 "####,
     ),
-    (
-        ".gitignore",
-        "/target\n/.leindex\n",
-    ),
+    (".gitignore", "/target\n/.leindex\n"),
     (
         "README.md",
         "# tokbench fixture gateway\n\nA small LLM gateway workspace used by the tokbench task corpus. Provider\nrequest bodies are assembled in `crates/api`, mapped from internal requests\nby `crates/server`, and dispatched per provider.\n",
@@ -411,6 +408,11 @@ pub fn materialize(dest: &Path) -> Result<()> {
         let output = std::process::Command::new("git")
             .args(args)
             .current_dir(dest)
+            // Fixed commit timestamps: the commit hash appears in measured
+            // git output, so a wall-clock hash would jitter token counts
+            // between runs and break report determinism.
+            .env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z")
             .output()
             .context("git init fixture")?;
         anyhow::ensure!(
