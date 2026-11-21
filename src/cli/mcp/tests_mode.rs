@@ -26,6 +26,9 @@ use crate::graph::pdg::{Node, ProgramDependenceGraph};
 /// Upper bound on transitive caller levels.
 const MAX_CALL_DEPTH: usize = 5;
 
+/// Hard cap on reported test targets; overflow is disclosed, not silent.
+pub(crate) const MAX_TEST_TARGETS: usize = 50;
+
 /// A test that exercises the target symbol.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TestTarget {
@@ -118,9 +121,7 @@ fn cargo_package(file: &str) -> Option<String> {
                     in_package = trimmed == "[package]";
                     continue;
                 }
-                if in_package
-                    && let Some(rest) = trimmed.strip_prefix("name")
-                {
+                if in_package && let Some(rest) = trimmed.strip_prefix("name") {
                     let rest = rest.trim_start().strip_prefix('=')?.trim();
                     let name = rest.trim_matches('"');
                     if !name.is_empty() {
@@ -200,7 +201,10 @@ fn command_for(
         Some(TestRunner::Jest) => format!("npx jest {} -t {}", file, node.name),
         None => {
             let at = line.map_or_else(|| "?".to_string(), |l| l.to_string());
-            format!("(no runner known for {} files) read {}:{}", node.language, file, at)
+            format!(
+                "(no runner known for {} files) read {}:{}",
+                node.language, file, at
+            )
         }
     }
 }
@@ -212,7 +216,7 @@ fn callers_by_depth(
     node_id: crate::graph::pdg::NodeId,
     max_depth: usize,
 ) -> Vec<(crate::graph::pdg::NodeId, usize)> {
-    let max_depth = max_depth.min(MAX_CALL_DEPTH).max(1);
+    let max_depth = max_depth.clamp(1, MAX_CALL_DEPTH);
     let mut visited = HashSet::new();
     let mut out = Vec::new();
     let mut frontier = vec![node_id];
@@ -331,18 +335,20 @@ pub(crate) fn tests_for(
             continue;
         };
         let source = cache.file_source(node);
-        let Some(evidence) =
-            classify_test(node, source.as_ref().map(|src| src.text.as_str()))
+        let Some(evidence) = classify_test(node, source.as_ref().map(|src| src.text.as_str()))
         else {
             continue;
         };
         let line = source.as_ref().and_then(|src| {
             src.tree.as_ref().and_then(|tree| {
-                crate::cli::mcp::call_sites::node_for_range(tree.root_node(), node.byte_range)
-                    .map(|fn_node| 1 + src.text.as_bytes()[..fn_node.start_byte()]
-                        .iter()
-                        .filter(|b| **b == b'\n')
-                        .count())
+                crate::cli::mcp::call_sites::node_for_range(tree.root_node(), node.byte_range).map(
+                    |fn_node| {
+                        1 + src.text.as_bytes()[..fn_node.start_byte()]
+                            .iter()
+                            .filter(|b| **b == b'\n')
+                            .count()
+                    },
+                )
             })
         });
         let command = command_for(node, line, source.as_deref());
@@ -375,9 +381,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_unit_test_command_is_exact_with_module_path() {
-        let source = "mod inner {\n    #[cfg(test)]\n    mod tests {\n        #[test]\n        fn test_x() {\n            assert!(true);\n        }\n    }\n}\n";
+    /// A real tempdir manifest, so `cargo_package`'s nearest-ancestor walk has
+    /// something true to find — the command must carry the real crate name.
+    fn manifest_dir(name: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("src dir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n"),
+        )
+        .expect("manifest");
+        dir
+    }
+
+    fn parse_rust(source: &str) -> crate::cli::mcp::call_sites::FileSource {
         let mut parser = tree_sitter::Parser::new();
         parser
             .set_language(
@@ -387,13 +404,24 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let tree = parser.parse(source, None).unwrap();
-        let src = crate::cli::mcp::call_sites::FileSource {
+        crate::cli::mcp::call_sites::FileSource {
             text: source.to_string(),
-            tree: Some(tree),
-        };
+            tree: parser.parse(source, None),
+        }
+    }
+
+    #[test]
+    fn test_unit_test_command_is_exact_with_module_path() {
+        let dir = manifest_dir("proj");
+        let source = "mod inner {\n    #[cfg(test)]\n    mod tests {\n        #[test]\n        fn test_x() {\n            assert!(true);\n        }\n    }\n}\n";
+        let src = parse_rust(source);
         let byte_range = (source.find("fn test_x").unwrap(), source.len());
-        let test_fn = node("test_x", "/proj/src/inner.rs", "rust", byte_range);
+        let test_fn = node(
+            "test_x",
+            &dir.path().join("src/inner.rs").display().to_string(),
+            "rust",
+            byte_range,
+        );
         let cmd = command_for(&test_fn, Some(5), Some(&src));
         assert_eq!(
             cmd, "cargo test -p proj --lib inner::tests::test_x -- --exact",
@@ -403,23 +431,16 @@ mod tests {
 
     #[test]
     fn test_root_level_unit_test_has_no_module_prefix() {
+        let dir = manifest_dir("proj");
         let source = "#[test]\nfn test_root() {\n    assert!(true);\n}\n";
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(
-                &crate::parse::grammar::LanguageId::from_extension("rs")
-                    .unwrap()
-                    .from_cache()
-                    .unwrap(),
-            )
-            .unwrap();
-        let tree = parser.parse(source, None).unwrap();
-        let src = crate::cli::mcp::call_sites::FileSource {
-            text: source.to_string(),
-            tree: Some(tree),
-        };
+        let src = parse_rust(source);
         let byte_range = (source.find("fn test_root").unwrap(), source.len());
-        let test_fn = node("test_root", "/proj/src/lib.rs", "rust", byte_range);
+        let test_fn = node(
+            "test_root",
+            &dir.path().join("src/lib.rs").display().to_string(),
+            "rust",
+            byte_range,
+        );
         let cmd = command_for(&test_fn, Some(2), Some(&src));
         assert_eq!(
             cmd, "cargo test -p proj --lib test_root -- --exact",
@@ -429,19 +450,38 @@ mod tests {
 
     #[test]
     fn test_integration_test_command_uses_test_target() {
-        let test_fn = node("test_api", "/proj/tests/api_test.rs", "rust", (0, 1));
+        let dir = manifest_dir("proj");
+        let test_fn = node(
+            "test_api",
+            &dir.path().join("tests/api_test.rs").display().to_string(),
+            "rust",
+            (0, 1),
+        );
         let cmd = command_for(&test_fn, None, None);
-        assert_eq!(cmd, "cargo test -p proj --test api_test test_api", "cmd: {cmd}");
+        assert_eq!(
+            cmd, "cargo test -p proj --test api_test test_api",
+            "cmd: {cmd}"
+        );
     }
 
     #[test]
     fn test_pytest_and_jest_commands() {
-        let py = node("test_round_trip", "/proj/tests/core_test.py", "python", (0, 1));
+        let py = node(
+            "test_round_trip",
+            "/proj/tests/core_test.py",
+            "python",
+            (0, 1),
+        );
         assert_eq!(
             command_for(&py, Some(12), None),
             "pytest /proj/tests/core_test.py::test_round_trip or /proj/tests/core_test.py:12"
         );
-        let js = node("should round trip", "/proj/src/x.test.js", "javascript", (0, 1));
+        let js = node(
+            "should round trip",
+            "/proj/src/x.test.js",
+            "javascript",
+            (0, 1),
+        );
         assert_eq!(
             command_for(&js, None, None),
             "npx jest /proj/src/x.test.js -t should round trip"
@@ -451,10 +491,20 @@ mod tests {
     #[test]
     fn test_classify_prefers_attributes_then_names_then_paths() {
         let src = "#[test]\nfn test_a() {}\n\n#[cfg(unix)]\nfn helper() {}\n";
-        let attr_fn = node("irrelevant_name", "/proj/src/lib.rs", "rust", (src.find("fn helper").unwrap(), src.len()));
+        let attr_fn = node(
+            "irrelevant_name",
+            "/proj/src/lib.rs",
+            "rust",
+            (src.find("fn helper").unwrap(), src.len()),
+        );
         // Attribute above helper is #[cfg(unix)] — not a test...
         assert_eq!(classify_test(&attr_fn, Some(src)), None);
-        let attr_test = node("irrelevant_name", "/proj/src/lib.rs", "rust", (src.find("fn test_a").unwrap(), src.len()));
+        let attr_test = node(
+            "irrelevant_name",
+            "/proj/src/lib.rs",
+            "rust",
+            (src.find("fn test_a").unwrap(), src.len()),
+        );
         assert_eq!(classify_test(&attr_test, Some(src)), Some("#[test]"));
         // Name convention without attributes.
         let named = node("test_only_name", "/proj/src/lib.rs", "rust", (0, 1));
@@ -488,7 +538,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let nested = dir.path().join("crates/sub");
         std::fs::create_dir_all(&nested).expect("dirs");
-        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"fixture_pkg\"\n").unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture_pkg\"\n",
+        )
+        .unwrap();
         let file = nested.join("src/lib.rs");
         let name = cargo_package(file.to_str().expect("utf8 path"));
         assert_eq!(name.as_deref(), Some("fixture_pkg"));
