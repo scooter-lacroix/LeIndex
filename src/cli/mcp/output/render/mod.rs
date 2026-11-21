@@ -824,6 +824,43 @@ fn render_read_file(data: &Value, color: bool) -> String {
     // this renderer silently dropped the field — the parameter looked like a
     // no-op (N-08). Render a compact map when present.
     out.push_str(&render_read_file_symbol_map(data, color));
+    // §6.6 overlay: last-check diagnostics for the read range, when any.
+    out.push_str(&render_read_diagnostics(data, color));
+    out
+}
+
+/// §6.6 diagnostics overlay (cross-lane contract with lane F): compact
+/// `file:line severity code message-first-line` lines for the read range.
+/// Emits nothing when the handler attached none — zero bytes.
+fn render_read_diagnostics(data: &Value, color: bool) -> String {
+    let Some(diagnostics) = data.get("diagnostics").and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    if diagnostics.is_empty() {
+        return String::new();
+    }
+    let mut out = format!(
+        "\n  {}Diagnostics ({}):{}\n",
+        if color { DIM } else { "" },
+        diagnostics.len(),
+        if color { RESET } else { "" },
+    );
+    for diagnostic in diagnostics.iter().take(10) {
+        let file = diagnostic.get("file").and_then(|v| v.as_str()).unwrap_or("?");
+        let line = diagnostic.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
+        let severity = diagnostic
+            .get("severity")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let code = diagnostic.get("code").and_then(|v| v.as_str());
+        let message = diagnostic.get("message").and_then(|v| v.as_str()).unwrap_or("");
+        let code_part = code.map(|code| format!(" {code}")).unwrap_or_default();
+        let first_line = message.lines().next().unwrap_or("");
+        out.push_str(&format!("  {file}:{line} {severity}{code_part} {first_line}\n"));
+    }
+    if diagnostics.len() > 10 {
+        out.push_str(&format!("  … {} more\n", diagnostics.len() - 10));
+    }
     out
 }
 

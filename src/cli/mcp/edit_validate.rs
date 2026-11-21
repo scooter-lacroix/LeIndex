@@ -1,4 +1,5 @@
-//! Post-edit validation (§4.3): `validate: "syntax"`.
+//! Post-edit validation (§4.3): `validate: "syntax"` and, wired at
+//! integration, `validate: "check"`.
 //!
 //! Tree-sitter parse of each edited file AFTER apply, reporting
 //! `syntax: ok` or the first N error nodes as `line:col`. Uses the
@@ -6,8 +7,8 @@
 //! `from_cache`), never a private grammar table.
 //!
 //! `validate: "check"` (cargo/tsc/pyright) is wired at INTEGRATION to
-//! lane F's `check_scoped`. This module owns the single error site for
-//! it so integration replaces exactly one function.
+//! lane F's `check_scoped`. This module owns the single resolution site
+//! so the handler maps exactly one `ValidateRequest` variant to F.
 
 use super::protocol::JsonRpcError;
 use crate::parse::grammar::LanguageId;
@@ -147,26 +148,15 @@ impl ErrorCollector {
     }
 }
 
-/// THE single error site for `validate: "check"`.
-///
-/// Per the roadmap SPEC, cargo/tsc/pyright checking is wired at
-/// integration to lane F's `check_scoped`. This build accepts the
-/// argument and refuses it with this exact message so callers get a
-/// clear, greppable answer instead of silent no-op behavior.
-pub(crate) fn validate_check_unavailable() -> JsonRpcError {
-    JsonRpcError::invalid_params(
-        "validate: \"check\" is not available in this build — cargo/tsc/pyright checking \
-         is wired at integration; use validate: \"syntax\" for tree-sitter parsing",
-    )
-}
-
-/// Resolve the `validate` argument (absent / "syntax" / "check") into the
-/// action the handler must take. Errors on unknown values.
+/// The single `validate` resolution site. The handler maps `Check` to lane
+/// F's `check_scoped` (§4.3, cross-lane contract).
 pub(crate) enum ValidateRequest {
     /// No validation requested.
     None,
     /// Tree-sitter parse after apply.
     Syntax,
+    /// Scoped cargo/tsc/pyright check after apply (lane F).
+    Check,
 }
 
 pub(crate) fn resolve_validate_arg(
@@ -178,10 +168,9 @@ pub(crate) fn resolve_validate_arg(
     match raw.trim().to_ascii_lowercase().as_str() {
         "" | "none" => Ok(ValidateRequest::None),
         "syntax" => Ok(ValidateRequest::Syntax),
-        "check" => Err(validate_check_unavailable()),
+        "check" => Ok(ValidateRequest::Check),
         other => Err(JsonRpcError::invalid_params(format!(
-            "Unknown validate value '{other}' — supported: \"syntax\" (tree-sitter parse); \
-             \"check\" is wired at integration"
+            "Unknown validate value '{other}' — supported: \"syntax\" (tree-sitter parse), \"check\" (scoped cargo/tsc/pyright check)"
         ))),
     }
 }
@@ -191,23 +180,14 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_validate_check_errors_from_one_place() {
-        let err = validate_check_unavailable();
-        assert!(
-            err.message_with_hint()
-                .contains("not available in this build"),
-            "check must refuse with the integration placeholder message: {err}"
-        );
-    }
-
-    #[test]
     fn test_resolve_validate_arg_accepts_syntax_and_check() {
         let syntax = resolve_validate_arg(&serde_json::json!({"validate": "syntax"})).unwrap();
         assert!(matches!(syntax, ValidateRequest::Syntax));
         let none = resolve_validate_arg(&serde_json::json!({})).unwrap();
         assert!(matches!(none, ValidateRequest::None));
-        let check = resolve_validate_arg(&serde_json::json!({"validate": "check"}));
-        assert!(check.is_err(), "check must error in this build");
+        let check = resolve_validate_arg(&serde_json::json!({"validate": "check"})).unwrap();
+        assert!(matches!(check, ValidateRequest::Check), "check must resolve to Check");
+        assert!(resolve_validate_arg(&serde_json::json!({"validate": "bogus"})).is_err());
     }
 
     #[test]

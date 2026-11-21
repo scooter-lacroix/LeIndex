@@ -742,6 +742,43 @@ pub(crate) fn unchanged_payload(
     })
 }
 
+/// §6.6 diagnostics overlay (cross-lane contract with lane F): attach the
+/// last-run check's diagnostics for the requested line range to a read
+/// result. Emits nothing (zero bytes, no sparse key) when no project root is
+/// known — arbitrary absolute reads outside any project cannot resolve a
+/// diagnostics store — or when the store holds nothing for the range.
+pub(crate) fn attach_range_diagnostics(
+    mut result: Value,
+    project_root: Option<&Path>,
+    file: &Path,
+    start_line: usize,
+    end_line: usize,
+) -> Value {
+    let Some(root) = project_root else {
+        return result;
+    };
+    if start_line > end_line {
+        return result;
+    }
+    let diagnostics = crate::cli::run::diagnostics::diagnostics_for(root, file, start_line..=end_line);
+    if diagnostics.is_empty() {
+        return result;
+    }
+    if let Some(object) = result.as_object_mut() {
+        object.insert(
+            "diagnostics".to_string(),
+            serde_json::json!(diagnostics.iter().map(|diagnostic| serde_json::json!({
+                "file": diagnostic.file,
+                "line": diagnostic.line,
+                "severity": diagnostic.severity,
+                "code": diagnostic.code,
+                "message": diagnostic.message,
+            })).collect::<Vec<_>>()),
+        );
+    }
+    result
+}
+
 #[cfg(test)]
 #[path = "read_paths_test.rs"]
 mod tests;

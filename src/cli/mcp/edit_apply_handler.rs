@@ -417,8 +417,8 @@ tree-sitter parse of every edited file after the write."
                 },
                 "validate": {
                     "type": "string",
-                    "enum": ["syntax"],
-                    "description": "\"syntax\": tree-sitter-parse every edited file after the write and report errors (line:col)."
+                    "enum": ["syntax", "check"],
+                    "description": "\"syntax\": tree-sitter-parse every edited file after the write and report errors (line:col). \"check\": run the package-scoped cargo/tsc check (lane F) and surface its diagnostics in the apply echo."
                 },
                 "preview_token": {
                     "type": "string",
@@ -758,6 +758,34 @@ tree-sitter parse of every edited file after the write."
             );
         }
 
+        // validate:"check" — lane F's scoped check (cargo/tsc/pyright) on the
+        // owning package of each edited file, surfaced in the apply echo
+        // (§4.3, cross-lane contract). Failures to run a check never fail an
+        // applied edit; they come back as per-file `error` entries.
+        if had_validate_arg && matches!(validate_request, ValidateRequest::Check) {
+            let mut checks = Vec::new();
+            for file in plan.files.iter().map(|f| f.canonical_path.clone()) {
+                match crate::cli::run::diagnostics::check_scoped(&project_root, &file, 10) {
+                    Ok(summary) => checks.push(serde_json::json!({
+                        "file": file.to_string_lossy(),
+                        "exit_code": summary.exit_code,
+                        "headline": summary.headline,
+                        "failures": summary.failures.iter().map(|failure| serde_json::json!({
+                            "name": failure.name,
+                            "detail": failure.detail,
+                        })).collect::<Vec<_>>(),
+                        "error_count": summary.error_count,
+                        "warning_counts": summary.warning_counts,
+                    })),
+                    Err(error) => checks.push(serde_json::json!({
+                        "file": file.to_string_lossy(),
+                        "error": error.to_string(),
+                    })),
+                }
+            }
+            response["check"] = serde_json::json!({ "files": checks });
+        }
+
         // §4.1/§6.9 (lane E): a durable edit invalidates this session's
         // cached reads for the file and is listed by the session-reads
         // resource. Fire-and-forget: ledger failures can never fail an edit.
@@ -808,3 +836,7 @@ fn fresh_changes_val(args: &Value) -> Result<Value, JsonRpcError> {
         )),
     }
 }
+
+#[cfg(test)]
+#[path = "edit_apply_handler_test.rs"]
+mod edit_apply_tests;

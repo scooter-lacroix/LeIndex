@@ -623,6 +623,13 @@ Works for any absolute path, including outside the project — no index required
                     "neural_status": "not_used_exact"
                 }),
             });
+            result = super::read_paths::attach_range_diagnostics(
+                result,
+                project_root.as_deref(),
+                &resolved_file_path,
+                elided.focus_start_line,
+                elided.focus_end_line,
+            );
             result = wrap_read_result(
                 result,
                 project_root.as_deref().unwrap_or(&resolved_file_path),
@@ -666,6 +673,13 @@ Works for any absolute path, including outside the project — no index required
                         "pdg_status": "not_needed_live",
                         "neural_status": "not_used_exact"
                     });
+                    let payload = super::read_paths::attach_range_diagnostics(
+                        payload,
+                        project_root.as_deref(),
+                        &resolved_file_path,
+                        start_line,
+                        end_line,
+                    );
                     return Ok(wrap_read_result(
                         payload,
                         project_root.as_deref().unwrap_or(&resolved_file_path),
@@ -708,6 +722,13 @@ Works for any absolute path, including outside the project — no index required
                         "pdg_status": "not_needed_live",
                         "neural_status": "not_used_exact"
                     });
+                    let result = super::read_paths::attach_range_diagnostics(
+                        result,
+                        project_root.as_deref(),
+                        &resolved_file_path,
+                        start_line,
+                        end_line,
+                    );
                     return Ok(wrap_read_result(
                         result,
                         project_root.as_deref().unwrap_or(&resolved_file_path),
@@ -771,6 +792,13 @@ Works for any absolute path, including outside the project — no index required
             result["symbol_map"] = serde_json::json!(symbol_map);
         }
 
+        result = super::read_paths::attach_range_diagnostics(
+            result,
+            project_root.as_deref(),
+            &resolved_file_path,
+            start_line,
+            end_line,
+        );
         result = wrap_read_result(
             result,
             project_root.as_deref().unwrap_or(&resolved_file_path),
@@ -1091,5 +1119,75 @@ mod tests {
             !content.contains("2 #[derive"),
             "overlap re-served: {content}"
         );
+    }
+
+    /// §6.6 overlay (cross-lane contract E→F): a read attaches the last-run
+    /// check's diagnostics for the requested range, filtered by file and
+    /// line, and emits nothing when none match.
+    #[tokio::test]
+    async fn test_read_overlay_attaches_range_diagnostics_from_last_check() {
+        let dir = tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let path = write_sample(&root, "sample.rs");
+        let session = test_session("overlay");
+        let storage = crate::cli::run::diagnostics::storage_for(&root);
+        crate::cli::run::diagnostics::record(
+            &storage,
+            &[
+                crate::cli::run::diagnostics::Diagnostic {
+                    file: path.clone(),
+                    line: 1,
+                    severity: crate::cli::run::diagnostics::Severity::Error,
+                    code: Some("E0001".to_string()),
+                    message: "first line error".to_string(),
+                },
+                crate::cli::run::diagnostics::Diagnostic {
+                    file: path.clone(),
+                    line: 20,
+                    severity: crate::cli::run::diagnostics::Severity::Warning,
+                    code: None,
+                    message: "out of requested range".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+
+        let registry = test_registry_for(&root);
+        let result = ReadFileHandler
+            .execute(
+                &registry,
+                serde_json::json!({
+                    "file_path": path.to_string_lossy(),
+                    "project_path": root.to_string_lossy(),
+                    "_session": session,
+                    "start_line": 1,
+                    "end_line": 4,
+                }),
+            )
+            .await
+            .unwrap();
+        let diagnostics = result["diagnostics"]
+            .as_array()
+            .expect("overlay must attach diagnostics for the requested range");
+        assert_eq!(diagnostics.len(), 1, "{result}");
+        assert_eq!(diagnostics[0]["line"], 1);
+        assert_eq!(diagnostics[0]["code"], "E0001");
+        assert_eq!(diagnostics[0]["severity"], "error");
+
+        // A range with no stored hits attaches nothing — sparse, zero bytes.
+        let wide = ReadFileHandler
+            .execute(
+                &registry,
+                serde_json::json!({
+                    "file_path": path.to_string_lossy(),
+                    "project_path": root.to_string_lossy(),
+                    "_session": test_session("overlay-wide"),
+                    "start_line": 10,
+                    "end_line": 14,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(wide.get("diagnostics").is_none(), "{wide}");
     }
 }

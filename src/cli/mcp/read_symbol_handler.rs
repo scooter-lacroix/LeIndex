@@ -115,6 +115,7 @@ impl ReadSymbolHandler {
                         include_dependencies,
                         relations,
                         budget,
+                        live.root(),
                     );
                 }
                 CatalogLookup::Stale { file } => (Some(file), true),
@@ -143,6 +144,7 @@ impl ReadSymbolHandler {
             include_dependencies,
             relations,
             budget,
+            live.root(),
         )
     }
 }
@@ -389,6 +391,7 @@ fn symbol_response(
     include_dependencies: bool,
     relations: ResidentRelations,
     budget: WorkBudget,
+    project_root: &Path,
 ) -> Result<Value, JsonRpcError> {
     let (start, end) = node.byte_range;
     let content = std::str::from_utf8(&bytes).map_err(|e| {
@@ -445,7 +448,7 @@ fn symbol_response(
         .filter(|line| line.trim_start().starts_with("#["))
         .map(|line| line.trim_start())
         .collect();
-    Ok(serde_json::json!({
+    let result = serde_json::json!({
         "symbol": node.symbol_name,
         "qualified_name": node.qualified_name,
         "node_id": node.node_id,
@@ -476,7 +479,14 @@ fn symbol_response(
             "max_latency_ms": budget.max_latency_ms,
             "allow_partial": budget.allow_partial
         }
-    }))
+    });
+    Ok(super::read_paths::attach_range_diagnostics(
+        result,
+        Some(project_root),
+        &node.file_path,
+        line_start,
+        line_end,
+    ))
 }
 
 pub(crate) async fn catalog_is_fresh(catalog: &CatalogReader, file: &Path, bytes: &[u8]) -> bool {

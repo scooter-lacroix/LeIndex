@@ -1007,3 +1007,44 @@ fn test_n11_status_note_never_reaches_the_text_surface() {
     );
     assert!(!s.contains("[index:"), "fresh: no footer at all: {s}");
 }
+
+/// §6.6 overlay: compact `file:line severity code message-first-line` lines
+/// for the diagnostics attached to a read.
+#[test]
+fn test_render_read_file_renders_attached_diagnostics_compact() {
+    let data = v(
+        r#"{
+        "file_path": "/p/src/lib.rs",
+        "start_line": 1,
+        "end_line": 5,
+        "language": "rust",
+        "content": "1 fn a() {}\n2 fn b() {}\n",
+        "diagnostics": [
+            {"file": "/p/src/lib.rs", "line": 2, "severity": "error", "code": "E0308", "message": "mismatched types\nhelp: a hint"},
+            {"file": "/p/src/lib.rs", "line": 4, "severity": "warning", "code": null, "message": "unused variable"}
+        ]
+    }"#,
+    );
+    let s = render_tool_output("leindex.read_file", &data, &serde_json::json!({}));
+    assert!(s.contains("/p/src/lib.rs:2 error E0308 mismatched types"), "{s}");
+    assert!(s.contains("/p/src/lib.rs:4 warning unused variable"), "{s}");
+    assert!(
+        !s.contains("help: a hint"),
+        "only the first message line may render: {s}"
+    );
+}
+
+/// The overlay must cost zero bytes when a read has no diagnostics.
+#[test]
+fn test_render_read_file_emits_nothing_without_diagnostics() {
+    let data = v(
+        r#"{
+        "file_path": "/p/src/lib.rs",
+        "start_line": 1,
+        "end_line": 5,
+        "content": "1 fn a() {}\n"
+    }"#,
+    );
+    let s = render_tool_output("leindex.read_file", &data, &serde_json::json!({}));
+    assert!(!s.contains("Diagnostics"), "{s}");
+}
