@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 /// Upper bound on diff bytes read from git (the patch is bounded again for output).
-const MAX_DIFF_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const MAX_DIFF_BYTES: u64 = 8 * 1024 * 1024;
 const DEFAULT_PATCH_CHARS: usize = 20_000;
 
 /// Handler for PDG-enriched `git diff`.
@@ -195,7 +195,10 @@ fn is_body_resync(line: &str, body_old: usize, body_new: usize, remaining: usize
 /// current file and silently dropped every remaining hunk of that file;
 /// see [`is_body_resync`] for how a crafted count is prevented from
 /// swinging to the opposite failure mode.
-fn parse_hunks(patch: &str) -> BTreeMap<String, Vec<(usize, usize)>> {
+///
+/// `pub(crate)`: the git status handler reuses this parser so both surfaces
+/// agree on what a hunk is (§3.11 hunk-level symbol attribution).
+pub(crate) fn parse_hunks(patch: &str) -> BTreeMap<String, Vec<(usize, usize)>> {
     let mut hunks: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
     let mut current: Option<String> = None;
     // Lines still expected inside the current hunk body (old-side and
@@ -281,7 +284,7 @@ fn parse_hunks(patch: &str) -> BTreeMap<String, Vec<(usize, usize)>> {
 }
 
 /// Byte offset of the start of each 1-based line in `content`.
-fn line_starts(content: &[u8]) -> Vec<usize> {
+pub(crate) fn line_starts(content: &[u8]) -> Vec<usize> {
     let mut starts = vec![0usize];
     for (index, byte) in content.iter().enumerate() {
         if *byte == b'\n' {
@@ -292,7 +295,12 @@ fn line_starts(content: &[u8]) -> Vec<usize> {
 }
 
 /// Byte range covered by 1-based inclusive lines `start..=end`.
-fn lines_to_bytes(starts: &[usize], total: usize, start: usize, end: usize) -> (usize, usize) {
+pub(crate) fn lines_to_bytes(
+    starts: &[usize],
+    total: usize,
+    start: usize,
+    end: usize,
+) -> (usize, usize) {
     let from = starts.get(start - 1).copied().unwrap_or(total);
     let to = starts.get(end).copied().unwrap_or(total);
     (from, to.max(from))
@@ -466,7 +474,7 @@ impl GitDiffHandler {
                 "range": { "type": "string", "description": "Revision range, e.g. main..feature or HEAD~3..HEAD" },
                 "staged": { "type": "boolean", "default": false, "description": "Diff the index against HEAD instead of the working tree" },
                 "stat_only": { "type": "boolean", "default": false, "description": "Per-file statistics only; no patch, no hunk-level symbol mapping" },
-                "include_patch": { "type": "boolean", "default": true, "description": "Include the (bounded) unified patch" },
+                "include_patch": { "type": "boolean", "default": false, "description": "Include the (bounded) unified patch; the compact default reports per-file stats plus hunk summaries instead" },
                 "max_patch_chars": { "type": "integer", "default": DEFAULT_PATCH_CHARS, "minimum": 0, "maximum": 200000, "description": "Patch size bound" },
                 "enrich_pdg": { "type": "boolean", "default": true, "description": "Map changed hunks to PDG symbols and compute impact" },
                 "scope": { "type": "string", "description": "Only report files under this project-relative path" },
@@ -563,7 +571,10 @@ fn parse_args(args: &Value) -> Result<DiffArgs, JsonRpcError> {
     Ok(DiffArgs {
         spec,
         stat_only,
-        include_patch: extract_bool(args, "include_patch", true) && !stat_only,
+        // §4.5: compact by default — the full patch is opt-in. Symbol/hunk
+        // summaries still run (they are bounded by the hunk count, not the
+        // patch size); `include_patch: true` restores the old full-patch view.
+        include_patch: extract_bool(args, "include_patch", false) && !stat_only,
         enrich: extract_bool(args, "enrich_pdg", true),
         max_patch_chars: extract_usize(args, "max_patch_chars", DEFAULT_PATCH_CHARS)?.min(200_000),
         budget: WorkBudget {
@@ -652,6 +663,10 @@ async fn attach_patch_and_enrich(
         let (text, cut) = bound_chars(&readable, max_patch_chars);
         result["patch"] = Value::String(text);
         result["patch_truncated"] = Value::Bool(cut || *truncated || readable_truncated);
+    } else if let Some((raw_patch, _)) = &patch {
+        // §4.5 compact default: summarize long hunks instead of printing
+        // them, using the enclosing function git names in the hunk header.
+        result["changes"] = hunk_summaries(raw_patch);
     }
     if !enrich || stat_only || files.is_empty() {
         return result;
@@ -749,6 +764,99 @@ fn bound_chars(text: &str, max: usize) -> (String, bool) {
         return (text.to_string(), false);
     }
     (text.chars().take(max).collect(), true)
+}
+
+/// Hunks over the summary threshold as one bounded record each (§4.5).
+///
+/// Git writes the enclosing function into the hunk header when it can detect
+/// one (`@@ -10,7 +10,40 @@ fn name(..)`), so the "in fn …" attribution comes
+/// free from the same `-U0` patch that drives symbol mapping — no second
+/// pass, no graph dependency. Short hunks are not listed: the per-file stat
+/// line already covers them.
+fn hunk_summaries(patch: &str) -> Value {
+    /// New-side line count above which a hunk is summarized instead of being
+    /// left to the per-file stat.
+    const LONG_HUNK_LINES: usize = 20;
+    const MAX_ENTRIES: usize = 50;
+
+    let mut current: Option<String> = None;
+    let mut entries = Vec::new();
+    let mut total_long = 0usize;
+    for line in patch.lines() {
+        if let Some(path) = line.strip_prefix("+++ ") {
+            current = path
+                .strip_prefix("b/")
+                .map(str::to_string)
+                .filter(|p| p != "/dev/null");
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("@@ ") else {
+            continue;
+        };
+        let Some(file) = current.as_ref() else {
+            continue;
+        };
+        let mut parts = rest.splitn(2, " @@");
+        let (Some(ranges), context) = (parts.next(), parts.next().unwrap_or_default()) else {
+            continue;
+        };
+        let new_side = ranges
+            .split_whitespace()
+            .find(|part| part.starts_with('+'))
+            .unwrap_or("+1");
+        let spec = new_side.trim_start_matches('+');
+        let (start, count) = match spec.split_once(',') {
+            Some((start, count)) => (
+                start.parse::<usize>().unwrap_or(1),
+                count.parse::<usize>().unwrap_or(1),
+            ),
+            None => (spec.parse::<usize>().unwrap_or(1), 1usize),
+        };
+        let old_side = ranges
+            .split_whitespace()
+            .find(|part| part.starts_with('-') && *part != "--")
+            .unwrap_or("-1");
+        let old_count = old_side
+            .trim_start_matches('-')
+            .split_once(',')
+            .and_then(|(_, count)| count.parse::<usize>().ok())
+            .unwrap_or(1);
+        if count <= LONG_HUNK_LINES {
+            continue;
+        }
+        total_long += 1;
+        if entries.len() >= MAX_ENTRIES {
+            continue;
+        }
+        let kind = if old_count == 0 {
+            "new"
+        } else if count == 0 {
+            "removed"
+        } else {
+            "modified"
+        };
+        let inside = context
+            .split_whitespace()
+            .find(|token| {
+                token.starts_with("fn ")
+                    && token.chars().all(|c| {
+                        c.is_alphanumeric() || c == '_' || c == ':' || c == '<' || c == '>'
+                    })
+            })
+            .map(str::to_string);
+        entries.push(json!({
+            "path": file,
+            "lines": count,
+            "at": start,
+            "kind": kind,
+            "in": inside,
+        }));
+    }
+    let mut value = json!({ "long_hunks": entries, "long_hunk_count": total_long });
+    if total_long > entries.len() {
+        value["omitted_long_hunks"] = json!(total_long - entries.len());
+    }
+    value
 }
 
 fn file_json(file: &ChangedFile) -> Value {
