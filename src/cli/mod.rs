@@ -99,6 +99,7 @@ pub mod index_cache;
 pub mod index_freshness;
 /// Registry-owned resumable indexing job state.
 pub mod index_job;
+
 /// Core orchestration logic for indexing and search.
 pub mod leindex;
 /// Canonical project identity for live, non-hydrating MCP reads.
@@ -115,6 +116,9 @@ pub mod registry;
 /// D-2 idle-engine eviction (sibling of `registry` so the Large-File gate
 /// keeps breathing room — see `registry.rs` head count).
 mod registry_evict;
+/// Sandboxed `run` capability (§4.4): allow-listed tool execution, structured
+/// output parsers, scoped diagnostics, and how-to-test discovery.
+pub(crate) mod run;
 /// Text-index lifecycle (locate, load, build) for the `find` search.
 pub mod textindex;
 /// File watcher for auto-reindex.

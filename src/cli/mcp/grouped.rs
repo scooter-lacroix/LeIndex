@@ -268,6 +268,18 @@ pub static GROUPS: [GroupSpec; 5] = [
                 &["retention", "prune"],
                 "Retention report for the generation store (dry_run by default)",
             ),
+            branch(
+                "run",
+                "leindex_manage",
+                &["exec"],
+                "Sandboxed cargo/npm/pytest/go/make/just/script run: ~300-char summary + log://handle; log=, check=, diagnostics= modes",
+            ),
+            branch(
+                "how_to_test",
+                "leindex_manage",
+                &["howtotest", "test_command"],
+                "The gate command for a path (workspace member, docs, scripts)",
+            ),
         ],
     },
     GroupSpec {
@@ -1516,7 +1528,7 @@ mod tests {
         let manage = group_by_name("leindex_manage").expect("manage router");
         let usage = branch_usage(manage, &handlers);
         assert!(
-            usage.contains("state,projects,evict,lease,cleanup:"),
+            usage.contains("state,projects,evict,lease,cleanup,run,how_to_test:"),
             "expected the shared branches folded into one entry: {usage}"
         );
         assert_eq!(
@@ -1607,6 +1619,13 @@ mod tests {
         // (trailers, confirm_text, allow_sensitive, hard/clean/delete) were
         // added. The ratio guard above still passes; the next growth here
         // needs the same accounting.
+        // 19_000 is the ceiling for the FULL integrated surface: lane D's git
+        // mutations plus lane F's `run`/`how_to_test` actions on
+        // `leindex_manage` (14 new arguments: argv, command, cwd,
+        // timeout_secs, name, log, tail, check, max, diagnostics, from, to,
+        // path). F measured 17_815 on its own tree; with D merged the listing
+        // is the union. The ratio guard still passes; if this number moves
+        // again, say which branch moved it.
         assert!(grouped <= 19_000, "tools/list grew to {grouped} bytes");
     }
 
