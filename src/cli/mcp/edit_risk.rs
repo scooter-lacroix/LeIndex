@@ -42,11 +42,7 @@ pub(crate) fn compute_signals(
     edit_ranges: &[(usize, usize)],
 ) -> EditRiskSignals {
     let overlapping = |pdg: &ProgramDependenceGraph| -> Vec<crate::graph::pdg::NodeId> {
-        let candidates: Vec<_> = pdg
-            .nodes_in_file(&file_path.to_string_lossy())
-            .iter()
-            .copied()
-            .collect();
+        let candidates = pdg.nodes_in_file(&file_path.to_string_lossy()).clone();
         let mut seen = std::collections::HashSet::new();
         candidates
             .into_iter()
@@ -90,10 +86,7 @@ pub(crate) fn compute_signals(
                 .rfind('\n')
                 .map(|pos| pos + 1)
                 .unwrap_or(0);
-            let decl_line = original[line_start..]
-                .lines()
-                .next()
-                .unwrap_or_default();
+            let decl_line = original[line_start..].lines().next().unwrap_or_default();
             let decl_head = decl_line.trim_start();
             let is_pub = decl_head.starts_with("pub ")
                 || decl_head.starts_with("pub(")
@@ -146,7 +139,9 @@ pub(crate) fn assess(signals: &EditRiskSignals) -> Option<RiskFinding> {
 const CALLER_HIGH_WATERMARK: usize = 10;
 
 fn range_touched(edit_ranges: &[(usize, usize)], byte: usize) -> bool {
-    edit_ranges.iter().any(|&(s, e)| s <= byte && byte < e.max(s + 1))
+    edit_ranges
+        .iter()
+        .any(|&(s, e)| s <= byte && byte < e.max(s + 1))
 }
 
 /// Does any test-side node reference `symbol_name` through the call/data

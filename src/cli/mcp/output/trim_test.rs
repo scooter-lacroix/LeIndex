@@ -195,6 +195,7 @@ fn test_trim_edit_keeps_structured_diff() {
             "affected_symbols": ["main"],
             "affected_files": ["src/foo.rs"],
             "breaking_changes": [],
+            "risk": {"level": "high", "reason": "pub signature changed"},
             "risk_level": "low",
             "change_count": 1,
             "validation": {"x": 1}
@@ -202,8 +203,11 @@ fn test_trim_edit_keeps_structured_diff() {
     let t = trim_edit(&input);
     assert_eq!(t["preview_token"], "tok");
     assert!(t["diff"].is_object());
-    assert_eq!(t["risk_level"], "low");
-    assert_eq!(t["change_count"], 1);
+    // §3.6: the real-signal risk object survives; the legacy no-info
+    // scalars (`risk_level`, `change_count`) are dropped.
+    assert_eq!(t["risk"]["level"], "high");
+    assert!(t.get("risk_level").is_none());
+    assert!(t.get("change_count").is_none());
     assert_eq!(t["affected_symbols"][0], "main");
     // diff_text is now preserved so the LLM can see the unified diff
     assert!(t.get("diff_text").is_some());

@@ -976,7 +976,11 @@ fn render_edit_preview(data: &Value, color: bool) -> String {
     if let Some(risk) = data.get("risk") {
         let level = risk.get("level").and_then(|v| v.as_str()).unwrap_or("?");
         let reason = risk.get("reason").and_then(|v| v.as_str()).unwrap_or("");
-        meta_lines.push(render_meta_line("risk", &format!("{level} — {reason}"), color));
+        meta_lines.push(render_meta_line(
+            "risk",
+            &format!("{level} — {reason}"),
+            color,
+        ));
     }
     if let Some(breaks) = data.get("breaking_changes").and_then(|v| v.as_array()) {
         for description in breaks.iter().filter_map(|value| value.as_str()) {
@@ -988,7 +992,10 @@ fn render_edit_preview(data: &Value, color: bool) -> String {
         }
     }
 
-    out.push_str(&append_meta_lines(render_diff_value(data, color), &meta_lines));
+    out.push_str(&append_meta_lines(
+        render_diff_value(data, color),
+        &meta_lines,
+    ));
     out
 }
 
@@ -1104,13 +1111,24 @@ fn render_edit_apply(data: &Value, color: bool) -> String {
         .get("success")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let (status_label, status_color) = edit_apply_status(success, data, color);
-    out.push_str(&format!(
-        "{}{}{}\n",
-        status_color,
-        status_label,
-        if color { RESET } else { "" },
-    ));
+    let is_noop = data
+        .get("changes_applied")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        == 0;
+    // With `applied_lines` present the one-line echo already says
+    // "Applied: …" — a separate status label would only duplicate it. The
+    // label remains for failure / dry-run / no-op shapes without the echo.
+    let has_echo = data.get("applied_lines").is_some();
+    if !has_echo || !success || is_noop {
+        let (status_label, status_color) = edit_apply_status(success, data, color);
+        out.push_str(&format!(
+            "{}{}{}\n",
+            status_color,
+            status_label,
+            if color { RESET } else { "" },
+        ));
+    }
     // §4.3: the apply result is ONE line per file —
     // `Applied: path:L802-828 (+27/-0) in fn name`. The handler computes
     // it (`applied_lines`); the field block below remains only for shapes
@@ -1118,13 +1136,11 @@ fn render_edit_apply(data: &Value, color: bool) -> String {
     if let Some(lines) = data.get("applied_lines").and_then(|v| v.as_array()) {
         for line in lines.iter().filter_map(|v| v.as_str()) {
             out.push_str(&format!(
-                "  {}{}\n",
+                "  {}{}{}\n",
                 if color { LIGHT_GREEN } else { "" },
                 line,
+                if color { RESET } else { "" },
             ));
-        }
-        if color {
-            out.push_str(RESET);
         }
         return out;
     }

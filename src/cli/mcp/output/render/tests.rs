@@ -430,16 +430,44 @@ fn test_render_impact_plain_output() {
 
 #[test]
 fn test_render_edit_metadata_plain_output() {
+    // §3.4: the token leads the text surface. §3.6: the no-information
+    // lines (`Risk level: low`, `Change count: N`, `Breaking: none`)
+    // must NOT render even when the legacy fields are present.
     let preview = v(r#"{
+                "preview_token": "tok123",
                 "affected_symbols": ["alpha"],
                 "affected_files": ["src/lib.rs"],
                 "risk_level": "low",
                 "change_count": 1,
                 "breaking_changes": ["none"]
             }"#);
+    let s = render_edit_preview(&preview, false);
     assert_eq!(
-        render_edit_preview(&preview, false),
-        "  Affected symbols: alpha\n  Affected files: src/lib.rs\n  Risk level: low\n  Change count: 1\n  Breaking: none\n"
+        s,
+        "preview_token: tok123 — apply with preview_token + project_path\n  Affected symbols: alpha\n  Affected files: src/lib.rs\n"
+    );
+    assert!(
+        !s.contains("Risk level"),
+        "no-info risk line must be gone: {s}"
+    );
+    assert!(
+        !s.contains("Change count"),
+        "no-info count line must be gone: {s}"
+    );
+    assert!(
+        !s.contains("Breaking"),
+        "no-info breaking line must be gone: {s}"
+    );
+
+    // §3.6: a real finding renders with its reason.
+    let risky = v(r#"{
+                "affected_files": ["src/lib.rs"],
+                "risk": {"level": "high", "reason": "src/lib.rs: high — pub signature changed, 14 callers"}
+            }"#);
+    let s = render_edit_preview(&risky, false);
+    assert!(
+        s.contains("risk: high — src/lib.rs: high — pub signature changed, 14 callers"),
+        "real risk must render with reason: {s}"
     );
 
     let rename = v(r#"{

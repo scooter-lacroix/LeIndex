@@ -25,9 +25,7 @@ enum ApplyRequest {
         file_path: Option<String>,
     },
     /// Apply the edit text directly (path resolved later).
-    Fresh {
-        file_path: Option<String>,
-    },
+    Fresh { file_path: Option<String> },
 }
 
 fn apply_request_args(args: &Value) -> Result<ApplyRequest, JsonRpcError> {
@@ -330,27 +328,17 @@ fn applied_lines(
                     .nodes_in_file(&file.canonical_path.to_string_lossy())
                     .into_iter()
                     .filter_map(|nid| graph.get_node(nid))
-                    .find(|node| {
-                        node.byte_range.0 <= first_byte && first_byte < node.byte_range.1
-                    })
+                    .find(|node| node.byte_range.0 <= first_byte && first_byte < node.byte_range.1)
                     .map(|node| node.name.clone())
             });
             match enclosing {
                 Some(name) => format!(
                     "Applied: {}:{}-{} (+{}/-{}) in fn {name}",
-                    file.display_path,
-                    first_line,
-                    last_line,
-                    diff.additions,
-                    diff.deletions
+                    file.display_path, first_line, last_line, diff.additions, diff.deletions
                 ),
                 None => format!(
                     "Applied: {}:{}-{} (+{}/-{})",
-                    file.display_path,
-                    first_line,
-                    last_line,
-                    diff.additions,
-                    diff.deletions
+                    file.display_path, first_line, last_line, diff.additions, diff.deletions
                 ),
             }
         })
@@ -426,6 +414,12 @@ tree-sitter parse of every edited file after the write."
                 "preview_token": {
                     "type": "string",
                     "description": "TOKEN MODE (advertised default): the preview_token from LeIndex [Edit Preview]. Send preview_token + project_path ONLY — the token replaces the whole edit. The file must be unchanged since the preview or the apply is rejected."
+                },
+                "tier": {
+                    "type": "string",
+                    "enum": ["l1", "l2"],
+                    "description": "l1 (default): one-line apply result only. l2: also echoes the surrounding region of the primary file.",
+                    "default": "l1"
                 }
             },
             "required": []
@@ -526,16 +520,21 @@ tree-sitter parse of every edited file after the write."
                     GLOBAL_EDIT_CACHE
                         .clear_with_token_alias(&storage_path, &entry.file_path, &token)
                         .await;
-                    return Err(JsonRpcError::invalid_params(format!(
+                    return Err(JsonRpcError::invalid_params(
                         "Edit rejected: file content changed since this preview was generated \
                          (hash mismatch). Request a new LeIndex [Edit Preview]; the stale \
-                         token was discarded."
-                    )));
+                         token was discarded.",
+                    ));
                 }
-                let multi_file = entry
-                    .changes
-                    .iter()
-                    .any(|c| matches!(c, crate::edit::EditChange::ReplaceText { file_path: Some(_), .. }));
+                let multi_file = entry.changes.iter().any(|c| {
+                    matches!(
+                        c,
+                        crate::edit::EditChange::ReplaceText {
+                            file_path: Some(_),
+                            ..
+                        }
+                    )
+                });
                 if multi_file {
                     let plan =
                         edit_batch::resolve_batch_from_changes(&entry.changes, &project_root)
@@ -543,7 +542,10 @@ tree-sitter parse of every edited file after the write."
                     Acquired::Batch(plan, Some(token))
                 } else {
                     let canonical = validate_file_within_project(
-                        &entry.file_path.to_string_lossy(),
+                        // Token-alias entries carry the synthetic `__token__:`
+                        // cache key in `file_path`; the real path is in the
+                        // preview's original-hashes map.
+                        &entry.real_file_path().to_string_lossy(),
                         &project_root,
                     )?;
                     Acquired::Single(
@@ -559,9 +561,12 @@ tree-sitter parse of every edited file after the write."
                 let changes_val = fresh_changes_val(&args)?;
                 let batch_mode = edit_batch::is_batch(&changes_val);
                 if batch_mode {
-                    let plan =
-                        edit_batch::resolve_batch(&changes_val, file_path.as_deref(), &project_root)
-                            .await?;
+                    let plan = edit_batch::resolve_batch(
+                        &changes_val,
+                        file_path.as_deref(),
+                        &project_root,
+                    )
+                    .await?;
                     Acquired::Batch(plan, None)
                 } else {
                     let Some(path) = file_path.as_deref() else {
@@ -668,7 +673,8 @@ tree-sitter parse of every edited file after the write."
             let guard = handle.read().await;
             edit_impact(
                 guard.pdg(),
-                &plan.files
+                &plan
+                    .files
                     .iter()
                     .flat_map(|f| f.changes.clone())
                     .collect::<Vec<_>>(),
@@ -684,23 +690,29 @@ tree-sitter parse of every edited file after the write."
             .first()
             .map(|f| f.canonical_path.clone())
             .unwrap_or_else(|| std::path::PathBuf::from(""));
-        let primary_region = plan
-            .files
-            .first()
-            .map(|f| edit_region(&f.original, &f.modified))
-            .unwrap_or_default();
         let mut response = serde_json::json!({
             "success": true,
             "changes_applied": changes_len,
             "file_path": primary_path.to_string_lossy(),
             "applied_lines": applied_lines(&plan.files, pdg_snapshot.as_ref()),
             "files": plan.files.iter().map(file_summary).collect::<Vec<_>>(),
-            "edit_region": primary_region,
             "multi_file": plan.files.len() > 1,
         });
-        if let (Some(validation), Some(obj)) =
-            (validation_json, response.as_object_mut())
+        // §4.3: the surrounding-region echo is OFF by default — the caller
+        // just wrote that text. It comes back only on `tier=l2`.
+        if args
+            .get("tier")
+            .and_then(Value::as_str)
+            .is_some_and(|tier| tier.eq_ignore_ascii_case("l2"))
         {
+            response["edit_region"] = serde_json::json!(
+                plan.files
+                    .first()
+                    .map(|f| edit_region(&f.original, &f.modified))
+                    .unwrap_or_default()
+            );
+        }
+        if let (Some(validation), Some(obj)) = (validation_json, response.as_object_mut()) {
             obj.insert("validation".to_string(), validation);
         }
         let (nodes, files, breaking) = impact;
@@ -712,13 +724,17 @@ tree-sitter parse of every edited file after the write."
 
         // validate:"syntax" — tree-sitter parse of every edited file, after
         // the writes are durable.
-        if had_validate_arg
-            && matches!(validate_request, ValidateRequest::Syntax)
-        {
+        if had_validate_arg && matches!(validate_request, ValidateRequest::Syntax) {
             let files_to_check: Vec<(String, std::path::PathBuf, String)> = plan
                 .files
                 .iter()
-                .map(|f| (f.display_path.clone(), f.canonical_path.clone(), f.modified.clone()))
+                .map(|f| {
+                    (
+                        f.display_path.clone(),
+                        f.canonical_path.clone(),
+                        f.modified.clone(),
+                    )
+                })
                 .collect();
             let outcomes = edit_validate::validate_syntax(&files_to_check, 5);
             response["syntax"] = serde_json::json!(

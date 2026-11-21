@@ -76,6 +76,16 @@ impl EditCacheEntry {
         })
     }
 
+    /// The filesystem path this entry edits. Token-alias entries store the
+    /// synthetic `__token__:` cache key in `file_path`; the real path lives
+    /// in `original_hashes` (single-file entries carry exactly one).
+    pub fn real_file_path(&self) -> &Path {
+        self.original_hashes
+            .keys()
+            .next()
+            .map_or(self.file_path.as_path(), Path::new)
+    }
+
     /// Estimated byte size of this entry in the hot cache.
     pub fn estimated_size(&self) -> usize {
         let path_bytes = self.file_path.as_os_str().len();
@@ -316,15 +326,23 @@ impl EditCache {
     }
 
     /// Resolve a preview by its token alone (no file_path needed).
-    pub async fn get_by_token(&self, project_storage: &Path, token: &str) -> Option<EditCacheEntry> {
+    pub async fn get_by_token(
+        &self,
+        project_storage: &Path,
+        token: &str,
+    ) -> Option<EditCacheEntry> {
         self.get(project_storage, &token_alias_path(token)).await
     }
 
     /// Clear both the file-path entry and the token alias after an apply.
-    pub async fn clear_with_token_alias(&self, project_storage: &Path, file_path: &Path, token: &str) {
+    pub async fn clear_with_token_alias(
+        &self,
+        project_storage: &Path,
+        file_path: &Path,
+        token: &str,
+    ) {
         self.clear(project_storage, file_path).await;
-        self.clear(project_storage, &token_alias_path(token))
-            .await;
+        self.clear(project_storage, &token_alias_path(token)).await;
     }
 }
 
@@ -453,5 +471,71 @@ mod tests {
         let entry = make_entry(100, 200);
         let size = entry.estimated_size();
         assert!(size > 300, "estimated size should account for text content");
+    }
+
+    /// §3.4: apply-by-token re-validates the file is unchanged since the
+    /// preview. `single_file` must hash the PRE-edit content, and the hash
+    /// must stop matching once the file changes on disk.
+    #[test]
+    fn test_single_file_entry_rejects_file_changed_since_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("stale_check.rs");
+        std::fs::write(&file, "fn a() {}\n").unwrap();
+        let entry = EditCacheEntry::single_file(
+            file.clone(),
+            "tok-stale".to_string(),
+            "fn a() {}\n".to_string(),
+            "fn b() {}\n".to_string(),
+            vec![],
+        );
+        assert!(
+            entry.files_unchanged_since_preview(),
+            "untouched file must pass the staleness check"
+        );
+
+        std::fs::write(&file, "fn a() { changed }\n").unwrap();
+        assert!(
+            !entry.files_unchanged_since_preview(),
+            "a file modified between preview and apply must FAIL the staleness check"
+        );
+    }
+
+    /// §3.4: a preview stored under its file path must also resolve from
+    /// the token alone (the advertised `preview_token + project_path`
+    /// apply path).
+    #[tokio::test]
+    async fn test_token_alias_resolves_without_file_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join(".leindex");
+        let file = dir.path().join("aliased.rs");
+        std::fs::write(&file, "fn aliased() {}\n").unwrap();
+        let cache = EditCache::new();
+        let entry = EditCacheEntry::single_file(
+            file,
+            "tok-alias-123".to_string(),
+            "fn aliased() {}\n".to_string(),
+            "fn renamed() {}\n".to_string(),
+            vec![],
+        );
+        cache
+            .set_with_token_alias(&storage, entry)
+            .await
+            .expect("no IO error")
+            .expect("within size limit");
+
+        let resolved = cache
+            .get_by_token(&storage, "tok-alias-123")
+            .await
+            .expect("token-only lookup must resolve the preview");
+        assert_eq!(resolved.preview_token, "tok-alias-123");
+        // The alias entry keys the cache on the synthetic `__token__:` path;
+        // the REAL file must come through `real_file_path()` so a token-only
+        // apply can resolve which file to write.
+        assert!(
+            resolved.real_file_path().ends_with("aliased.rs"),
+            "real_file_path must carry the actual file, got: {}",
+            resolved.real_file_path().display()
+        );
+        assert_eq!(resolved.original_text, "fn aliased() {}\n");
     }
 }

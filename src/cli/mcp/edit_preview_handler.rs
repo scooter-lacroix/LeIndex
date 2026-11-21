@@ -125,12 +125,7 @@ their own file_path (atomic across files, one token for the whole batch)."
         };
 
         let preview_token = blake3::hash(
-            format!(
-                "{}{}",
-                chrono::Utc::now().to_rfc3339(),
-                std::process::id()
-            )
-            .as_bytes(),
+            format!("{}{}", chrono::Utc::now().to_rfc3339(), std::process::id()).as_bytes(),
         )
         .to_hex()
         .to_string();
@@ -216,9 +211,7 @@ their own file_path (atomic across files, one token for the whole batch)."
         for file in &plan.files {
             let diff = make_diff(&file.original, &file.modified, &file.display_path);
             files_json.push(file_summary(file));
-            diff_text.push_str(&crate::cli::mcp::output::render_unified_diff(
-                &diff, false,
-            ));
+            diff_text.push_str(&crate::cli::mcp::output::render_unified_diff(&diff, false));
             diffs_json.push(serde_json::json!({
                 "file": file.display_path,
                 "diff": diff.to_json(),
@@ -228,17 +221,19 @@ their own file_path (atomic across files, one token for the whole batch)."
                 .changes
                 .iter()
                 .filter_map(|c| match c {
-                    crate::edit::EditChange::ReplaceText { start, end, .. } => {
-                        Some((*start, *end))
-                    }
+                    crate::edit::EditChange::ReplaceText { start, end, .. } => Some((*start, *end)),
                     _ => None,
                 })
                 .collect();
 
             // Per-file PDG impact (rename callers + edited-region overlap).
             if let Some(pdg) = pdg_snapshot.as_ref() {
-                let (nodes, files, breaks) =
-                    collect_pdg_impact(pdg, &file.changes, &file.canonical_path, &file.display_path);
+                let (nodes, files, breaks) = collect_pdg_impact(
+                    pdg,
+                    &file.changes,
+                    &file.canonical_path,
+                    &file.display_path,
+                );
                 affected_nodes.extend(nodes);
                 affected_files.extend(files);
                 breaking_changes.extend(breaks);
