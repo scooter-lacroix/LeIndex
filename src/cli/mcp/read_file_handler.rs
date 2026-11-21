@@ -1,8 +1,8 @@
 use super::helpers::{
     extract_bool, extract_string, extract_usize, get_direct_callers, node_type_str,
 };
-use super::read_paths::{self, ConsultVerdict};
 use super::protocol::JsonRpcError;
+use super::read_paths::{self, ConsultVerdict};
 use crate::cli::live_project::LiveProject;
 use crate::cli::registry::{ProjectHandle, ProjectRegistry};
 use crate::graph::pdg::ProgramDependenceGraph;
@@ -88,10 +88,7 @@ fn detect_language(extension: &str) -> &str {
 /// An unindexed or unresolved project is NOT an error for a read: an
 /// absolute path outside any project is a valid live read (brief §6.1), and
 /// a relative path only needs the root when it is actually relative.
-async fn resolve_project_root(
-    registry: &Arc<ProjectRegistry>,
-    args: &Value,
-) -> Option<PathBuf> {
+async fn resolve_project_root(registry: &Arc<ProjectRegistry>, args: &Value) -> Option<PathBuf> {
     if let Some(project_path) = args.get("project_path").and_then(|value| value.as_str()) {
         return LiveProject::resolve(project_path)
             .ok()
@@ -359,15 +356,18 @@ fn language_for(file_path: &str) -> String {
 /// background reindex that holds the write lock; the hydration itself is
 /// still serialized behind that lock, but this call neither waits for it nor
 /// takes the lock at all.
-async fn ensure_symbol_map_pdg(handle: Option<ProjectHandle>, wanted: bool) -> Option<ProjectHandle> {
+async fn ensure_symbol_map_pdg(
+    handle: Option<ProjectHandle>,
+    wanted: bool,
+) -> Option<ProjectHandle> {
     match handle {
         Some(handle) if wanted => {
-            if let Ok(mut guard) = handle.try_write() {
-                if guard.pdg().is_none() {
-                    // The symbol map lists graph nodes only; the full engine
-                    // load here added ~1s to every cold read with a map.
-                    let _ = guard.ensure_pdg_loaded_graph_only();
-                }
+            if let Ok(mut guard) = handle.try_write()
+                && guard.pdg().is_none()
+            {
+                // The symbol map lists graph nodes only; the full engine
+                // load here added ~1s to every cold read with a map.
+                let _ = guard.ensure_pdg_loaded_graph_only();
             }
             // Lock busy (a reindex is running): serve without the map rather
             // than block — the read itself is exact either way.
@@ -536,14 +536,14 @@ Works for any absolute path, including outside the project — no index required
 
         // Window resolution. Precedence: explicit start/end args, then the
         // #L600-800 fragment, then a symbol anchor, then the whole file.
-        let explicit_start = extract_usize(&args, "start_line", 0)?.max(0);
-        let explicit_end = extract_usize(&args, "end_line", 0)?.max(0);
+        let explicit_start = extract_usize(&args, "start_line", 0)?;
+        let explicit_end = extract_usize(&args, "end_line", 0)?;
         let symbol_target = handle.symbol.clone().or_else(|| focus_symbol.clone());
 
         let mut anchor: Option<(usize, usize)> = None;
         if let Some(target) = &symbol_target {
-            let live = super::read_symbol_handler::parse_live_file(resolved_file_path.clone())
-                .await?;
+            let live =
+                super::read_symbol_handler::parse_live_file(resolved_file_path.clone()).await?;
             let spans = read_paths::spans_with_lines(&content, &live.symbols);
             let span = read_paths::find_span(&spans, target).ok_or_else(|| {
                 JsonRpcError::invalid_params(format!(
@@ -553,7 +553,9 @@ Works for any absolute path, including outside the project — no index required
             })?;
             anchor = Some((span.start_line, span.end_line));
         }
-        let (anchor_start, anchor_end) = anchor.unwrap_or((1, 1));
+        // No anchor and no explicit range means the WHOLE file — defaulting
+        // the end to 1 collapsed every plain read to its first line.
+        let (anchor_start, anchor_end) = anchor.unwrap_or((1, total_lines.max(1)));
         let start_line = if explicit_start > 0 {
             explicit_start.max(1)
         } else {
@@ -565,10 +567,7 @@ Works for any absolute path, including outside the project — no index required
         let end_line = if explicit_end > 0 {
             explicit_end
         } else {
-            handle
-                .line_range
-                .map(|(_, end)| end)
-                .unwrap_or(anchor_end)
+            handle.line_range.map(|(_, end)| end).unwrap_or(anchor_end)
         }
         .min(total_lines.max(1))
         .min(start_line.saturating_add(max_lines).saturating_sub(1));
@@ -589,21 +588,16 @@ Works for any absolute path, including outside the project — no index required
         // Elided view (§4.1): focus symbol in full, siblings collapsed.
         // Always served — a view is not the same answer as the bytes.
         if let Some(focus) = &focus_symbol {
-            let live = super::read_symbol_handler::parse_live_file(resolved_file_path.clone())
-                .await?;
+            let live =
+                super::read_symbol_handler::parse_live_file(resolved_file_path.clone()).await?;
             let file_label = project_root
                 .as_deref()
                 .and_then(|root| resolved_file_path.strip_prefix(root).ok())
                 .map(|rel| rel.to_string_lossy().into_owned())
                 .unwrap_or_else(|| resolved_file_path.to_string_lossy().into_owned());
-            let elided = read_paths::elide_around(
-                &content,
-                &live.symbols,
-                focus,
-                &file_label,
-                max_lines,
-            )
-            .map_err(JsonRpcError::invalid_params)?;
+            let elided =
+                read_paths::elide_around(&content, &live.symbols, focus, &file_label, max_lines)
+                    .map_err(JsonRpcError::invalid_params)?;
 
             let mut result = serde_json::json!({
                 "file_path": handle.file_path,
@@ -629,7 +623,10 @@ Works for any absolute path, including outside the project — no index required
                     "neural_status": "not_used_exact"
                 }),
             });
-            result = wrap_read_result(result, project_root.as_deref().unwrap_or(&resolved_file_path));
+            result = wrap_read_result(
+                result,
+                project_root.as_deref().unwrap_or(&resolved_file_path),
+            );
             // The focus bytes were served in full — record that range.
             ledger.record(
                 session,
@@ -684,8 +681,7 @@ Works for any absolute path, including outside the project — no index required
                     for (s, e) in &unseen {
                         let end = (*e).min(total_lines.max(1));
                         if let Ok(slice) = visible_slice(&content, *s, end, total_lines) {
-                            let numbered =
-                                read_paths::number_lines(&slice, *s);
+                            let numbered = read_paths::number_lines(&slice, *s);
                             if !body.is_empty() {
                                 body.push('\n');
                             }
@@ -724,7 +720,9 @@ Works for any absolute path, including outside the project — no index required
         let content_str = visible_slice(&content, start_line, end_line, total_lines)?;
 
         let maybe_handle = ensure_symbol_map_pdg(
-            registry.try_get_loaded(&project_root.as_deref().unwrap_or(Path::new(""))).await,
+            registry
+                .try_get_loaded(project_root.as_deref().unwrap_or(Path::new("")))
+                .await,
             include_symbol_map,
         )
         .await;
@@ -773,10 +771,325 @@ Works for any absolute path, including outside the project — no index required
             result["symbol_map"] = serde_json::json!(symbol_map);
         }
 
-        result = wrap_read_result(result, project_root.as_deref().unwrap_or(&resolved_file_path));
+        result = wrap_read_result(
+            result,
+            project_root.as_deref().unwrap_or(&resolved_file_path),
+        );
 
-        ledger.record(session, &resolved_file_path, &content_hash, start_line, end_line);
+        ledger.record(
+            session,
+            &resolved_file_path,
+            &content_hash,
+            start_line,
+            end_line,
+        );
 
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::mcp::helpers::test_registry_for;
+    use tempfile::tempdir;
+
+    /// Isolated session key: tests must never share ledger state with each
+    /// other or with the process-default session.
+    fn test_session(name: &str) -> String {
+        format!("test-{name}-{}", std::process::id())
+    }
+
+    const SAMPLE: &str = "/// Doc.\n#[derive(Debug)]\npub fn alpha() -> u32 {\n    1\n}\n\n/// Beta doc.\npub fn beta(x: u32) -> u32 {\n    x + 1\n}\n\npub struct Gamma {\n    pub field: u32,\n}\n";
+
+    fn write_sample(dir: &std::path::Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, SAMPLE).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn test_read_file_numbers_lines_exactly_once() {
+        // §3.1 regression: the numbered body is `N code`, never `N: code` and
+        // never a second gutter.
+        let dir = tempdir().unwrap();
+        let path = write_sample(dir.path(), "sample.rs");
+        let registry = test_registry_for(dir.path());
+        let result = ReadFileHandler
+            .execute(
+                &registry,
+                serde_json::json!({
+                    "file_path": path.to_string_lossy(),
+                    "project_path": dir.path().to_string_lossy(),
+                    "_session": test_session("dedup-basic"),
+                }),
+            )
+            .await
+            .unwrap();
+        let content = result["content"].as_str().unwrap();
+        assert!(content.starts_with("1 /// Doc.\n"), "{content}");
+        assert!(content.contains("2 #[derive(Debug)]"), "{content}");
+        assert!(content.contains("8 pub fn beta"), "{content}");
+        assert!(!content.contains("│"), "no gutter bar: {content}");
+        assert!(!content.contains("1:"), "no colon number: {content}");
+    }
+
+    #[tokio::test]
+    async fn test_second_identical_read_returns_unchanged_marker() {
+        let dir = tempdir().unwrap();
+        let path = write_sample(dir.path(), "sample.rs");
+        let registry = test_registry_for(dir.path());
+        let session = test_session("unchanged");
+        let args = serde_json::json!({
+            "file_path": path.to_string_lossy(),
+            "project_path": dir.path().to_string_lossy(),
+            "_session": session,
+        });
+        let first = ReadFileHandler
+            .execute(&registry, args.clone())
+            .await
+            .unwrap();
+        assert!(first.get("status").is_none(), "first read serves bytes");
+        let second = ReadFileHandler.execute(&registry, args).await.unwrap();
+        assert_eq!(second["status"], "unchanged", "{}", second);
+        assert!(
+            second["note"]
+                .as_str()
+                .unwrap()
+                .contains("unchanged since read #1 (lines 1-"),
+            "{}",
+            second["note"].as_str().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fresh_opt_out_bypasses_dedup() {
+        let dir = tempdir().unwrap();
+        let path = write_sample(dir.path(), "sample.rs");
+        let registry = test_registry_for(dir.path());
+        let session = test_session("fresh");
+        let base = serde_json::json!({
+            "file_path": path.to_string_lossy(),
+            "project_path": dir.path().to_string_lossy(),
+            "_session": session,
+        });
+        ReadFileHandler
+            .execute(&registry, base.clone())
+            .await
+            .unwrap();
+        let mut fresh_args = base.clone();
+        fresh_args["fresh"] = serde_json::json!(true);
+        let again = ReadFileHandler
+            .execute(&registry, fresh_args)
+            .await
+            .unwrap();
+        assert!(
+            again.get("status").is_none() && again["content"].as_str().is_some(),
+            "fresh:true serves bytes: {}",
+            again
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_invalidates_dedup_and_next_read_serves_bytes() {
+        let dir = tempdir().unwrap();
+        let path = write_sample(dir.path(), "sample.rs");
+        let registry = test_registry_for(dir.path());
+        let session = test_session("edit");
+        let args = serde_json::json!({
+            "file_path": path.to_string_lossy(),
+            "project_path": dir.path().to_string_lossy(),
+            "_session": session,
+        });
+        ReadFileHandler
+            .execute(&registry, args.clone())
+            .await
+            .unwrap();
+        // External modification of the file changes the content hash — the
+        // ledger must serve the new bytes, never a stale `unchanged`.
+        std::fs::write(&path, SAMPLE.replace("x + 1", "x + 2")).unwrap();
+        let after = ReadFileHandler.execute(&registry, args).await.unwrap();
+        assert!(
+            after.get("status").is_none() && after["content"].as_str().is_some(),
+            "changed file must be re-served: {}",
+            after
+        );
+        assert!(after["content"].as_str().unwrap().contains("x + 2"));
+    }
+
+    #[tokio::test]
+    async fn test_read_outside_project_reads_live_without_index() {
+        // §6.1: logs, /tmp and other repos are readable — no index, no root.
+        let outside =
+            std::env::temp_dir().join(format!("leindex-lane-e-{}-sample.txt", std::process::id()));
+        std::fs::write(&outside, "alpha\nbeta\ngamma\n").unwrap();
+        let dir = tempdir().unwrap();
+        let registry = test_registry_for(dir.path());
+        let result = ReadFileHandler
+            .execute(
+                &registry,
+                serde_json::json!({
+                    "file_path": outside.to_string_lossy(),
+                    "project_path": dir.path().to_string_lossy(),
+                    "_session": test_session("outside"),
+                }),
+            )
+            .await
+            .unwrap();
+        let content = result["content"].as_str().unwrap();
+        assert!(content.contains("2 beta"), "{content}");
+        std::fs::remove_file(&outside).ok();
+    }
+
+    #[tokio::test]
+    async fn test_handle_expands_line_range_and_symbol() {
+        let dir = tempdir().unwrap();
+        let path = write_sample(dir.path(), "sample.rs");
+        let registry = test_registry_for(dir.path());
+        let range = ReadFileHandler
+            .execute(
+                &registry,
+                serde_json::json!({
+                    "file_path": format!("{}#L1-2", path.to_string_lossy()),
+                    "project_path": dir.path().to_string_lossy(),
+                    "_session": test_session("handle-range"),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(range["start_line"], 1);
+        assert_eq!(range["end_line"], 2);
+        assert_eq!(
+            range["content"].as_str().unwrap().lines().count(),
+            2,
+            "{}",
+            range
+        );
+
+        let symbol = ReadFileHandler
+            .execute(
+                &registry,
+                serde_json::json!({
+                    "file_path": format!("{}#alpha", path.to_string_lossy()),
+                    "project_path": dir.path().to_string_lossy(),
+                    "_session": test_session("handle-symbol"),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(symbol["anchor_symbol"], "alpha");
+        // Item spans start at the item keyword; the doc comment hangs above.
+        assert_eq!(symbol["anchor_line_start"], 3);
+        assert_eq!(symbol["anchor_line_end"], 5);
+    }
+
+    #[tokio::test]
+    async fn test_elided_read_collapses_siblings_and_reports_handles() {
+        let dir = tempdir().unwrap();
+        let path = write_sample(dir.path(), "sample.rs");
+        let registry = test_registry_for(dir.path());
+        let result = ReadFileHandler
+            .execute(
+                &registry,
+                serde_json::json!({
+                    "file_path": path.to_string_lossy(),
+                    "project_path": dir.path().to_string_lossy(),
+                    "_session": test_session("elide"),
+                    "focus_symbol": "beta",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["elided"], true);
+        let content = result["content"].as_str().unwrap();
+        // The focus item is verbatim; siblings are one-line collapses with
+        // their own expand handles.
+        assert!(
+            content.contains("pub fn beta(x: u32) -> u32 {"),
+            "{content}"
+        );
+        assert!(
+            content.contains("[expand: sample.rs#alpha]"),
+            "sibling collapsed: {content}"
+        );
+        assert!(
+            content.contains("[expand: sample.rs#Gamma]"),
+            "struct collapsed: {content}"
+        );
+        assert!(!content.contains("pub field: u32"), "{content}");
+        assert_eq!(result["expand"], "sample.rs#beta");
+        let collapsed = result["collapsed"].as_array().unwrap();
+        assert_eq!(collapsed.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_read_never_reports_initializing_for_an_unindexed_project() {
+        // §3.10: a live filesystem read is exact bytes; it must never claim
+        // another file's reindex state — not `initializing`, on any path.
+        let dir = tempdir().unwrap();
+        let path = write_sample(dir.path(), "sample.rs");
+        let registry = test_registry_for(dir.path());
+        let result = ReadFileHandler
+            .execute(
+                &registry,
+                serde_json::json!({
+                    "file_path": path.to_string_lossy(),
+                    "project_path": dir.path().to_string_lossy(),
+                    "_session": test_session("freshness"),
+                }),
+            )
+            .await
+            .unwrap();
+        let serialized = result.to_string();
+        assert!(
+            !serialized.contains("initializing"),
+            "read must not report reindex state: {serialized}"
+        );
+        assert_eq!(result["_meta"]["read_source"], "live_bytes");
+        let status = result["_meta"]["freshness"]["status"].as_str().unwrap();
+        assert_ne!(status, "initializing");
+    }
+
+    #[tokio::test]
+    async fn test_partial_overlap_serves_only_unseen_lines() {
+        let dir = tempdir().unwrap();
+        let path = write_sample(dir.path(), "sample.rs");
+        let registry = test_registry_for(dir.path());
+        let session = test_session("overlap");
+        ReadFileHandler
+            .execute(
+                &registry,
+                serde_json::json!({
+                    "file_path": path.to_string_lossy(),
+                    "project_path": dir.path().to_string_lossy(),
+                    "_session": session,
+                    "start_line": 1,
+                    "end_line": 4,
+                }),
+            )
+            .await
+            .unwrap();
+        let wider = ReadFileHandler
+            .execute(
+                &registry,
+                serde_json::json!({
+                    "file_path": path.to_string_lossy(),
+                    "project_path": dir.path().to_string_lossy(),
+                    "_session": session,
+                    "start_line": 1,
+                    "end_line": 8,
+                }),
+            )
+            .await
+            .unwrap();
+        // Overlapping read: the new lines (5-8) are served, the overlap is
+        // referenced instead of repeated.
+        assert!(wider.get("unchanged_since_read").is_some(), "{}", wider);
+        let content = wider["content"].as_str().unwrap();
+        assert!(content.contains("8 pub fn beta"), "{content}");
+        assert!(
+            !content.contains("2 #[derive"),
+            "overlap re-served: {content}"
+        );
     }
 }

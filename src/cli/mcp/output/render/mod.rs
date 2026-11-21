@@ -765,8 +765,35 @@ fn render_file_summary(data: &Value, color: bool) -> String {
 
 fn render_read_file(data: &Value, color: bool) -> String {
     let mut out = String::new();
-    if let Some(path) = data.get("file_path").and_then(|v| v.as_str()) {
-        out.push_str(&header(&format!("Read: {}", path), color));
+    // Range header (brief §4.1): `── path:600-800 (rust) ──`, or the elided
+    // view marker when a focus_symbol collapsed the siblings.
+    let path = data.get("file_path").and_then(|v| v.as_str());
+    let start = data.get("start_line").and_then(|v| v.as_u64());
+    let end = data.get("end_line").and_then(|v| v.as_u64());
+    let lang = data.get("language").and_then(|v| v.as_str());
+    if data.get("elided").and_then(Value::as_bool) == Some(true) {
+        let focus = data
+            .get("focus_symbol")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let title = match (path, lang) {
+            (Some(path), Some(lang)) => {
+                format!("Read (elided: {focus}): {path} ({lang})")
+            }
+            (Some(path), None) => format!("Read (elided: {focus}): {path}"),
+            _ => format!("Read (elided: {focus})"),
+        };
+        out.push_str(&header(&title, color));
+        out.push('\n');
+    } else if let (Some(path), Some(start), Some(end)) = (path, start, end) {
+        let title = match lang {
+            Some(lang) => format!("Read: {path}:{start}-{end} ({lang})"),
+            None => format!("Read: {path}:{start}-{end}"),
+        };
+        out.push_str(&header(&title, color));
+        out.push('\n');
+    } else if let Some(path) = path {
+        out.push_str(&header(&format!("Read: {path}"), color));
         out.push('\n');
     }
     // Session dedup verdict (§4.1): a re-read of unchanged content is a
@@ -784,17 +811,13 @@ fn render_read_file(data: &Value, color: bool) -> String {
         .get("content")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    let start = data.get("start_line").and_then(|v| v.as_u64()).unwrap_or(1);
-    for (i, line) in content.lines().enumerate() {
-        let n = start + i as u64;
-        let gutter = format!("{:>4}", n);
-        out.push_str(&format!(
-            "  {}{}{}│ {}\n",
-            if color { DIM } else { "" },
-            gutter,
-            if color { RESET } else { "" },
-            line,
-        ));
+    // §3.1: `content` already carries exactly one unpadded number per line
+    // (`600 code`, from `read_paths::number_lines`). Emit it verbatim; this
+    // renderer adds NO second gutter. The old `  600│ 600: code` form was
+    // the duplication defect.
+    out.push_str(content);
+    if !content.is_empty() && !content.ends_with('\n') {
+        out.push('\n');
     }
     // `include_symbol_map=true` requests per-symbol PDG annotations for the
     // read range; the handler builds them and the trimmer keeps them, but

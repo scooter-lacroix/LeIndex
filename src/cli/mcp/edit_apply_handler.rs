@@ -29,6 +29,15 @@ fn apply_request_args(
     ))
 }
 
+/// The session key the read ledger records edits under (§4.1): the transport
+/// injects `_session` (the MCP session id); direct CLI calls land under the
+/// process-scoped key, matching how reads record.
+fn session_id_for_ledger(args: &Value) -> &str {
+    args.get("_session")
+        .and_then(Value::as_str)
+        .unwrap_or("__process__")
+}
+
 fn cached_edit(entry: Option<EditCacheEntry>, token: &str) -> Result<PreparedEdit, JsonRpcError> {
     let entry = entry.ok_or_else(|| {
         JsonRpcError::invalid_params(
@@ -466,6 +475,12 @@ edits). Supports dry_run=true for preview."
             guard.project_path().to_path_buf()
         };
         registry.invalidate_stale_cache(&project_root).await;
+
+        // §4.1/§6.9 (lane E): a durable edit invalidates this session's
+        // cached reads for the file and is listed by the session-reads
+        // resource. Fire-and-forget: ledger failures can never fail an edit.
+        crate::cli::mcp::read_paths::session_ledger()
+            .record_edit(session_id_for_ledger(&args), &canonical_path);
 
         // 6. Build the response NOW — the edit is durable and every field
         // is already computed (impact runs against the pre-edit PDG loaded

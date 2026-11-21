@@ -5,11 +5,22 @@ use super::*;
 
 fn symbol_at(content: &str, name: &str, start_marker: &str) -> CatalogSymbol {
     let start = content.find(start_marker).unwrap();
-    // Span ends AT the closing brace, excluding the trailing newline —
-    // the shape tree-sitter item spans actually have.
+    // Span ends AT the item's own closing brace (first line starting with
+    // `}` at column 0), including it but not the trailing newline — the
+    // shape tree-sitter item spans actually have. The old fixture scanned
+    // for the first `\n}\n` ANYWHERE below the start, so for an item whose
+    // first closing brace belongs to a nested block it swallowed every line
+    // down to some later item's closer and invented a line span that does
+    // not exist in the file.
     let end = content[start..]
-        .find("\n}\n")
-        .map(|pos| start + pos + 1)
+        .lines()
+        .scan(0usize, |offset, line| {
+            let here = *offset;
+            *offset += line.len() + 1;
+            Some((here, line))
+        })
+        .find(|(_, line)| line.starts_with('}'))
+        .map(|(line_offset, line)| start + line_offset + line.len())
         .unwrap_or(content.len());
     CatalogSymbol {
         node_id: format!("fixture.rs:{name}"),
@@ -95,8 +106,9 @@ fn test_handles_round_trip_through_parse() {
     let parsed = parse_read_handle(&range_handle, Some(root));
     assert_eq!(parsed.line_range, Some((600, 800)));
 
-    let symbol_handle = handle_for_symbol(&file, Some(root), "focus");
-    assert_eq!(symbol_handle, "src/lib.rs#focus");
+    // Symbol handles are rendered inline (`elide_around`, the read_symbol
+    // handler); pin their round-trip contract through the parser here.
+    let symbol_handle = format!("{}#focus", "src/lib.rs");
     let parsed = parse_read_handle(&symbol_handle, Some(root));
     assert_eq!(parsed.symbol.as_deref(), Some("focus"));
 }
@@ -148,14 +160,19 @@ fn test_elide_collapses_siblings_and_keeps_focus_verbatim() {
         out.body
     );
     assert!(
-        out.body
-            .contains("8 pub fn sibling(x: u32) -> u32 { … 5 lines }  [expand: fixture.rs#sibling]"),
+        out.body.contains(
+            "8 pub fn sibling(x: u32) -> u32 { … 5 lines }  [expand: fixture.rs#sibling]"
+        ),
         "fn collapsed: {}",
         out.body
     );
     // Focus item verbatim, including its doc comment (lines 14-17).
     assert!(out.body.contains("14 /// Doc for focus."), "{}", out.body);
-    assert!(out.body.contains("15 pub fn focus() -> u32 {"), "{}", out.body);
+    assert!(
+        out.body.contains("15 pub fn focus() -> u32 {"),
+        "{}",
+        out.body
+    );
     assert!(out.body.contains("17 }"), "{}", out.body);
     // Collapsed bodies and their doc/attr blocks are gone.
     assert!(!out.body.contains("pub a: u32"), "{}", out.body);
@@ -214,7 +231,7 @@ fn test_top_level_spans_filter_nested_items() {
 }
 
 #[test]
-fn test_find_span_prefix_fallback() {
+fn test_find_span_suffix_fallback() {
     let spans = vec![SymbolSpan {
         name: "Impl::build_x".into(),
         start_byte: 0,
@@ -222,7 +239,10 @@ fn test_find_span_prefix_fallback() {
         start_line: 1,
         end_line: 5,
     }];
-    assert_eq!(find_span(&spans, "build_x").map(|s| s.name.as_str()), Some("Impl::build_x"));
+    assert_eq!(
+        find_span(&spans, "build_x").map(|s| s.name.as_str()),
+        Some("Impl::build_x")
+    );
 }
 
 // =============================================================================
@@ -259,7 +279,10 @@ fn test_different_session_does_not_share_reads() {
     let ledger = SessionLedger::new(8, 64);
     let path = Path::new("/proj/src/lib.rs");
     ledger.record("s1", path, "hash-a", 600, 800);
-    assert_eq!(ledger.consult("s2", path, "hash-a", 600, 800), ConsultVerdict::New);
+    assert_eq!(
+        ledger.consult("s2", path, "hash-a", 600, 800),
+        ConsultVerdict::New
+    );
 }
 
 #[test]
@@ -267,9 +290,23 @@ fn test_content_change_resets_reads() {
     let ledger = SessionLedger::new(8, 64);
     let path = Path::new("/proj/src/lib.rs");
     let first = ledger.record("s1", path, "hash-a", 600, 800);
-    ledger.record("s1", path, "hash-b", 600, 800);
-    assert_eq!(ledger.consult("s1", path, "hash-a", 600, 800), ConsultVerdict::New);
-    assert_eq!(ledger.consult("s1", path, "hash-b", 600, 800), ConsultVerdict::New);
+    let second = ledger.record("s1", path, "hash-b", 600, 800);
+    // The stale content's cached read is gone after the content change...
+    assert_eq!(
+        ledger.consult("s1", path, "hash-a", 600, 800),
+        ConsultVerdict::New
+    );
+    // ...and the re-read of the NEW content was itself served (record #2),
+    // so a repeat hits the unchanged marker: a content change resets the old
+    // entries, it does not disable dedup for the new content.
+    assert_eq!(
+        ledger.consult("s1", path, "hash-b", 600, 800),
+        ConsultVerdict::Unchanged {
+            since_ordinal: second,
+            start_line: 600,
+            end_line: 800
+        }
+    );
     assert!(first > 0);
 }
 
@@ -279,7 +316,10 @@ fn test_edit_invalidates_cached_reads_until_reread() {
     let path = Path::new("/proj/src/lib.rs");
     let ordinal = ledger.record("s1", path, "hash-a", 600, 800);
     ledger.record_edit("s1", path);
-    assert_eq!(ledger.consult("s1", path, "hash-a", 600, 800), ConsultVerdict::New);
+    assert_eq!(
+        ledger.consult("s1", path, "hash-a", 600, 800),
+        ConsultVerdict::New
+    );
     // The post-edit re-read of the same bytes is served (a fresh hash).
     let after = ledger.record("s1", path, "hash-post", 600, 800);
     assert!(after > ordinal);
@@ -314,8 +354,14 @@ fn test_ledger_sessions_are_bounded() {
     ledger.record("second", path, "h", 1, 2);
     ledger.record("third", path, "h", 1, 2);
     // The oldest session was evicted.
-    assert_eq!(ledger.consult("first", path, "h", 1, 2), ConsultVerdict::New);
-    assert_ne!(ledger.consult("second", path, "h", 1, 2), ConsultVerdict::New);
+    assert_eq!(
+        ledger.consult("first", path, "h", 1, 2),
+        ConsultVerdict::New
+    );
+    assert_ne!(
+        ledger.consult("second", path, "h", 1, 2),
+        ConsultVerdict::New
+    );
 }
 
 #[test]
@@ -334,7 +380,10 @@ fn test_ledger_reads_per_file_are_bounded() {
 
 #[test]
 fn test_merge_ranges_merges_adjacent_and_overlapping() {
-    assert_eq!(merge_ranges(vec![(1, 5), (6, 9), (20, 25), (21, 30)]), vec![(1, 9), (20, 30)]);
+    assert_eq!(
+        merge_ranges(vec![(1, 5), (6, 9), (20, 25), (21, 30)]),
+        vec![(1, 9), (20, 30)]
+    );
     assert!(merge_ranges(Vec::new()).is_empty());
 }
 

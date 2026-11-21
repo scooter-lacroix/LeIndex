@@ -516,6 +516,12 @@ fn trim_read_file(data: &Value) -> Value {
     // (start_line / end_line), so we keep it. Drop `symbol_map` unless
     // the handler populated it; the per-entry callers/callees arrays
     // can also be capped.
+    //
+    // §3.1/§4.1 (lane E): `content` now carries exactly one unpadded line
+    // number per line (`600 code`), a `handle` gives the stable
+    // `path#L…` read handle, and a session-dedup verdict may replace the
+    // bytes entirely (`status: unchanged` + `note`). Elided reads carry
+    // `collapsed` (sibling signatures with their own expand handles).
     let mut out = serde_json::Map::new();
     out.insert(
         "file_path".to_string(),
@@ -541,6 +547,29 @@ fn trim_read_file(data: &Value) -> Value {
         "content".to_string(),
         data.get("content").cloned().unwrap_or(Value::Null),
     );
+    // §4.1 (lane E): stable read handle, session-dedup verdict fields, and
+    // the elided-view projection. Only present when the handler set them.
+    for key in [
+        "handle",
+        "status",
+        "note",
+        "unchanged_since_read",
+        "unchanged_ranges",
+        "lines",
+        "elided",
+        "focus_symbol",
+        "focus_line_start",
+        "focus_line_end",
+        "expand",
+        "collapsed",
+        "anchor_symbol",
+        "anchor_line_start",
+        "anchor_line_end",
+    ] {
+        if let Some(v) = data.get(key) {
+            out.insert(key.to_string(), v.clone());
+        }
+    }
     if let Some(ctx) = data.get("context")
         && let Some(obj) = ctx.as_object()
     {

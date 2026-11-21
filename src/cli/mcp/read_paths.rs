@@ -34,33 +34,66 @@ pub(crate) struct ReadHandle {
     pub line_range: Option<(usize, usize)>,
 }
 
+/// Split `path#fragment` into the file part and the raw fragment.
+/// A `#` with an empty file part (`#foo`) stays in the file part.
+pub(crate) fn split_read_fragment(raw: &str) -> (String, Option<String>) {
+    match raw.split_once('#') {
+        Some((file, fragment)) if !file.is_empty() => {
+            (file.to_string(), Some(fragment.to_string()))
+        }
+        _ => (raw.to_string(), None),
+    }
+}
+
+/// Classify a handle fragment: `L600-800` / `L600` / `600-800` → inclusive
+/// 1-based range; anything else is a symbol name.
+pub(crate) fn classify_fragment(fragment: &str) -> Fragment {
+    if let Some(range) = parse_line_fragment(fragment) {
+        return Fragment::LineRange(range);
+    }
+    let trimmed = fragment.trim();
+    if trimmed.is_empty() {
+        return Fragment::None;
+    }
+    Fragment::Symbol(trimmed.to_string())
+}
+
+/// A classified handle fragment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Fragment {
+    /// `path#L600-800`
+    LineRange((usize, usize)),
+    /// `path#symbol`
+    Symbol(String),
+    /// Empty fragment (`path#`)
+    None,
+}
+
 /// Split a `file_path` argument into file, symbol and line-range parts.
 ///
 /// `#` starts a fragment: `#symbol` or `#L<start>-<end>` (also `#L<start>`,
 /// meaning the single line). The two escapes MCP clients actually produce for
 /// spaces and for a literal `#` in a filename are decoded.
 pub(crate) fn parse_read_handle(raw: &str, project_root: Option<&Path>) -> ReadHandle {
-    let decoded = raw.replace("%20", " ").replace("%23", "#");
-    let (file_part, fragment) = match decoded.split_once('#') {
-        Some((file, fragment)) if !file.is_empty() => (file, Some(fragment)),
-        _ => (decoded.as_str(), None),
+    // Split FIRST, decode second: `%23` in a path is an escaped literal `#`
+    // (a filename like `a b#c.rs`), never a fragment separator — decoding
+    // before the split would cut the file part at the escaped `#`.
+    let (file_part, fragment) = split_read_fragment(raw);
+    let decode = |part: &str| part.replace("%20", " ").replace("%23", "#");
+    let decoded_file = decode(&file_part);
+    let decoded_fragment = fragment.as_deref().map(decode);
+
+    let (line_range, symbol) = match decoded_fragment.as_deref().map(classify_fragment) {
+        Some(Fragment::LineRange(range)) => (Some(range), None),
+        Some(Fragment::Symbol(symbol)) => (None, Some(symbol)),
+        _ => (None, None),
     };
 
-    let mut line_range = None;
-    let mut symbol = None;
-    if let Some(fragment) = fragment {
-        if let Some(range) = parse_line_fragment(fragment) {
-            line_range = Some(range);
-        } else if !fragment.trim().is_empty() {
-            symbol = Some(fragment.trim().to_string());
-        }
-    }
-
     let file_path = match project_root {
-        Some(root) if !Path::new(file_part).is_absolute() && !file_part.is_empty() => {
-            root.join(file_part).to_string_lossy().into_owned()
+        Some(root) if !Path::new(&decoded_file).is_absolute() && !decoded_file.is_empty() => {
+            root.join(&decoded_file).to_string_lossy().into_owned()
         }
-        _ => file_part.to_string(),
+        _ => decoded_file,
     };
 
     ReadHandle {
@@ -104,22 +137,13 @@ pub(crate) fn handle_for_range(
     )
 }
 
-/// Render the stable handle for a symbol: `path#symbol`.
-pub(crate) fn handle_for_symbol(
-    file_path: &Path,
-    project_root: Option<&Path>,
-    symbol: &str,
-) -> String {
-    format!("{}#{}", display_path(file_path, project_root), symbol)
-}
-
 /// Project-relative display when the file is under the root, absolute path
 /// otherwise. Handles read back identically via [`parse_read_handle`].
 fn display_path(file_path: &Path, project_root: Option<&Path>) -> String {
-    if let Some(root) = project_root {
-        if let Ok(rel) = file_path.strip_prefix(root) {
-            return rel.to_string_lossy().into_owned();
-        }
+    if let Some(root) = project_root
+        && let Ok(rel) = file_path.strip_prefix(root)
+    {
+        return rel.to_string_lossy().into_owned();
     }
     file_path.to_string_lossy().into_owned()
 }
@@ -239,12 +263,14 @@ pub(crate) fn top_level_spans(spans: &[SymbolSpan]) -> Vec<SymbolSpan> {
         .collect()
 }
 
-/// Find the span for `focus` among `spans` (exact name, then prefix).
+/// Find the span for `focus` among `spans` (exact name, then suffix —
+/// handles name the bare item, parses may carry a qualifier like
+/// `Impl::build_x`).
 pub(crate) fn find_span<'a>(spans: &'a [SymbolSpan], focus: &str) -> Option<&'a SymbolSpan> {
     spans
         .iter()
         .find(|span| span.name == focus)
-        .or_else(|| spans.iter().find(|span| span.name.starts_with(focus)))
+        .or_else(|| spans.iter().find(|span| span.name.ends_with(focus)))
 }
 
 /// Build the elided read: focus span verbatim, every other top-level span
@@ -327,9 +353,8 @@ pub(crate) fn elide_around(
     collapsed_lines.sort_unstable();
     collapsed_lines.dedup();
 
-    let in_focus = |line_no: usize| {
-        line_no >= focus_span.start_line && line_no <= focus_span.end_line
-    };
+    let in_focus =
+        |line_no: usize| line_no >= focus_span.start_line && line_no <= focus_span.end_line;
 
     let mut out = String::new();
     let mut emitted = 0usize;
@@ -475,7 +500,10 @@ impl SessionLedger {
         start_line: usize,
         end_line: usize,
     ) -> ConsultVerdict {
-        let inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(state) = inner.sessions.get(session) else {
             return ConsultVerdict::New;
         };
@@ -542,6 +570,7 @@ impl SessionLedger {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cap = inner.max_reads_per_file;
         let key: Arc<str> = Arc::from(session);
         if !inner.sessions.contains_key(&key) {
             // Admit at most `max_sessions` resident sessions: evict in
@@ -571,7 +600,6 @@ impl SessionLedger {
             entry.invalidated = false;
         }
         entry.reads.push((ordinal, start_line, end_line));
-        let cap = inner.max_reads_per_file;
         if entry.reads.len() > cap {
             entry.reads.drain(0..entry.reads.len() - cap);
         }
@@ -586,25 +614,29 @@ impl SessionLedger {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cap = inner.max_reads_per_file;
         let Some(state) = inner.sessions.get_mut(session) else {
             return;
         };
         state.next_ordinal += 1;
         let ordinal = state.next_ordinal;
-        let entry = state
-            .files
-            .entry(path.to_path_buf())
-            .or_insert(FileRecord {
-                content_hash: String::new(),
-                reads: Vec::new(),
-                invalidated: false,
-            });
+        let entry = state.files.entry(path.to_path_buf()).or_insert(FileRecord {
+            content_hash: String::new(),
+            reads: Vec::new(),
+            invalidated: false,
+        });
         entry.invalidated = true;
         state.edits.push((ordinal, path.to_path_buf()));
-        let cap = inner.max_reads_per_file;
         if state.edits.len() > cap {
             state.edits.drain(0..state.edits.len() - cap);
         }
+    }
+
+    /// Render the `leindex://session/reads` resource body for `session`.
+    /// `None` (stdio, direct CLI) renders the process-default session.
+    pub(crate) fn render(&self, session: Option<&str>) -> String {
+        let (entries, edits) = self.summarize_session(session.unwrap_or("__process__"));
+        render_session_reads(&entries, &edits)
     }
 
     /// Per-file read entries `(path, [(ordinal, start, end)])` in first-read
@@ -613,7 +645,10 @@ impl SessionLedger {
     pub(crate) fn summarize_session(
         &self,
         session: &str,
-    ) -> (Vec<(PathBuf, Vec<(u64, usize, usize)>)>, Vec<(u64, PathBuf)>) {
+    ) -> (
+        Vec<(PathBuf, Vec<(u64, usize, usize)>)>,
+        Vec<(u64, PathBuf)>,
+    ) {
         let inner = self
             .inner
             .lock()
@@ -624,7 +659,7 @@ impl SessionLedger {
         let mut files: Vec<(PathBuf, Vec<(u64, usize, usize)>)> = state
             .files
             .iter()
-            .filter(|(_, record)| !record.reads.is_empty() && !record.invalidated)
+            .filter(|(_, record)| !record.reads.is_empty())
             .map(|(path, record)| (path.clone(), record.reads.clone()))
             .collect();
         files.sort_by_key(|(_, reads)| reads.first().map(|r| r.0).unwrap_or(0));

@@ -1049,7 +1049,7 @@ async fn json_rpc_handler(headers: HeaderMap, Json(body): Json<Value>) -> Respon
         "prompts/list" => Ok(list_prompts_json()),
         "prompts/get" => handle_prompt_get(&json_req),
         "resources/list" => Ok(list_resources_json()),
-        "resources/read" => handle_resource_read(&json_req),
+        "resources/read" => handle_resource_read(&json_req, incoming_session_id.as_deref()),
         _ => Err(JsonRpcError::method_not_found(json_req.method.clone())),
     };
 
@@ -1126,6 +1126,15 @@ async fn handle_tool_call_timed(
         Ok(tier) => tier,
         Err(error) => return Ok(tool_error_result(&error, None)),
     };
+    // Lane E (§4.1): stamp the transport session id onto the call so
+    // session-scoped state (the per-session read ledger behind
+    // `leindex://session/reads`) keys on the caller's session instead of the
+    // whole process. Handlers that don't care ignore the extra field.
+    if let Some((_, sid)) = advisory
+        && let Some(obj) = resolved_args.as_object_mut()
+    {
+        obj.insert("_session".to_string(), Value::String((*sid).to_string()));
+    }
     let canonical_name = crate::cli::mcp::output::normalize_tool_name(&resolved_name);
     let tool_call = super::protocol::ToolCallParams {
         name: resolved_name,
@@ -1814,7 +1823,7 @@ async fn handle_socket_message(
                 }
                 "resources/list" => JsonRpcResponse::success(request_id, list_resources_json()),
                 "resources/read" => {
-                    let result = handle_resource_read(&request);
+                    let result = handle_resource_read(&request, Some(session_id));
                     match result {
                         Ok(value) => JsonRpcResponse::success(request_id, value),
                         Err(e) => JsonRpcResponse::error(request_id, e),
