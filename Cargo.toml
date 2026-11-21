@@ -659,6 +659,7 @@ strip = false
 members = [
     ".",
     "tools/memcheck",
+    "tools/tokbench",
     "tools/xtask",
 ]
 
