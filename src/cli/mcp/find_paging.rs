@@ -50,6 +50,21 @@ fn store() -> &'static Mutex<Store> {
     &STORE
 }
 
+/// A fresh, caller-owned store.
+///
+/// The production store is process-wide, so a test that CHURNS past
+/// `STORE_CAP` evicts other tests' live continuations — which showed up as an
+/// intermittent stale-token failure in the handlers' own paging tests.
+/// Eviction tests therefore run against an instance of their own; every other
+/// caller keeps using [`store`].
+#[cfg(test)]
+fn empty_store() -> Store {
+    Store {
+        order: Vec::new(),
+        entries: HashMap::new(),
+    }
+}
+
 /// The arguments a continuation replays: the original call minus the paging
 /// keys, which the token itself carries. `resume_cursors` is a paging key
 /// too: the token owns the per-file resume state (§4.2e/§6.8), and a stable
@@ -94,12 +109,25 @@ pub fn issue_with_cursors(
     next_offset: usize,
     cursors: &Value,
 ) -> String {
+    issue_in(store(), tool, args, next_offset, cursors)
+}
+
+/// [`issue_with_cursors`] against an explicit store. Production uses the
+/// process-wide one ([`store`]); the eviction tests use an instance of their
+/// own so churning past the cap cannot evict another test's live token.
+fn issue_in(
+    store: &Mutex<Store>,
+    tool: &'static str,
+    args: &Value,
+    next_offset: usize,
+    cursors: &Value,
+) -> String {
     let stored = continuation_args(args);
     if stored.is_null() {
         return String::new();
     }
     let hash = hash_args(&stored);
-    let Ok(mut guard) = store().lock() else {
+    let Ok(mut guard) = store.lock() else {
         return String::new();
     };
     if !guard.entries.contains_key(&hash) {
@@ -145,6 +173,15 @@ pub struct Continuation {
 /// stale, truncated, or was issued by a different tool — the caller gets an
 /// actionable message instead of a silently different query.
 pub fn resume(tool: &'static str, token: &str) -> Result<Continuation, String> {
+    resume_in(store(), tool, token)
+}
+
+/// [`resume`] against an explicit store (the eviction tests' own instance).
+fn resume_in(
+    store: &Mutex<Store>,
+    tool: &'static str,
+    token: &str,
+) -> Result<Continuation, String> {
     let (hash_part, offset_part) = token
         .split_once('.')
         .ok_or_else(|| "malformed next token; re-send the query".to_string())?;
@@ -153,7 +190,7 @@ pub fn resume(tool: &'static str, token: &str) -> Result<Continuation, String> {
     let offset: usize = offset_part
         .parse()
         .map_err(|_| "malformed next token; re-send the query".to_string())?;
-    let Ok(mut guard) = store().lock() else {
+    let Ok(mut guard) = store.lock() else {
         return Err("continuation store unavailable; re-send the query".to_string());
     };
     let Some(entry) = guard.entries.get(&hash) else {
@@ -286,47 +323,61 @@ mod tests {
     /// for a hash it had never seen, so a caller paging through one query kept
     /// the entry at its ORIGINAL insertion slot — it was the first thing
     /// evicted while actively in use.
+    ///
+    /// The structure matters: the hot hash is re-issued WHILE IT IS STILL
+    /// PRESENT (the only way the refresh branch runs), then a full cap of
+    /// distinct insertions follows. A twin store takes the identical setup
+    /// WITHOUT the re-issue, and the same churn must evict it — that control
+    /// is what makes this test fail if the refresh branch is deleted (an
+    /// earlier version re-issued only after eviction, took the INSERT branch,
+    /// and passed with the fix removed).
+    ///
+    /// Each store is a private instance ([`empty_store`]), so the churn cannot
+    /// evict another test's live continuation from the process-wide store.
     #[test]
     fn test_reissue_refreshes_lru_position_of_an_existing_hash() {
-        let _guard = test_guard();
         let args = json!({ "pattern": "hot-query" });
-        let first = issue("leindex_find", &args, 10);
-        // Churn the store past its cap with distinct queries: without the
-        // recency refresh the hot entry is at the front and dies here.
-        for index in 0..STORE_CAP {
-            issue(
-                "leindex_find",
-                &json!({ "pattern": format!("filler-{index}") }),
-                10,
-            );
-        }
-        assert!(
-            resume("leindex_find", &first).is_err(),
-            "sanity: unrefreshed, the hot entry is evicted by one cap of churn"
-        );
+        // `tag` keeps each churn's hashes distinct: re-inserting the SAME
+        // filler names would take the refresh branch and churn nothing.
+        let churn = |store: &Mutex<Store>, tag: &str| {
+            for index in 0..STORE_CAP - 1 {
+                issue_in(
+                    store,
+                    "leindex_find",
+                    &json!({ "pattern": format!("{tag}-{index}") }),
+                    10,
+                    &Value::Null,
+                );
+            }
+        };
 
-        let reissued = issue("leindex_find", &args, 20);
+        // Twin A: hot entry issued, then RE-ISSUED while still present (the
+        // only way the refresh branch runs).
+        let refreshed_store = Mutex::new(empty_store());
+        issue_in(&refreshed_store, "leindex_find", &args, 10, &Value::Null);
+        churn(&refreshed_store, "first");
+        let token = issue_in(&refreshed_store, "leindex_find", &args, 20, &Value::Null);
+        churn(&refreshed_store, "second");
+
+        // Twin B (control): identical setup, NO re-issue — nothing refreshes
+        // the hot entry's position, so the same churn reaches it first.
+        let stale_store = Mutex::new(empty_store());
+        let stale_token = issue_in(&stale_store, "leindex_find", &args, 10, &Value::Null);
+        churn(&stale_store, "first");
+        churn(&stale_store, "second");
+
         assert_eq!(
-            first.split('.').next(),
-            reissued.split('.').next(),
+            token.split('.').next(),
+            stale_token.split('.').next(),
             "the same query keeps one hash"
         );
         assert!(
-            resume("leindex_find", &reissued).is_ok(),
-            "the re-issued token is live again"
+            resume_in(&stale_store, "leindex_find", &stale_token).is_err(),
+            "control: without the refresh the entry is the oldest and the same churn evicts it"
         );
-        // A further cap of churn keeps it: its recency moved to the back, so
-        // the NEXT evictions are the filler entries, not this one.
-        for index in 0..STORE_CAP - 1 {
-            issue(
-                "leindex_find",
-                &json!({ "pattern": format!("later-{index}") }),
-                10,
-            );
-        }
         assert!(
-            resume("leindex_find", &reissued).is_ok(),
-            "a refreshed entry survives a full cap of subsequent churn"
+            resume_in(&refreshed_store, "leindex_find", &token).is_ok(),
+            "the refreshed entry moved to the back, so a full cap of later insertions cannot evict it"
         );
     }
 }

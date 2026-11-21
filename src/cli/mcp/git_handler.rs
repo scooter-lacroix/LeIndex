@@ -789,12 +789,11 @@ const PLAN_NEXT_HINT: &str = "Nothing was changed. To apply: re-send this call w
 /// *describes* the argv, and every probe it runs is read-only.
 async fn mutation_plan(op: &Op, root: &Path, args: &Value) -> Result<Value, JsonRpcError> {
     let (argv, staging) = if op.name == "add" {
-        // Compute the staging outcome ONCE: it builds the argv below AND is
-        // the report the plan shows, so a second call could disagree with it.
+        // Compute the staging outcome ONCE: the shared helper builds the argv
+        // from it AND it is the report the plan shows, so a second call could
+        // disagree with the argv the token binds.
         let outcome = super::git_apply::staging_outcome(root, args)?;
-        let mut argv = vec!["add".to_string(), "--".to_string()];
-        argv.extend(outcome.staged.iter().cloned());
-        (argv, Some(outcome))
+        (super::git_apply::add_argv(&outcome), Some(outcome))
     } else {
         (plan_argv(op, root, &args.clone())?, None)
     };
@@ -970,9 +969,13 @@ fn delete_flag(args: &Value) -> bool {
 
 /// Describe the argv a mutation would run, validating every argument first.
 ///
-/// This is the only place a mutation's command line is decided; the plan, the
-/// token and the executor all consume this one definition. Crate callers go
-/// through [`plan_argv_for`]; [`Op`] stays module-private.
+/// This is the single place a mutation's command line is decided, with one
+/// documented exception: `add` is built by
+/// [`super::git_apply::add_argv`] from a `StagingOutcome` the caller already
+/// has, because the stage list IS the reviewer-facing report and recomputing
+/// it here would let the plan and the payload disagree. Its arm below routes
+/// through that same helper, so the definition still has one owner.
+/// Crate callers go through [`plan_argv_for`]; [`Op`] stays module-private.
 fn plan_argv(op: &Op, root: &Path, args: &Value) -> Result<Vec<String>, JsonRpcError> {
     let target = plan_target(op, args)?;
     let required = |field: &str| require_target(&target, op.name, field);
@@ -980,12 +983,9 @@ fn plan_argv(op: &Op, root: &Path, args: &Value) -> Result<Vec<String>, JsonRpcE
     match op.name {
         // `add` is planned over the exact post-exclusion path list the
         // guardrails produce, so the plan's staged list is the truth.
-        "add" => {
-            let outcome = super::git_apply::staging_outcome(root, args)?;
-            let mut argv = vec!["add".to_string(), "--".to_string()];
-            argv.extend(outcome.staged.iter().cloned());
-            Ok(argv)
-        }
+        "add" => Ok(super::git_apply::add_argv(
+            &super::git_apply::staging_outcome(root, args)?,
+        )),
         "commit" => commit_argv(root, args),
         "checkout" => Ok(target_argv(
             "checkout",

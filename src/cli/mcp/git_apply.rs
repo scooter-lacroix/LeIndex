@@ -336,6 +336,16 @@ pub(crate) fn staging_outcome(root: &Path, args: &Value) -> Result<StagingOutcom
     })
 }
 
+/// The `git add` command line for a staging outcome.
+///
+/// ONE definition: the plan's advertised argv, the argv the token binds, and
+/// the argv the executor runs all come from here, so the three cannot drift.
+pub(crate) fn add_argv(outcome: &StagingOutcome) -> Vec<String> {
+    let mut argv = vec!["add".to_string(), "--".to_string()];
+    argv.extend(outcome.staged.iter().cloned());
+    argv
+}
+
 // ---------------------------------------------------------------------------
 // Repository state binding
 // ---------------------------------------------------------------------------
@@ -775,9 +785,7 @@ pub(crate) async fn handle(op: &str, root: &Path, args: &Value) -> Result<Value,
     // staged.
     let (argv, staging) = if op == "add" {
         let outcome = staging_outcome(root, args)?;
-        let mut argv = vec!["add".to_string(), "--".to_string()];
-        argv.extend(outcome.staged.iter().cloned());
-        (argv, Some(outcome))
+        (add_argv(&outcome), Some(outcome))
     } else {
         (plan_argv_for(op, root, args)?, None)
     };
@@ -1003,23 +1011,37 @@ mod test {
     /// The token binds repository state: once HEAD moves, a plan's token must
     /// be rejected instead of replaying the reviewed argv against a moved
     /// branch (brief §5 token binding).
+    ///
+    /// The token is derived through the EXPORTED seam ([`token_now`]) — never
+    /// by rebuilding the state string here. An earlier version hand-built
+    /// `"{head} {index}"` with a SPACE while [`state_binding`] joins with NUL,
+    /// so the apply rejected a token that never matched for the WRONG reason
+    /// and only the loose message assertion kept it green: it proved the
+    /// separator, not the binding.
     #[tokio::test]
     async fn test_apply_rejects_a_token_after_head_moves() {
         let repo = scratch();
         let root = repo.path();
         let args = serde_json::json!({ "target": "HEAD" });
         let argv = plan_argv_for("checkout", root, &args).unwrap();
-        let state = format!(
-            "{}{}{}",
-            head_oid(root).unwrap_or_else(|| "none".to_string()),
-            ' ',
-            index_digest(root).unwrap(),
+        let token = token_now(root, "checkout", &argv).unwrap();
+
+        // Sanity: the token IS valid for the state it was issued against, so
+        // the rejection below can only come from the HEAD move.
+        assert_eq!(
+            token_now(root, "checkout", &argv).unwrap(),
+            token,
+            "an unmoved repository must reproduce the plan's token"
         );
-        let token = preview_token(root, "checkout", &argv, &state);
 
         // Move HEAD after the plan: the token's state is now stale.
         std::fs::write(root.join("f.txt"), "changed\n").unwrap();
         git(root, &["commit", "-aqm", "two"]);
+        assert_ne!(
+            token_now(root, "checkout", &argv).unwrap(),
+            token,
+            "the state binding must change when HEAD moves"
+        );
 
         let error = handle(
             "checkout",
