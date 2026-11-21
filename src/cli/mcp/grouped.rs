@@ -11,6 +11,7 @@
 //   leindex_analyze  (mode)    deep | impact | diagnostics | phase
 //   leindex_edit     (action)  apply | preview | rename | write        (action REQUIRED)
 //   leindex_manage   (action)  index | state | projects | evict | lease | cleanup
+//                              | run | how_to_test
 //   leindex_git      (action)  status | diff | log | show | blame | branch | remote
 //                              | add | commit | checkout | stash | tag | merge
 //                              | rebase | push | reset | force   (mutations: plan -> apply)
@@ -228,7 +229,7 @@ pub static GROUPS: [GroupSpec; 5] = [
     GroupSpec {
         name: "leindex_manage",
         title: "LeIndex [Manage]",
-        description: "Index lifecycle and state. action: index (build/refresh, pollable — default), state (usable? generation, phase, freshness), projects, evict, lease, cleanup (retention, dry-run).",
+        description: "Index lifecycle, state, commands. action: index (default, pollable), state (usable? generation/freshness), projects, evict, lease, cleanup (retention, dry-run), run (sandboxed build/test: summary + log handle), how_to_test (gate command for a path).",
         discriminator: "action",
         default_branch: Some("index"),
         branches: &[
@@ -1591,52 +1592,27 @@ mod tests {
             grouped * 10 < legacy * 6,
             "router listing ({grouped} bytes) must stay under 60% of the flat listing ({legacy} bytes)"
         );
-        // 13_000 was the ceiling before `leindex_explore` gained its
-        // `structural` branch; that branch contributes a new `lang` argument
-        // plus one more entry in the per-branch arg map that `branch_usage`
-        // builds, which put the listing at 13_251 bytes (flat listing 24_546,
-        // ratio 0.54 — the 60% assertion above is the guard that actually
-        // bounds growth; this absolute ceiling is the backstop). Raised rather
-        // than dropped, per owner decision. If this number moves again, say
-        // which branch moved it.
-        // 14_000 -> 16_500: the FIFTH router `leindex_git` was added. It
-        // advertises 17 operations (7 reads + 10 preview-only mutations) and
-        // one `action` entry per operation in the arg map. The ratio guard
-        // STILL passes (the router surface remains far smaller than the flat
-        // per-tool listing), so growth is bounded; the absolute ceiling moves
-        // with it.
-        // 16_500 -> 17_500: `leindex_manage` went from ONE branch (`index`) to
-        // six, which on its own pushed the listing to 17_258 bytes because
-        // `branch_usage` emitted the shared handler's identical argument list
-        // once per branch. Folding branches that share a handler brought it
-        // back to 15_742 (flat 30_472, ratio 0.52), so the ceiling goes UP
-        // only to match the branch count, not to hide a regression: the next
-        // branch that lands here must not push past this without the same
-        // accounting.
-        // 17_500 -> 19_000: the git mutations became real (plan -> apply).
-        // The router description says how to apply, the schema `action` entry
-        // carries one summary line per operation, and the mutation arguments
-        // (trailers, confirm_text, allow_sensitive, hard/clean/delete) were
-        // added. The ratio guard above still passes; the next growth here
-        // needs the same accounting.
-        // 19_000 -> 20_900: the INTEGRATED surface (roadmap/integration).
-        // Merging lane F (`run`/`how_to_test` on leindex_manage), lane D (git
-        // mutations on leindex_git) and lane G (symbol_lookup call-sites /
-        // usage kinds) brought the router listing to a measured 19,842 bytes.
-        // The ratio guard above still passes (the flat listing grew too), so
-        // growth is bounded; the ceiling is bumped to 20,900 (~5% headroom)
-        // with this accounting. If it moves again, say which branch moved it.
-        assert!(grouped <= 20_900, "tools/list grew to {grouped} bytes");
+        // The ABSOLUTE payload ceiling is owned by
+        // `test_tools_list_payload_cannot_grow_past_measured_ceiling` (with its
+        // raise ledger). This test owns the RATIO guard only — the two used to
+        // assert the same number, so a raise had to be made twice and a real
+        // regression could pass in one place and fail in the other.
     }
 
     /// Absolute regression cap on the advertised `tools/list` payload (§6.10):
-    /// descriptions are per-turn context paid on every session. 19,842 bytes
-    /// is the measured size on the integrated roadmap tree (all lanes — F's
-    /// run/how_to_test, D's git mutations, G's symbol-lookup usage kinds);
-    /// lane A alone had it at 15,960 after shrinking the shared `project_path`
-    /// boilerplate. The ceiling adds ~5% headroom; the 20,900 backstop above
-    /// predates this and stays. If a legitimate change moves the payload past
-    /// this line, name what moved it and raise the ceiling consciously.
+    /// descriptions are per-turn context paid on every session. THIS test owns
+    /// the number; `test_benchmark_tools_list_sizes` owns only the ratio guard.
+    ///
+    /// Ledger: 16_800 measured 15_960 after lane A shrank the shared per-router
+    /// `project_path` boilerplate (16_510 before) and moved its non-obvious
+    /// detail into `leindex://tools/guide`. 16_800 -> 17_500 when the fifth
+    /// router `leindex_git` landed; -> 19_000 when git mutations became real
+    /// (plan -> apply: trailer/confirm_text/allow_sensitive/hard/clean/delete
+    /// arguments plus one summary line per operation); -> 20_900 on the
+    /// INTEGRATED roadmap tree, where lane F's `run`/`how_to_test` and lane G's
+    /// symbol-lookup usage kinds land on the same listing (measured 19,842).
+    /// If a legitimate change moves the payload past this line, name what moved
+    /// it and raise the ceiling consciously.
     #[test]
     fn test_tools_list_payload_cannot_grow_past_measured_ceiling() {
         let handlers = all_tool_handlers();

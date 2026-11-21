@@ -108,6 +108,13 @@ pub fn issue_with_cursors(
             let oldest = guard.order.remove(0);
             guard.entries.remove(&oldest);
         }
+    } else if let Some(position) = guard.order.iter().position(|known| *known == hash) {
+        // Re-use refreshes recency: without this, a token re-issued for the
+        // same query keeps its original insertion slot and a hot entry can be
+        // evicted as "oldest" while it is the one being paged through. Move it
+        // to the back — the LRU is now actually least-RECENTLY-used.
+        let recent = guard.order.remove(position);
+        guard.order.push(recent);
     }
     guard.entries.insert(
         hash,
@@ -199,8 +206,20 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The continuation store is process-wide, so the tests in this module
+    /// would otherwise evict each other's entries (the LRU test deliberately
+    /// churns past `STORE_CAP`). One lock per test keeps the store's contents
+    /// deterministic.
+    fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn test_next_token_round_trips_query_and_offset() {
+        let _guard = test_guard();
         let args = json!({"pattern": "needle", "project_path": "/tmp/p", "offset": 0});
         let token = issue("leindex_find", &args, 50);
         let resumed = resume("leindex_find", &token).expect("fresh token resumes");
@@ -214,6 +233,7 @@ mod tests {
 
     #[test]
     fn test_resume_rejects_foreign_and_stale_tokens() {
+        let _guard = test_guard();
         let args = json!({"pattern": "needle"});
         let token = issue("leindex_find", &args, 10);
         let error = resume("leindex_structural", &token).unwrap_err();
@@ -224,6 +244,7 @@ mod tests {
 
     #[test]
     fn test_merge_overlay_keeps_query_and_takes_token_offset() {
+        let _guard = test_guard();
         let stored = json!({"pattern": "needle", "case": "smart"});
         let caller = json!({"project_path": "/elsewhere", "offset": 999, "next": "x"});
         let merged = merge(&stored, &caller, 25, &Value::Null);
@@ -235,6 +256,7 @@ mod tests {
 
     #[test]
     fn test_cursors_round_trip_through_issue_and_merge() {
+        let _guard = test_guard();
         let args = json!({"pattern": "needle", "per_file_cap": 20});
         let cursors = json!({"0:src/a.rs": 20, "0:src/b.rs": 20});
         let token = issue_with_cursors("leindex_find", &args, 20, &cursors);
@@ -256,5 +278,55 @@ mod tests {
         let resumed_plain = resume("leindex_find", &plain).unwrap();
         let merged_plain = merge(&resumed_plain.args, &json!({}), 50, &resumed_plain.cursors);
         assert!(merged_plain.get("resume_cursors").is_none());
+    }
+
+    /// Re-issuing a token for the SAME query must refresh its recency.
+    ///
+    /// Regression (integration review, F6): `issue` only appended to `order`
+    /// for a hash it had never seen, so a caller paging through one query kept
+    /// the entry at its ORIGINAL insertion slot — it was the first thing
+    /// evicted while actively in use.
+    #[test]
+    fn test_reissue_refreshes_lru_position_of_an_existing_hash() {
+        let _guard = test_guard();
+        let args = json!({ "pattern": "hot-query" });
+        let first = issue("leindex_find", &args, 10);
+        // Churn the store past its cap with distinct queries: without the
+        // recency refresh the hot entry is at the front and dies here.
+        for index in 0..STORE_CAP {
+            issue(
+                "leindex_find",
+                &json!({ "pattern": format!("filler-{index}") }),
+                10,
+            );
+        }
+        assert!(
+            resume("leindex_find", &first).is_err(),
+            "sanity: unrefreshed, the hot entry is evicted by one cap of churn"
+        );
+
+        let reissued = issue("leindex_find", &args, 20);
+        assert_eq!(
+            first.split('.').next(),
+            reissued.split('.').next(),
+            "the same query keeps one hash"
+        );
+        assert!(
+            resume("leindex_find", &reissued).is_ok(),
+            "the re-issued token is live again"
+        );
+        // A further cap of churn keeps it: its recency moved to the back, so
+        // the NEXT evictions are the filler entries, not this one.
+        for index in 0..STORE_CAP - 1 {
+            issue(
+                "leindex_find",
+                &json!({ "pattern": format!("later-{index}") }),
+                10,
+            );
+        }
+        assert!(
+            resume("leindex_find", &reissued).is_ok(),
+            "a refreshed entry survives a full cap of subsequent churn"
+        );
     }
 }

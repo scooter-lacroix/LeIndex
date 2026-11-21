@@ -762,11 +762,21 @@ tree-sitter parse of every edited file after the write."
         // owning package of each edited file, surfaced in the apply echo
         // (§4.3, cross-lane contract). Failures to run a check never fail an
         // applied edit; they come back as per-file `error` entries.
+        //
+        // `check_scoped` is BLOCKING (it spawns its own runtime and waits on a
+        // child process): it runs on the blocking pool, exactly like the
+        // sibling call site in `run::actions`, so the async executor is never
+        // parked behind a build.
         if had_validate_arg && matches!(validate_request, ValidateRequest::Check) {
             let mut checks = Vec::new();
             for file in plan.files.iter().map(|f| f.canonical_path.clone()) {
-                match crate::cli::run::diagnostics::check_scoped(&project_root, &file, 10) {
-                    Ok(summary) => checks.push(serde_json::json!({
+                let (root, target) = (project_root.clone(), file.clone());
+                let outcome = tokio::task::spawn_blocking(move || {
+                    crate::cli::run::diagnostics::check_scoped(&root, &target, 10)
+                })
+                .await;
+                match outcome {
+                    Ok(Ok(summary)) => checks.push(serde_json::json!({
                         "file": file.to_string_lossy(),
                         "exit_code": summary.exit_code,
                         "headline": summary.headline,
@@ -777,9 +787,13 @@ tree-sitter parse of every edited file after the write."
                         "error_count": summary.error_count,
                         "warning_counts": summary.warning_counts,
                     })),
-                    Err(error) => checks.push(serde_json::json!({
+                    Ok(Err(error)) => checks.push(serde_json::json!({
                         "file": file.to_string_lossy(),
                         "error": error.to_string(),
+                    })),
+                    Err(error) => checks.push(serde_json::json!({
+                        "file": file.to_string_lossy(),
+                        "error": format!("check task failed: {error}"),
                     })),
                 }
             }

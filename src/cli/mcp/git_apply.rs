@@ -376,18 +376,32 @@ fn head_oid(root: &Path) -> Option<String> {
     .filter(|oid| !oid.is_empty())
 }
 
+/// The live state a mutation token binds: HEAD oid + the index digest.
+///
+/// ONE binding, used at both ends of the seam: `mutation_plan` issues the
+/// advertised token against it, `validate_before_apply` recomputes it before
+/// spawning git. Issuing against an empty string (the pre-fix behaviour) made
+/// every plan-issued token unmatchable, which silently disabled every
+/// `TOKEN_ONLY` operation and every destructive shape.
+pub(crate) fn state_binding(root: &Path) -> Result<String, JsonRpcError> {
+    Ok(format!(
+        "{}\u{0}{}",
+        head_oid(root).unwrap_or_else(|| "none".to_string()),
+        index_digest(root)?,
+    ))
+}
+
 /// Recompute the preview token for `(op, argv)` against the CURRENT state.
 ///
 /// The token is the plan's identity AND its validity window: it changes when
 /// the argv changes (caller typo, tree grew) and when the state changes
 /// (HEAD moved, index changed), so a stale token can never apply.
-fn token_now(root: &Path, op: &str, argv: &[String]) -> Result<String, JsonRpcError> {
-    let state = format!(
-        "{}\u{0}{}",
-        head_oid(root).unwrap_or_else(|| "none".to_string()),
-        index_digest(root)?,
-    );
-    Ok(preview_token(root, op, argv, &state))
+///
+/// `pub(crate)` so `git_handler::mutation_plan` issues its advertised token
+/// through this exact function — a plan token that is not the apply token is
+/// a dead seam.
+pub(crate) fn token_now(root: &Path, op: &str, argv: &[String]) -> Result<String, JsonRpcError> {
+    Ok(preview_token(root, op, argv, &state_binding(root)?))
 }
 
 // ---------------------------------------------------------------------------
@@ -604,13 +618,19 @@ fn failure_error(
     }
     let mut message = format!("git {} failed", argv.join(" "));
     if !combined.trim().is_empty() {
-        let mut body: String = combined.chars().take(FAILURE_CHARS).collect();
+        // Git surfaces remote output verbatim — including `push` progress and
+        // hook chatter, which can carry URL-embedded credentials
+        // (`https://user:token@host/…`) or `Bearer` tokens from a CI hook.
+        // The same scrubber the log pipeline uses runs here so a mutation
+        // failure can never leak a secret into an MCP response.
+        let redacted = crate::observability::LogScrubber::redact(&combined);
+        let mut body: String = redacted.chars().take(FAILURE_CHARS).collect();
         if body.chars().count() == FAILURE_CHARS {
             body.push('…');
         }
         message.push_str(":\n");
         message.push_str(&body);
-        let total = combined.chars().count();
+        let total = redacted.chars().count();
         let shown = total.min(FAILURE_CHARS);
         if total > shown || truncated_chars > 0 {
             message.push_str(&format!(
@@ -749,13 +769,17 @@ fn head_branch(root: &Path) -> Option<String> {
 pub(crate) async fn handle(op: &str, root: &Path, args: &Value) -> Result<Value, JsonRpcError> {
     // `add` is planned over the EXACT path list the guardrails produce, so the
     // plan's staged list is the truth (exclusions included), not a promise.
-    let argv = if op == "add" {
+    // The outcome is computed ONCE and reused for the payload: a second call
+    // could disagree with the argv that actually ran (the tree can move
+    // between them), which would report a different staged list than the one
+    // staged.
+    let (argv, staging) = if op == "add" {
         let outcome = staging_outcome(root, args)?;
         let mut argv = vec!["add".to_string(), "--".to_string()];
         argv.extend(outcome.staged.iter().cloned());
-        argv
+        (argv, Some(outcome))
     } else {
-        plan_argv_for(op, root, args)?
+        (plan_argv_for(op, root, args)?, None)
     };
 
     validate_before_apply(op, root, args, &argv).await?;
@@ -789,7 +813,7 @@ pub(crate) async fn handle(op: &str, root: &Path, args: &Value) -> Result<Value,
     });
     match op {
         "add" => {
-            let outcome = staging_outcome(root, args)?;
+            let outcome = staging.expect("add always carries its staging outcome");
             payload["staged"] = json!(outcome.staged);
             payload["excluded"] = json!(
                 outcome
@@ -945,6 +969,35 @@ mod test {
                 .any(|w| w.contains("MiB") && w.contains("big.bin"))
         );
         assert!(outcome.warnings.iter().any(|w| w.contains("binary")));
+    }
+
+    #[test]
+    fn test_failure_error_redacts_credentials_from_git_output() {
+        // F3: git echoes remote URLs and hook chatter verbatim. A push that
+        // fails against `https://user:token@host/…` must not put the token in
+        // an MCP error message.
+        let error = failure_error(
+            &["push".to_string()],
+            "",
+            "fatal: unable to access 'https://scooter:s3cr3t-token@github.com/o/r.git/': 403\n\
+             remote: Authorization: Bearer abcdef123456\n",
+            0,
+        );
+        let message = error.message_with_hint();
+        assert!(
+            !message.contains("s3cr3t-token"),
+            "URL credentials must be redacted: {message}"
+        );
+        assert!(
+            !message.contains("abcdef123456"),
+            "bearer tokens must be redacted: {message}"
+        );
+        assert!(
+            message.contains("[REDACTED]"),
+            "the redaction is visible, not silently dropped: {message}"
+        );
+        // The words the hook printed that matter are still there.
+        assert!(message.contains("403"), "{message}");
     }
 
     /// The token binds repository state: once HEAD moves, a plan's token must

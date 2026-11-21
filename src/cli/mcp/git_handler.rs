@@ -788,8 +788,20 @@ const PLAN_NEXT_HINT: &str = "Nothing was changed. To apply: re-send this call w
 /// state. Nothing here spawns a mutating git command: [`plan_argv`] only
 /// *describes* the argv, and every probe it runs is read-only.
 async fn mutation_plan(op: &Op, root: &Path, args: &Value) -> Result<Value, JsonRpcError> {
-    let argv = plan_argv(op, root, &args.clone())?;
-    let token = preview_token(root, op.name, &argv, "");
+    let (argv, staging) = if op.name == "add" {
+        // Compute the staging outcome ONCE: it builds the argv below AND is
+        // the report the plan shows, so a second call could disagree with it.
+        let outcome = super::git_apply::staging_outcome(root, args)?;
+        let mut argv = vec!["add".to_string(), "--".to_string()];
+        argv.extend(outcome.staged.iter().cloned());
+        (argv, Some(outcome))
+    } else {
+        (plan_argv(op, root, &args.clone())?, None)
+    };
+    // Issued through the SAME function the executor validates with: the plan's
+    // token must be the apply's token, or every token-only operation is
+    // unreachable (the plan reports a token the executor can never accept).
+    let token = super::git_apply::token_now(root, op.name, &argv)?;
     let warnings = argument_warnings(op, args)?;
     let root_buf = root.to_path_buf();
     let probe_args = args.clone();
@@ -811,8 +823,7 @@ async fn mutation_plan(op: &Op, root: &Path, args: &Value) -> Result<Value, Json
     });
     // The plan shows what an apply would attach, so the reviewer sees the
     // exclusions and warnings before committing to anything.
-    if op.name == "add" {
-        let outcome = super::git_apply::staging_outcome(root, args)?;
+    if let Some(outcome) = staging {
         payload["will_stage"] = json!(outcome.staged);
         payload["excluded"] = json!(
             outcome
@@ -1201,10 +1212,11 @@ fn staged_paths(root: &Path, args: &Value) -> Result<Vec<String>, JsonRpcError> 
 /// Preview token identifying exactly one `(repository, operation, argv, state)`
 /// tuple.
 ///
-/// `state` is computed by the caller ([`super::git_apply::token_now`] at apply
-/// time: HEAD oid + index digest; empty at plan-issue time because a plan is
-/// issued against the state its own probe observes and the executor recomputes
-/// the binding before spawning git).
+/// `state` is the repository binding ([`super::git_apply::state_binding`]:
+/// HEAD oid + index digest). Both ends of the seam go through
+/// [`super::git_apply::token_now`] — the plan issues the token with it and the
+/// executor recomputes it — so a plan's token is always the one the executor
+/// accepts, and a moved HEAD or a changed index still invalidates it.
 pub(crate) fn preview_token(root: &Path, op: &str, argv: &[String], state: &str) -> String {
     blake3::hash(
         format!(
@@ -1347,6 +1359,47 @@ mod tests {
             );
             assert_eq!(op.mutating, expected, "{} mutation flag", op.name);
         }
+    }
+
+    /// The plan's advertised token MUST be the token the executor accepts.
+    ///
+    /// Regression (integration review, F1): `mutation_plan` issued the token
+    /// against an EMPTY state while the executor validates against
+    /// `{head_oid}\0{index_digest}`, so every plan-issued token was rejected.
+    /// That made every TOKEN_ONLY operation (checkout/stash/tag/merge/rebase)
+    /// and every destructive shape unreachable — only `confirm:true` worked,
+    /// and the negative "token rejected after HEAD moves" test kept passing
+    /// because it hand-derived the token with the real state instead of
+    /// round-tripping a plan. This test round-trips: bare stash → plan →
+    /// re-send with the PLAN'S token → applied.
+    #[tokio::test]
+    async fn test_plan_token_round_trips_into_a_successful_apply() {
+        let repo = scratch_repo();
+        let root = repo.path();
+        // Something to stash: an untracked file is enough (`stash -u`).
+        std::fs::write(root.join("dirty.txt"), "dirty\n").unwrap();
+
+        let plan = mutation_plan(Op::parse("stash").unwrap(), root, &json!({}))
+            .await
+            .expect("plan");
+        assert_eq!(plan["applied"], false, "a plan applies nothing: {plan}");
+        let token = plan["preview_token"]
+            .as_str()
+            .expect("the plan advertises a token")
+            .to_string();
+
+        let applied =
+            super::super::git_apply::handle("stash", root, &json!({ "preview_token": token }))
+                .await
+                .unwrap_or_else(|error| panic!("the plan's own token must apply: {error}"));
+        assert_eq!(
+            applied["applied"], true,
+            "token path must reach git: {applied}"
+        );
+        assert!(
+            !root.join("dirty.txt").exists(),
+            "the stash actually ran — the untracked file is gone from the tree"
+        );
     }
 
     /// The whole mutation policy in one assertion: a bare mutating call is a
