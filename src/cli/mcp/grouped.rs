@@ -273,7 +273,7 @@ pub static GROUPS: [GroupSpec; 5] = [
     GroupSpec {
         name: "leindex_git",
         title: "LeIndex [Git]",
-        description: "Live Git. action: status (default), diff, log, show, blame, branch, remote (read); add, commit, checkout, stash, tag, merge, rebase, push, reset, force (mutations: a bare call returns a plan + preview_token; re-send with the token to apply, or confirm:true for add/commit/push; force-push/reset --hard/clean -fd/branch delete need their rails flags).",
+        description: "Live Git. action: status (default), diff, log, show, blame, branch, remote (read); add, commit, checkout, stash, tag, merge, rebase, push, reset, force (mutations: bare call → plan + preview_token; re-send to apply; confirm:true for add/commit/push).",
         discriminator: "action",
         default_branch: Some("status"),
         branches: &[
@@ -1595,6 +1595,12 @@ mod tests {
         // only to match the branch count, not to hide a regression: the next
         // branch that lands here must not push past this without the same
         // accounting.
-        assert!(grouped <= 17_500, "tools/list grew to {grouped} bytes");
+        // 17_500 -> 19_000: the git mutations became real (plan -> apply).
+        // The router description says how to apply, the schema `action` entry
+        // carries one summary line per operation, and the mutation arguments
+        // (trailers, confirm_text, allow_sensitive, hard/clean/delete) were
+        // added. The ratio guard above still passes; the next growth here
+        // needs the same accounting.
+        assert!(grouped <= 19_000, "tools/list grew to {grouped} bytes");
     }
 }

@@ -952,11 +952,17 @@ fn tag_argv(args: &Value, name: String) -> Vec<String> {
     argv
 }
 
+/// The explicit `delete: true` gate for branch deletion.
+fn delete_flag(args: &Value) -> bool {
+    args.get("delete").and_then(Value::as_bool).unwrap_or(false)
+}
+
 /// Describe the argv a mutation would run, validating every argument first.
 ///
 /// This is the only place a mutation's command line is decided; the plan, the
-/// token and the executor all consume this one definition.
-pub(crate) fn plan_argv(op: &Op, root: &Path, args: &Value) -> Result<Vec<String>, JsonRpcError> {
+/// token and the executor all consume this one definition. Crate callers go
+/// through [`plan_argv_for`]; [`Op`] stays module-private.
+fn plan_argv(op: &Op, root: &Path, args: &Value) -> Result<Vec<String>, JsonRpcError> {
     let target = plan_target(op, args)?;
     let required = |field: &str| require_target(&target, op.name, field);
 
@@ -1006,10 +1012,30 @@ pub(crate) fn plan_argv(op: &Op, root: &Path, args: &Value) -> Result<Vec<String
                 return Ok(vec!["clean".to_string(), target, "-f".to_string()]);
             }
             if target.starts_with('-') {
-                return Err(JsonRpcError::invalid_params_with_suggestion(
-                    format!("'{target}' is not a revision"),
-                    "reset takes a commit/branch; branch deletion is target:'-d <branch>' with delete:true".to_string(),
-                ));
+                // The one legal flag-shaped target is branch deletion, and
+                // only with delete:true (the executor then makes it
+                // token-only). Everything else flag-shaped is a refusal.
+                let Some(branch) = target
+                    .strip_prefix("-d ")
+                    .map(str::trim)
+                    .filter(|b| !b.is_empty())
+                else {
+                    return Err(JsonRpcError::invalid_params_with_suggestion(
+                        format!("'{target}' is not a revision"),
+                        "reset takes a commit/branch; branch deletion is target:'-d <branch>' with delete:true".to_string(),
+                    ));
+                };
+                if !delete_flag(args) {
+                    return Err(JsonRpcError::invalid_params_with_suggestion(
+                        format!("branch deletion refused: '{branch}' needs delete:true (and is token-only)"),
+                        "Pass target:'-d <branch>' with delete:true; a preview_token from its plan applies it".to_string(),
+                    ));
+                }
+                return Ok(vec![
+                    "branch".to_string(),
+                    "-d".to_string(),
+                    branch.to_string(),
+                ]);
             }
             let flag = if hard { "--hard" } else { "--mixed" };
             Ok(target_argv("reset", Some(flag), target))
@@ -1558,7 +1584,7 @@ mod tests {
         let argv = commit_argv(root, &args).unwrap();
         assert!(
             argv.windows(2)
-                .eq([["--".to_string(), "a.txt".to_string()]]),
+                .any(|pair| pair == ["--".to_string(), "a.txt".to_string()].as_slice()),
             "paths must arrive after -- as a pathspec: {argv:?}"
         );
         assert_eq!(

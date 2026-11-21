@@ -814,7 +814,7 @@ fn hunk_summaries(patch: &str) -> Value {
         };
         let old_side = ranges
             .split_whitespace()
-            .find(|part| part.starts_with('-') && part != "--")
+            .find(|part| part.starts_with('-') && *part != "--")
             .unwrap_or("-1");
         let old_count = old_side
             .trim_start_matches('-')
@@ -836,7 +836,6 @@ fn hunk_summaries(patch: &str) -> Value {
             "modified"
         };
         let inside = context
-            .trim()
             .split_whitespace()
             .find(|token| {
                 token.starts_with("fn ")

@@ -37,7 +37,8 @@ const MUTATION_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_MUTATION_OUTPUT_BYTES: usize = 256 * 1024;
 
 /// Operations the `confirm: true` shortcut may apply without a prior plan.
-const SAFE_TO_CONFIRM: [&str; 3] = ["add", "commit", "push"];
+/// `pub(crate)`: the git_handler test pins the plan hint to exactly this set.
+pub(crate) const SAFE_TO_CONFIRM: [&str; 3] = ["add", "commit", "push"];
 
 /// Operations that only a prior plan's token may apply.
 const TOKEN_ONLY: [&str; 5] = ["checkout", "stash", "tag", "merge", "rebase"];
@@ -68,18 +69,28 @@ pub(crate) struct StagingOutcome {
 /// Files whose names look like secrets.
 ///
 /// basename patterns: `.env*`, `*.pem`, `*id_rsa*`, `*.key`,
-/// `credentials*.json`, and anything with `secret` in the name.
+/// `credentials*.json`, and anything with `secret` in the name; anything
+/// under a `credentials`/`secrets` directory is also treated as one
+/// (`credentials/google.json` is a secret even though its basename is not).
 fn is_secret_path(relative: &str) -> bool {
-    let Some(name) = Path::new(relative).file_name().and_then(|n| n.to_str()) else {
+    let path = Path::new(relative);
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
     let lower = name.to_ascii_lowercase();
-    lower.starts_with(".env")
+    let basename_looks_secret = lower.starts_with(".env")
         || lower.ends_with(".pem")
         || lower.contains("id_rsa")
         || lower.ends_with(".key")
-        || (lower.starts_with("credentials") && lower.ends_with(".json"))
         || lower.contains("secret")
+        || (lower.starts_with("credentials") && lower.ends_with(".json"));
+    basename_looks_secret
+        || path.components().rev().skip(1).any(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .is_some_and(|c| c.eq_ignore_ascii_case("credentials"))
+        })
 }
 
 /// Runtime/generated artefacts the brief names for this workspace.
@@ -88,7 +99,10 @@ fn is_runtime_artifact(relative: &str) -> bool {
     if path.components().any(|component| {
         matches!(
             component.as_os_str().to_str(),
-            Some("target") | Some("node_modules")
+            Some("target")
+                | Some("node_modules")
+                | Some("selection.json")
+                | Some("initializer.json")
         )
     }) {
         return true;
@@ -97,9 +111,9 @@ fn is_runtime_artifact(relative: &str) -> bool {
         return false;
     };
     let lower = name.to_ascii_lowercase();
-    (relative.starts_with(".maestro/operations/") && lower.ends_with(".lock"))
-        || lower == "selection.json"
-        || lower == "initializer.json"
+    // The operation lock file is named `lock` (the parent dir is the
+    // operation id, e.g. `.maestro/operations/1-lock/lock`).
+    (relative.starts_with(".maestro/operations/") && (lower == "lock" || lower.ends_with(".lock")))
         || lower.ends_with(".log")
 }
 
@@ -131,7 +145,11 @@ fn expand_paths(
     for raw in requested {
         let absolute = root.join(raw);
         if absolute.is_dir() {
-            dirs.push((raw.clone(), absolute));
+            // A whole-tree request (`.`) is the common bulk case: normalize it
+            // so discovered paths come back project-relative (`f.txt`), not
+            // `./f.txt` — the plan and the exclusion report use these strings.
+            let rel = if raw == "." { "" } else { raw.as_str() };
+            dirs.push((rel.to_string(), absolute));
         } else {
             files.push(raw.clone());
         }
@@ -176,7 +194,11 @@ fn walk_dir(
         let Ok(entry) = entry else { continue };
         let name = entry.file_name();
         let name = name.to_string_lossy().into_owned();
-        let child_rel = format!("{rel}/{name}");
+        let child_rel = if rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel}/{name}")
+        };
         let child_abs = root.join(&child_rel);
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         if is_dir {
@@ -278,7 +300,7 @@ pub(crate) fn staging_outcome(root: &Path, args: &Value) -> Result<StagingOutcom
                 size as f64 / (1024.0 * 1024.0)
             ));
         }
-        if !is_explicit && looks_binary(&absolute) {
+        if looks_binary(&absolute) {
             warnings.push(format!(
                 "'{relative}' looks binary; check before committing"
             ));
@@ -584,7 +606,7 @@ fn failure_error(
     if !combined.trim().is_empty() {
         let mut body: String = combined.chars().take(FAILURE_CHARS).collect();
         if body.chars().count() == FAILURE_CHARS {
-            body.push_str("…");
+            body.push('…');
         }
         message.push_str(":\n");
         message.push_str(&body);
@@ -688,7 +710,7 @@ async fn push_payload(stdout: &str, root: &Path) -> Value {
             ],
             4096,
         ) {
-            let mut fields = counts.trim().split_whitespace();
+            let mut fields = counts.split_whitespace();
             let (b, a) = (fields.next(), fields.next());
             upstream = Value::String(format!("{branch}@{{upstream}}"));
             behind = b
@@ -798,7 +820,6 @@ pub(crate) async fn handle(op: &str, root: &Path, args: &Value) -> Result<Value,
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::path::PathBuf;
 
     fn git(dir: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
