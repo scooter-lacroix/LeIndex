@@ -760,20 +760,26 @@ pub(crate) fn attach_range_diagnostics(
     if start_line > end_line {
         return result;
     }
-    let diagnostics = crate::cli::run::diagnostics::diagnostics_for(root, file, start_line..=end_line);
+    let diagnostics =
+        crate::cli::run::diagnostics::diagnostics_for(root, file, start_line..=end_line);
     if diagnostics.is_empty() {
         return result;
     }
     if let Some(object) = result.as_object_mut() {
         object.insert(
             "diagnostics".to_string(),
-            serde_json::json!(diagnostics.iter().map(|diagnostic| serde_json::json!({
-                "file": diagnostic.file,
-                "line": diagnostic.line,
-                "severity": diagnostic.severity,
-                "code": diagnostic.code,
-                "message": diagnostic.message,
-            })).collect::<Vec<_>>()),
+            serde_json::json!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| serde_json::json!({
+                        "file": diagnostic.file,
+                        "line": diagnostic.line,
+                        "severity": diagnostic.severity,
+                        "code": diagnostic.code,
+                        "message": diagnostic.message,
+                    }))
+                    .collect::<Vec<_>>()
+            ),
         );
     }
     result

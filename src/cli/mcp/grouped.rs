@@ -1619,24 +1619,24 @@ mod tests {
         // (trailers, confirm_text, allow_sensitive, hard/clean/delete) were
         // added. The ratio guard above still passes; the next growth here
         // needs the same accounting.
-        // 19_000 is the ceiling for the FULL integrated surface: lane D's git
-        // mutations plus lane F's `run`/`how_to_test` actions on
-        // `leindex_manage` (14 new arguments: argv, command, cwd,
-        // timeout_secs, name, log, tail, check, max, diagnostics, from, to,
-        // path). F measured 17_815 on its own tree; with D merged the listing
-        // is the union. The ratio guard still passes; if this number moves
-        // again, say which branch moved it.
-        assert!(grouped <= 19_000, "tools/list grew to {grouped} bytes");
+        // 19_000 -> 20_900: the INTEGRATED surface (roadmap/integration).
+        // Merging lane F (`run`/`how_to_test` on leindex_manage), lane D (git
+        // mutations on leindex_git) and lane G (symbol_lookup call-sites /
+        // usage kinds) brought the router listing to a measured 19,842 bytes.
+        // The ratio guard above still passes (the flat listing grew too), so
+        // growth is bounded; the ceiling is bumped to 20,900 (~5% headroom)
+        // with this accounting. If it moves again, say which branch moved it.
+        assert!(grouped <= 20_900, "tools/list grew to {grouped} bytes");
     }
 
     /// Absolute regression cap on the advertised `tools/list` payload (§6.10):
-    /// descriptions are per-turn context paid on every session. 15,960 bytes
-    /// is the measured size after lane A shrank the shared per-router
-    /// `project_path` boilerplate (16,510 before) and moved its non-obvious
-    /// detail into `leindex://tools/guide`. The ceiling adds ~5% headroom;
-    /// the 17,500 backstop above predates this and stays. If a legitimate
-    /// change moves the payload past this line, name what moved it and raise
-    /// the ceiling consciously.
+    /// descriptions are per-turn context paid on every session. 19,842 bytes
+    /// is the measured size on the integrated roadmap tree (all lanes — F's
+    /// run/how_to_test, D's git mutations, G's symbol-lookup usage kinds);
+    /// lane A alone had it at 15,960 after shrinking the shared `project_path`
+    /// boilerplate. The ceiling adds ~5% headroom; the 20,900 backstop above
+    /// predates this and stays. If a legitimate change moves the payload past
+    /// this line, name what moved it and raise the ceiling consciously.
     #[test]
     fn test_tools_list_payload_cannot_grow_past_measured_ceiling() {
         let handlers = all_tool_handlers();
@@ -1644,8 +1644,8 @@ mod tests {
             .unwrap()
             .len();
         assert!(
-            grouped <= 16_800,
-            "tools/list grew to {grouped} bytes (ceiling 16,800 = measured 15,960 + ~5%)"
+            grouped <= 20_900,
+            "tools/list grew to {grouped} bytes (ceiling 20,900 = measured 19,842 + ~5%)"
         );
     }
 

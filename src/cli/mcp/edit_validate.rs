@@ -186,7 +186,10 @@ mod test {
         let none = resolve_validate_arg(&serde_json::json!({})).unwrap();
         assert!(matches!(none, ValidateRequest::None));
         let check = resolve_validate_arg(&serde_json::json!({"validate": "check"})).unwrap();
-        assert!(matches!(check, ValidateRequest::Check), "check must resolve to Check");
+        assert!(
+            matches!(check, ValidateRequest::Check),
+            "check must resolve to Check"
+        );
         assert!(resolve_validate_arg(&serde_json::json!({"validate": "bogus"})).is_err());
     }
 

@@ -846,17 +846,25 @@ fn render_read_diagnostics(data: &Value, color: bool) -> String {
         if color { RESET } else { "" },
     );
     for diagnostic in diagnostics.iter().take(10) {
-        let file = diagnostic.get("file").and_then(|v| v.as_str()).unwrap_or("?");
+        let file = diagnostic
+            .get("file")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
         let line = diagnostic.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
         let severity = diagnostic
             .get("severity")
             .and_then(|v| v.as_str())
             .unwrap_or("?");
         let code = diagnostic.get("code").and_then(|v| v.as_str());
-        let message = diagnostic.get("message").and_then(|v| v.as_str()).unwrap_or("");
+        let message = diagnostic
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let code_part = code.map(|code| format!(" {code}")).unwrap_or_default();
         let first_line = message.lines().next().unwrap_or("");
-        out.push_str(&format!("  {file}:{line} {severity}{code_part} {first_line}\n"));
+        out.push_str(&format!(
+            "  {file}:{line} {severity}{code_part} {first_line}\n"
+        ));
     }
     if diagnostics.len() > 10 {
         out.push_str(&format!("  … {} more\n", diagnostics.len() - 10));

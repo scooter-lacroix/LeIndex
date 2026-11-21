@@ -1012,8 +1012,7 @@ fn test_n11_status_note_never_reaches_the_text_surface() {
 /// for the diagnostics attached to a read.
 #[test]
 fn test_render_read_file_renders_attached_diagnostics_compact() {
-    let data = v(
-        r#"{
+    let data = v(r#"{
         "file_path": "/p/src/lib.rs",
         "start_line": 1,
         "end_line": 5,
@@ -1023,10 +1022,12 @@ fn test_render_read_file_renders_attached_diagnostics_compact() {
             {"file": "/p/src/lib.rs", "line": 2, "severity": "error", "code": "E0308", "message": "mismatched types\nhelp: a hint"},
             {"file": "/p/src/lib.rs", "line": 4, "severity": "warning", "code": null, "message": "unused variable"}
         ]
-    }"#,
-    );
+    }"#);
     let s = render_tool_output("leindex.read_file", &data, &serde_json::json!({}));
-    assert!(s.contains("/p/src/lib.rs:2 error E0308 mismatched types"), "{s}");
+    assert!(
+        s.contains("/p/src/lib.rs:2 error E0308 mismatched types"),
+        "{s}"
+    );
     assert!(s.contains("/p/src/lib.rs:4 warning unused variable"), "{s}");
     assert!(
         !s.contains("help: a hint"),
@@ -1037,14 +1038,12 @@ fn test_render_read_file_renders_attached_diagnostics_compact() {
 /// The overlay must cost zero bytes when a read has no diagnostics.
 #[test]
 fn test_render_read_file_emits_nothing_without_diagnostics() {
-    let data = v(
-        r#"{
+    let data = v(r#"{
         "file_path": "/p/src/lib.rs",
         "start_line": 1,
         "end_line": 5,
         "content": "1 fn a() {}\n"
-    }"#,
-    );
+    }"#);
     let s = render_tool_output("leindex.read_file", &data, &serde_json::json!({}));
     assert!(!s.contains("Diagnostics"), "{s}");
 }
