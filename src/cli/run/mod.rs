@@ -1,6 +1,7 @@
 //! The `run` capability (§4.4): sandboxed, allow-listed command execution with
 //! a structured output summary, scoped diagnostics, and how-to-test discovery.
 
+pub(crate) mod diagnostics;
 pub(crate) mod parsers;
 pub(crate) mod run_log;
 pub(crate) mod sandbox;

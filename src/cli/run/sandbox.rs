@@ -205,6 +205,8 @@ pub(crate) fn tool_kind(argv: &[String]) -> ToolKind {
         "cargo" if has("test") => ToolKind::CargoTest,
         "pytest" => ToolKind::Pytest,
         "python" | "python3" if has("pytest") => ToolKind::Pytest,
+        // pyright and the go toolchain both print `file:line:col: message`.
+        "python" | "python3" | "go" => ToolKind::FileLineCol,
         "npx" if has("tsc") => ToolKind::Tsc,
         "tsc" => ToolKind::Tsc,
         _ => ToolKind::UnknownTool,
