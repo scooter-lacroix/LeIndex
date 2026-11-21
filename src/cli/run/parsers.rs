@@ -481,10 +481,9 @@ fn tsc_line(line: &str) -> Option<(String, String, String, String)> {
     // Shape: `error TS18003: No inputs were found…` (no file/location).
     let (severity, rest) = if let Some(rest) = line.strip_prefix("error ") {
         ("error", rest)
-    } else if let Some(rest) = line.strip_prefix("warning ") {
-        ("warning", rest)
     } else {
-        return None;
+        let rest = line.strip_prefix("warning ")?;
+        ("warning", rest)
     };
     let code_end = rest.find(':')?;
     let code = rest[..code_end].trim().to_string();
@@ -506,13 +505,13 @@ pub(crate) fn parse_file_line_col(output: &str) -> Parsed {
     let mut failures: Vec<Failure> = Vec::new();
 
     for line in output.lines() {
-        if let Some((location, message)) = file_line_col(line) {
-            if seen.insert(location.clone()) {
-                failures.push(Failure {
-                    name: location,
-                    detail: message,
-                });
-            }
+        if let Some((location, message)) = file_line_col(line)
+            && seen.insert(location.clone())
+        {
+            failures.push(Failure {
+                name: location,
+                detail: message,
+            });
         }
     }
 

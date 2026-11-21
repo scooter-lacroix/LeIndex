@@ -86,7 +86,7 @@ pub(crate) fn enforce_retention(storage: &Path, keep: usize) -> io::Result<()> {
         .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "log"))
         .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
         .collect();
-    logs.sort_by(|a, b| b.0.cmp(&a.0));
+    logs.sort_by_key(|a| std::cmp::Reverse(a.0));
     for (_, path) in logs.into_iter().skip(keep) {
         std::fs::remove_file(path)?;
     }

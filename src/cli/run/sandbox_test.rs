@@ -118,6 +118,41 @@ async fn test_run_cargo_version_is_summarised_with_log() {
     assert!(stored.starts_with("cargo "), "{stored}");
 }
 
+/// End-to-end: a real failing `cargo test` on a fixture crate runs through the
+/// sandbox, is summarised by the CargoTest parser, and the rendered summary
+/// stays under the 1200-char cap.
+#[tokio::test]
+async fn test_real_failing_cargo_test_render_is_small() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let storage = root.join("store");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"failing_probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "#[cfg(test)]\nmod tests {\n    #[test]\n    fn passes() { assert!(true); }\n    #[test]\n    fn fails() { assert_eq!(1 + 1, 3); }\n}\n",
+    )
+    .unwrap();
+    let args = argv(&["cargo", "test"]);
+    let mut req = request(&root, &storage, Some(&args), None);
+    req.name = Some("failing-probe");
+    req.timeout_secs = Some(600);
+    let summary = run(req).await.unwrap();
+    assert_ne!(summary.exit_code, 0);
+    assert_eq!(summary.failures.len(), 1, "{}", summary.render());
+    let rendered = summary.render();
+    let chars = rendered.chars().count();
+    println!("MEASURED_RENDER_CHARS={chars}");
+    assert!(
+        chars <= 1200,
+        "render exceeded cap: {chars} chars\n{rendered}"
+    );
+}
+
 #[tokio::test]
 async fn test_run_scrubs_secrets_before_storing() {
     let dir = tempfile::tempdir().unwrap();
