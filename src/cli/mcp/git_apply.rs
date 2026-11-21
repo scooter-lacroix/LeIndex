@@ -946,4 +946,39 @@ mod test {
         );
         assert!(outcome.warnings.iter().any(|w| w.contains("binary")));
     }
+
+    /// The token binds repository state: once HEAD moves, a plan's token must
+    /// be rejected instead of replaying the reviewed argv against a moved
+    /// branch (brief §5 token binding).
+    #[tokio::test]
+    async fn test_apply_rejects_a_token_after_head_moves() {
+        let repo = scratch();
+        let root = repo.path();
+        let args = serde_json::json!({ "target": "HEAD" });
+        let argv = plan_argv_for("checkout", root, &args).unwrap();
+        let state = format!(
+            "{}{}{}",
+            head_oid(root).unwrap_or_else(|| "none".to_string()),
+            ' ',
+            index_digest(root).unwrap(),
+        );
+        let token = preview_token(root, "checkout", &argv, &state);
+
+        // Move HEAD after the plan: the token's state is now stale.
+        std::fs::write(root.join("f.txt"), "changed\n").unwrap();
+        git(root, &["commit", "-aqm", "two"]);
+
+        let error = handle(
+            "checkout",
+            root,
+            &serde_json::json!({ "target": "HEAD", "preview_token": token }),
+        )
+        .await
+        .expect_err("a stale token must not apply");
+        let message = error.message_with_hint();
+        assert!(
+            message.contains("no longer matches") || message.contains("fresh plan"),
+            "stale token must be refused with guidance: {error}"
+        );
+    }
 }

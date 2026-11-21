@@ -1668,6 +1668,32 @@ mod tests {
         assert_eq!(parsed, 0);
     }
 
+    /// §4.5: `show` is compact by default — stat, no patch. The patch is
+    /// opt-in via `include_patch: true`.
+    #[test]
+    fn test_show_defaults_to_stat_and_omits_the_patch() {
+        let repo = scratch_repo();
+        let compact = git_show(repo.path(), &json!({})).unwrap();
+        assert_eq!(compact["include_patch"], false);
+        assert!(
+            compact.get("patch").is_none(),
+            "compact show must not carry a patch: {compact}"
+        );
+        assert!(
+            compact["stat"]
+                .as_str()
+                .is_some_and(|stat| stat.contains("f.txt")),
+            "stat names the changed file: {compact}"
+        );
+
+        let with_patch = git_show(repo.path(), &json!({ "include_patch": true })).unwrap();
+        assert_eq!(with_patch["include_patch"], true);
+        assert!(
+            with_patch["patch"].is_string(),
+            "include_patch:true carries the patch: {with_patch}"
+        );
+    }
+
     /// Helper: a scratch repository with one commit on branch `master`.
     fn scratch_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
