@@ -17,8 +17,6 @@ const HANDLE_PREFIX: &str = "log://";
 /// A log that a run writes to.
 #[derive(Debug, Clone)]
 pub(crate) struct StoredLog {
-    /// Handle name (no scheme, no extension).
-    pub name: String,
     /// Absolute path of the `.log` file.
     pub path: PathBuf,
 }
@@ -66,7 +64,6 @@ pub(crate) fn prepare(storage: &Path, name: Option<&str>) -> io::Result<StoredLo
     let dir = std::fs::canonicalize(dir)?;
     Ok(StoredLog {
         path: dir.join(format!("{name}.log")),
-        name,
     })
 }
 

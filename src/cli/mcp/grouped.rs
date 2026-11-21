@@ -268,6 +268,18 @@ pub static GROUPS: [GroupSpec; 5] = [
                 &["retention", "prune"],
                 "Retention report for the generation store (dry_run by default)",
             ),
+            branch(
+                "run",
+                "leindex_manage",
+                &["exec"],
+                "Sandboxed cargo/npm/pytest/go/make/just/script run: ~300-char summary + log://handle; log=, check=, diagnostics= modes",
+            ),
+            branch(
+                "how_to_test",
+                "leindex_manage",
+                &["howtotest", "test_command"],
+                "The gate command for a path (workspace member, docs, scripts)",
+            ),
         ],
     },
     GroupSpec {
@@ -1504,7 +1516,7 @@ mod tests {
         let manage = group_by_name("leindex_manage").expect("manage router");
         let usage = branch_usage(manage, &handlers);
         assert!(
-            usage.contains("state,projects,evict,lease,cleanup:"),
+            usage.contains("state,projects,evict,lease,cleanup,run,how_to_test:"),
             "expected the shared branches folded into one entry: {usage}"
         );
         assert_eq!(
@@ -1589,6 +1601,11 @@ mod tests {
         // only to match the branch count, not to hide a regression: the next
         // branch that lands here must not push past this without the same
         // accounting.
-        assert!(grouped <= 17_500, "tools/list grew to {grouped} bytes");
+        // 17_500 -> 18_000: `leindex_manage` gained `run` and `how_to_test`.
+        // They fold into the same shared-handler entry, but they bring 14 new
+        // arguments (argv, command, cwd, timeout_secs, name, log, tail, check,
+        // max, diagnostics, from, to, path) that the flat union must list once
+        // each: measured 17_815 bytes (ratio guard above still passes).
+        assert!(grouped <= 18_000, "tools/list grew to {grouped} bytes");
     }
 }
