@@ -371,6 +371,16 @@ pub struct SearchOptions {
     /// an earlier page capped away (`FileResult::cap_withheld` reports the
     /// per-file tail so renderers can say `+K more in this file`).
     pub per_file_cap: usize,
+    /// Per-file resume cursors for continuation pages, keyed by
+    /// `"{root_index}:{rel}"`: how many of that file's hits earlier pages
+    /// already delivered. When non-empty the page is a continuation: the
+    /// global offset no longer windows hits (tails of capped files sit at
+    /// stream positions BELOW the next offset whenever files interleave),
+    /// each file skips its cursor and shows up to the cap, and `has_more`
+    /// reports whether any file still holds undelivered matches. The
+    /// continuation token is what carries this map; bare `offset` paging
+    /// keeps the plain global-window semantics.
+    pub skip_in_file: BTreeMap<String, usize>,
     /// Context lines around each hit.
     pub context: usize,
     /// Maximum characters of a hit line.
@@ -389,6 +399,7 @@ impl Default for SearchOptions {
             offset: 0,
             limit: Some(50),
             per_file_cap: 50,
+            skip_in_file: BTreeMap::new(),
             context: 0,
             max_line_chars: 200,
             deadline: None,
@@ -506,6 +517,12 @@ pub struct SearchOutput {
     /// (`match_lines` still counts them). The client signal for
     /// `per_file_cap` semantics.
     pub cap_withheld: usize,
+    /// §6.8: per-file resume cursors (`"{root_index}:{rel}" → hits already
+    /// delivered`) for files that still withhold capped-off matches. The
+    /// handler echoes these back in `SearchOptions.skip_in_file` on the
+    /// next page, via the continuation token — they are the only way a
+    /// tail can be reached without overlap when files interleave.
+    pub resume: BTreeMap<String, usize>,
     /// Totals.
     pub stats: SearchStats,
 }
@@ -919,15 +936,12 @@ fn scan_file(
     }
     // A page limit stopped collection while matches remained: the caller
     // must report has_more even if the buffered hits alone did not exceed
-    // the window (the defaults' collect_bound == window_end shape) — but
-    // only when the file's CAPPED stream actually extends past the
-    // collected prefix. A cap at or below the collected count already
-    // bounds the stream inside it (those hits are all buffered), so
-    // flagging there sent clients paging into empty pages forever (a
-    // 200-match file with cap 20 fully shown must not claim has_more).
-    result.collected_truncated = collect_bound > 0
-        && result.match_lines > result.hits.len()
-        && (options.per_file_cap == 0 || options.per_file_cap > result.hits.len());
+    // the window (the defaults' collect_bound == window_end shape). There
+    // is no per_file_cap term: the cap shapes what a page SHOWS, not the
+    // stream (see `window_file_hits`), so matches beyond the buffer are
+    // exactly the ones a later offset must reach — flagging them is the
+    // whole point.
+    result.collected_truncated = collect_bound > 0 && result.match_lines > result.hits.len();
     // Byte spans → 1-based line numbers for the enclosing-symbol ranges the
     // grouped renderer prints (`path › name (L2336-2428): N hits`); the same
     // conversion shape `symbols.rs` uses for its hits.
@@ -950,49 +964,114 @@ fn scan_file(
     Some(result)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn window_file_hits(
     file: &mut FileResult,
     seen_hits: &mut usize,
-    offset: usize,
+    root_index: usize,
+    options: &SearchOptions,
     window_end: Option<usize>,
-    per_file_cap: usize,
+    page_hits: &mut usize,
+    cursors: &mut BTreeMap<String, usize>,
 ) {
     // The per-file cap shapes what a page SHOWS without shrinking the
     // pagination stream: every buffered hit occupies a position in the
     // stream (`seen_hits` walks the uncapped sequence on every request), so
-    // pages tile it exactly once and a later offset still reaches what an
-    // earlier page capped away. Dropping past-cap hits from the stream
-    // instead (the previous behavior) made them appear on no page while
+    // plain-offset pages tile it exactly once. Dropping past-cap hits from
+    // the stream (the previous behavior) made them appear on no page while
     // `match_lines` kept counting them — a silent drop the caller could
-    // never page into. `shown` counts what this page displays; the tail is
-    // reported as `cap_withheld = total_hits - shown` so the renderer can
-    // promise `+K more in this file`. 0 = uncapped.
+    // never page into.
+    //
+    // On a continuation page (`skip_in_file` non-empty) the global offset
+    // no longer windows: tails of capped files sit at stream positions
+    // BELOW the next offset whenever files interleave. Each file skips its
+    // resume cursor instead, shows up to the cap of NEW hits, and the page
+    // stops after `limit` shown hits. Files visited here keep or advance
+    // their cursor in `cursors`; exhausted files drop out.
+    let continuation = !options.skip_in_file.is_empty();
+    let key = format!("{root_index}:{}", file.rel);
+    let skip = options.skip_in_file.get(&key).copied().unwrap_or(0);
+    let mut skipped = 0usize;
+    let mut tail = 0usize;
+    let per_file_cap = options.per_file_cap;
     file.total_hits = file.hits.len();
     file.shown = 0;
     let mut windowed = Vec::with_capacity(file.hits.len());
     for hit in file.hits.drain(..) {
         let position = *seen_hits;
         *seen_hits += 1;
-        let in_window = position >= offset && window_end.is_none_or(|end| position < end);
-        let shown = in_window && (per_file_cap == 0 || file.shown < per_file_cap);
+        let mut shown = false;
+        if continuation {
+            if skipped < skip {
+                // Delivered by an earlier page.
+                skipped += 1;
+            } else if options.limit.is_some_and(|limit| *page_hits >= limit) {
+                // Page budget spent: this hit and every remaining hit of
+                // the file stay undelivered — they must NOT advance the
+                // cursor, or the next page would skip over them.
+                break;
+            } else if per_file_cap == 0 || file.shown < per_file_cap {
+                shown = true;
+            }
+            // else: the file's cap is spent; keep scanning so the next
+            // page resumes past everything shown so far.
+        } else {
+            let in_window =
+                position >= options.offset && window_end.is_none_or(|end| position < end);
+            shown = in_window && (per_file_cap == 0 || file.shown < per_file_cap);
+            // The tail is every buffered hit at or after the window start
+            // that this page did not show. Hits BEFORE the offset were
+            // delivered by earlier pages and must not resurrect the stream
+            // (a stale tail there would make bare-offset paging loop
+            // forever).
+            if !shown && position >= options.offset {
+                tail += 1;
+            }
+        }
         if shown {
             file.shown += 1;
+            *page_hits += 1;
             windowed.push(hit);
         }
     }
     file.hits = windowed;
-    if per_file_cap > 0 {
-        file.cap_withheld = file.total_hits.saturating_sub(file.shown);
+    file.cap_withheld = if per_file_cap == 0 {
+        0
+    } else if continuation {
+        file.total_hits - skipped - file.shown
+    } else {
+        tail
+    };
+    // §6.8: the resume cursor is what this file has already DELIVERED —
+    // shown hits plus everything earlier pages took (skip on a
+    // continuation; the pre-offset window on a first page). Every visited
+    // file gets an entry, not only capped ones: the next page must skip a
+    // fully-delivered file just as surely as it must resume a capped one.
+    // A file absent from the map was never visited (budget break) and is
+    // served fresh.
+    let cursor = if continuation {
+        skip + file.shown
+    } else {
+        file.total_hits - tail
+    };
+    if cursor > 0 || file.cap_withheld > 0 {
+        cursors.insert(key, cursor);
+    } else {
+        cursors.remove(&key);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ingest_scanned_files(
     scanned: Vec<Option<FileResult>>,
+    root_index: usize,
     root_out: &mut RootOutput,
     output: &mut SearchOutput,
     options: &SearchOptions,
     seen_hits: &mut usize,
     window_end: Option<usize>,
+    page_hits: &mut usize,
+    cursors: &mut BTreeMap<String, usize>,
 ) -> bool {
     let mut truncated = false;
     for mut file in scanned.into_iter().flatten() {
@@ -1000,11 +1079,7 @@ fn ingest_scanned_files(
         output.stats.match_lines += file.match_lines;
         truncated |= file.collected_truncated;
         window_file_hits(
-            &mut file,
-            seen_hits,
-            options.offset,
-            window_end,
-            options.per_file_cap,
+            &mut file, seen_hits, root_index, options, window_end, page_hits, cursors,
         );
         // Summed after windowing: `window_file_hits` is what sets
         // `cap_withheld`.
@@ -1027,10 +1102,21 @@ pub fn search(roots: &[RootSpec], compiled: &Compiled, options: &SearchOptions) 
     let window_end = options
         .limit
         .map(|limit| options.offset.saturating_add(limit));
+    // §4.2e continuation: per-file resume cursors replace the global
+    // window (tails of capped files sit at stream positions BELOW the next
+    // offset whenever files interleave). Files are visited in deterministic
+    // path order, so `limit` still bounds the page — just counted per file
+    // instead of globally.
+    let continuation = !options.skip_in_file.is_empty();
+    let mut page_hits = 0usize;
+    // Seed with the incoming cursors so files this page never reaches (a
+    // budget break mid-scan) keep their resume state instead of being
+    // re-served on the next page.
+    let mut cursors: BTreeMap<String, usize> = options.skip_in_file.clone();
     let mut seen_hits = 0usize;
     let chunk_size = worker_threads() * 8;
 
-    'roots: for spec in roots {
+    'roots: for (root_index, spec) in roots.iter().enumerate() {
         let mut root_out = RootOutput {
             root: spec.root.clone(),
             used_index: spec.index.is_some() && !spec.root.is_file(),
@@ -1079,13 +1165,25 @@ pub fn search(roots: &[RootSpec], compiled: &Compiled, options: &SearchOptions) 
             output.stats.scanned += chunk.len();
             let chunk_truncated = ingest_scanned_files(
                 scanned,
+                root_index,
                 &mut root_out,
                 &mut output,
                 options,
                 &mut seen_hits,
                 window_end,
+                &mut page_hits,
+                &mut cursors,
             );
-            if options.collect_hits && window_end.is_some_and(|end| seen_hits > end) {
+            if continuation {
+                // The page holds its full budget; more files still hold
+                // undelivered hits.
+                if options.limit.is_some_and(|limit| page_hits >= limit) {
+                    output.has_more = true;
+                    output.complete = false;
+                    output.roots.push(std::mem::take(&mut root_out));
+                    break 'roots;
+                }
+            } else if options.collect_hits && window_end.is_some_and(|end| seen_hits > end) {
                 output.has_more = true;
                 output.complete = false;
                 output.roots.push(std::mem::take(&mut root_out));
@@ -1109,6 +1207,15 @@ pub fn search(roots: &[RootSpec], compiled: &Compiled, options: &SearchOptions) 
         output.has_more = true;
         output.stopped_by_deadline = true;
     }
+    if output.cap_withheld > 0 {
+        // §4.2e: a non-zero tail is reachable by construction — the cursors
+        // riding the next token resume exactly there — so the stream is not
+        // complete. The old code left has_more false here, which is the
+        // silent drop the brief calls out.
+        output.has_more = true;
+        output.complete = false;
+    }
+    output.resume = cursors;
     output.stats.millis = started.elapsed().as_millis();
     output
 }
@@ -1557,10 +1664,11 @@ mod tests {
 
     #[test]
     fn test_capped_stream_paginates_completely() {
-        // The cap defines the pagination stream: a 30-match file with cap 20
-        // pages through its first 20 hits and stops; the 10 beyond the cap
-        // stay counted (match_lines) but appear on no page, and no page
-        // claims has_more once the capped stream is exhausted.
+        // The cap bounds what each page SHOWS, never the stream: a
+        // 30-match file with cap 20 pages through ALL 30 hits across pages
+        // (10 per page at limit 10); nothing is dropped and match_lines
+        // keeps counting throughout. The old comment claimed the 10 hits
+        // beyond the cap "appear on no page" — the exact §4.2e hazard.
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "big.txt", &"needle\n".repeat(30));
         let compiled = q("needle").compile().unwrap();
@@ -1575,7 +1683,7 @@ mod tests {
             },
         );
         assert_eq!(first.returned, 10, "first page returns the window");
-        assert!(first.has_more, "the capped stream (20) exceeds the page");
+        assert!(first.has_more, "the stream (30) exceeds the page");
 
         let second = search(
             &[spec(dir.path(), None)],
@@ -1591,7 +1699,7 @@ mod tests {
             second.returned, 10,
             "second page shows the rest of the stream"
         );
-        assert!(!second.has_more, "capped stream fully shown");
+        assert!(second.has_more, "10 hits remain past offset 20");
         assert_eq!(second.roots[0].files[0].match_lines, 30, "all counted");
 
         let third = search(
@@ -1604,8 +1712,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(third.returned, 0, "stream ends at the cap");
-        assert!(!third.has_more, "paging terminates cleanly");
+        // The 10 hits past the cap are NOT gone — page three delivers them
+        // and the stream then ends honestly (the old assertion expected
+        // them on no page at all).
+        assert_eq!(third.returned, 10, "the capped-off tail arrives here");
+        assert!(!third.has_more, "stream exhausted after the tail");
     }
 
     #[test]
@@ -1630,10 +1741,12 @@ mod tests {
         assert_eq!(out.roots[0].files[0].hits.len(), 20);
         assert_eq!(out.roots[0].files[0].match_lines, 200, "all counted");
         assert!(
-            !out.has_more,
-            "the capped stream is fully shown; no page churn"
+            out.has_more,
+            "the 180 capped-off hits keep their stream positions and are \
+             reachable on the next page — the old assert denied their \
+             reachability, which is exactly the §4.2e silent drop"
         );
-        assert!(out.complete);
+        assert!(!out.complete);
     }
 
     #[test]
@@ -1641,10 +1754,11 @@ mod tests {
         // The reported multi-file shape (defaults in the MCP handler: limit
         // 50, cap 20): two files with 25 matches each buffer all 50 hits, so
         // neither `collected_truncated` nor `seen_hits > window_end` fired
-        // and 10 matches were reachable on no offset. With the cap defining
-        // the stream, the page shows the full capped stream (2 x 20) and
-        // reports has_more honestly; paging with a smaller limit tiles the
-        // stream exactly once, with no duplicates and no gaps.
+        // and 10 matches were reachable on no offset. The cap now shapes
+        // what each page SHOWS, not the stream: the page shows 2 x 20 and
+        // reports has_more because each file still holds 5 withheld hits;
+        // paging with a smaller limit tiles the full 50-hit stream exactly
+        // once, with no duplicates and no gaps.
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "a.txt", &"needle\n".repeat(25));
         write(dir.path(), "b.txt", &"needle\n".repeat(25));
@@ -1660,10 +1774,13 @@ mod tests {
             },
         );
         assert_eq!(page.returned, 40, "both files contribute their capped 20");
-        assert!(!page.has_more, "capped stream (40) fits the page");
+        assert!(
+            page.has_more,
+            "each file holds 5 withheld hits past the cap"
+        );
         assert_eq!(page.stats.match_lines, 50, "all matches counted");
 
-        // Same corpus, smaller pages: the capped stream tiles exactly once.
+        // Same corpus, smaller pages: the full stream tiles exactly once.
         let mut seen: Vec<(String, u32)> = Vec::new();
         let mut offset = 0;
         loop {
@@ -1685,17 +1802,17 @@ mod tests {
                 }
             }
             if !out.has_more {
-                assert_eq!(out.returned + offset, 40, "pages tile the capped stream");
+                assert_eq!(out.returned + offset, 50, "pages tile the full stream");
                 break;
             }
             offset += out.returned;
-            assert!(offset < 40, "paging must terminate");
+            assert!(offset < 50, "paging must terminate");
         }
         let mut unique = seen.clone();
         unique.sort();
         unique.dedup();
         assert_eq!(unique.len(), seen.len(), "no hit appears on two pages");
-        assert_eq!(seen.len(), 40, "every capped-stream hit is delivered");
+        assert_eq!(seen.len(), 50, "every stream hit is delivered");
     }
 
     #[test]
@@ -1731,7 +1848,33 @@ mod tests {
             },
         );
         assert_eq!(second.returned, 50, "second page shows the next 50");
-        assert!(!second.has_more, "capped stream (100) fully shown");
+        // The stream is 200 matches, not the cap's 100: 100 remain and
+        // later offsets reach them (the old assertion ended the stream at
+        // the cap, stranding 100 counted-but-unreachable hits).
+        assert!(second.has_more, "100 of 200 shown; the tail is reachable");
+        let third = search(
+            &[spec(dir.path(), None)],
+            &q("needle").compile().unwrap(),
+            &SearchOptions {
+                per_file_cap: 100,
+                limit: Some(50),
+                offset: 100,
+                ..Default::default()
+            },
+        );
+        assert_eq!(third.returned, 50, "third page shows hits 101-150");
+        let fourth = search(
+            &[spec(dir.path(), None)],
+            &q("needle").compile().unwrap(),
+            &SearchOptions {
+                per_file_cap: 100,
+                limit: Some(50),
+                offset: 150,
+                ..Default::default()
+            },
+        );
+        assert_eq!(fourth.returned, 50, "fourth page shows hits 151-200");
+        assert!(!fourth.has_more, "paging terminates cleanly");
     }
 
     #[test]

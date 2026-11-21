@@ -144,11 +144,21 @@ impl FindHandler {
         // without re-sending the query. The stored arguments win; the
         // caller's overrides (project_path) merge over them; the position
         // comes from the token.
-        if let Some(token) = args.get("next").and_then(Value::as_str).filter(|t| !t.is_empty()) {
-            let resumed = crate::cli::mcp::find_paging::resume("leindex_find", token).map_err(
-                |reason| JsonRpcError::invalid_params_with_suggestion(reason, "Re-send the full query"),
-            )?;
-            let merged = crate::cli::mcp::find_paging::merge(&resumed.args, &args, resumed.offset);
+        if let Some(token) = args
+            .get("next")
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+        {
+            let resumed =
+                crate::cli::mcp::find_paging::resume("leindex_find", token).map_err(|reason| {
+                    JsonRpcError::invalid_params_with_suggestion(reason, "Re-send the full query")
+                })?;
+            let merged = crate::cli::mcp::find_paging::merge(
+                &resumed.args,
+                &args,
+                resumed.offset,
+                &resumed.cursors,
+            );
             return Box::pin(self.run(registry, merged)).await;
         }
         // `auto`: definitions named like the pattern first; when there are
@@ -220,6 +230,7 @@ impl FindHandler {
             offset: engine_offset,
             limit: engine_limit,
             per_file_cap: window.per_file,
+            skip_in_file: parse_resume_cursors(&args),
             context: window.context,
             max_line_chars: window.max_line_chars,
             deadline: search_deadline(window.timeout_ms),
@@ -280,6 +291,7 @@ impl FindHandler {
             result,
             &window,
             regex_note,
+            case_insensitive_hits,
             &args,
         );
         if output_mode == "callsites" {
@@ -607,33 +619,38 @@ fn build_roots(
     let mut specs: Vec<RootSpec> = Vec::new();
     let mut primary: Vec<PrimaryRoot> = Vec::new();
     let project_root = project.map(|p| p.root.clone());
-    let mut push =
-        |root: PathBuf,
-         index: Option<Arc<crate::search::textsearch::TextIndex>>,
-         filter: FileFilter,
-         bypass_ignore: bool,
-         file_root: bool| {
-            let external = project_root.as_ref() != Some(&root);
-            primary.push(PrimaryRoot {
-                root: root.clone(),
-                indexed: index.is_some(),
-                external,
-                file_root,
-            });
-            specs.push(RootSpec {
-                root,
-                index,
-                filter,
-                bypass_ignore,
-            });
-        };
+    let mut push = |root: PathBuf,
+                    index: Option<Arc<crate::search::textsearch::TextIndex>>,
+                    filter: FileFilter,
+                    bypass_ignore: bool,
+                    file_root: bool| {
+        let external = project_root.as_ref() != Some(&root);
+        primary.push(PrimaryRoot {
+            root: root.clone(),
+            indexed: index.is_some(),
+            external,
+            file_root,
+        });
+        specs.push(RootSpec {
+            root,
+            index,
+            filter,
+            bypass_ignore,
+        });
+    };
 
     if paths.is_empty() {
         let project =
             project.ok_or_else(|| JsonRpcError::invalid_params("No project to search"))?;
         let scope = scope.map(|s| relative_to(&project.root, s));
         let filter = FileFilter::new(include, exclude, scope.as_deref());
-        push(project.root.clone(), project_index(project), filter, false, false);
+        push(
+            project.root.clone(),
+            project_index(project),
+            filter,
+            false,
+            false,
+        );
         return Ok((specs, primary));
     }
 
@@ -654,13 +671,7 @@ fn build_roots(
             .canonicalize()
             .map_err(|e| JsonRpcError::invalid_params(format!("Cannot search '{raw}': {e}")))?;
         let filter = FileFilter::new(include, exclude, None);
-        push(
-            canonical.clone(),
-            None,
-            filter,
-            true,
-            canonical.is_file(),
-        );
+        push(canonical.clone(), None, filter, true, canonical.is_file());
     }
     Ok((specs, primary))
 }
@@ -680,9 +691,13 @@ fn shape_text_result(
     result: SearchOutput,
     window: &FindWindow,
     regex_note: Option<&str>,
+    case_insensitive_hits: usize,
     query_args: &Value,
 ) -> Value {
     let stats = &result.stats;
+    // `callsites` is a hit page with definition lines dropped afterwards;
+    // it shares the `matches` shaping end to end.
+    let hit_page = output_mode == "matches" || output_mode == "callsites";
     let (mut files_json, symbol_totals, file_rows) =
         collect_file_rows(&result, primary, output_mode, window.include_tests);
     let zero_hit = stats.match_lines == 0;
@@ -712,13 +727,11 @@ fn shape_text_result(
     // in `shape_rows_page`). A zero-hit page ends the stream too — its
     // next_offset would re-serve the identical page — but only the ceiling
     // case is a truncation; the note explains the rest.
-    let ceiling_ended = output_mode == "matches"
-        && result.has_more
-        && continuation_past_ceiling(window.offset + result.returned);
-    let zero_hit_ended =
-        output_mode == "matches" && result.has_more && result.returned == 0 && !ceiling_ended;
+    let ceiling_ended =
+        hit_page && result.has_more && continuation_past_ceiling(window.offset + result.returned);
+    let zero_hit_ended = hit_page && result.has_more && result.returned == 0 && !ceiling_ended;
     match output_mode {
-        "matches" => {
+        "matches" | "callsites" => {
             // §4.2c: test files rank after source files on every page.
             if window.include_tests {
                 files_json.sort_by_key(|file| is_test_path(file_path_of(file)));
@@ -746,10 +759,18 @@ fn shape_text_result(
         "symbols" => {
             let mut rows: Vec<_> = symbol_totals.into_iter().collect();
             rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            shape_rows_page(&mut value, rows, window.offset, window.limit, "symbols", |entry| {
-                let ((name, kind, file), matches) = entry;
-                json!({ "name": name, "kind": kind, "file": file, "matches": matches })
-            }, query_args);
+            shape_rows_page(
+                &mut value,
+                rows,
+                window.offset,
+                window.limit,
+                "symbols",
+                |entry| {
+                    let ((name, kind, file), matches) = entry;
+                    json!({ "name": name, "kind": kind, "file": file, "matches": matches })
+                },
+                query_args,
+            );
         }
         _ => {}
     }
@@ -760,12 +781,8 @@ fn shape_text_result(
         .get("has_more")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let notes = match text_result_notes(
-        &result,
-        value_notes_ceiling,
-        response_has_more,
-        regex_note,
-    ) {
+    let notes = match text_result_notes(&result, value_notes_ceiling, response_has_more, regex_note)
+    {
         Some(note) => vec![note],
         None => Vec::new(),
     };
@@ -774,6 +791,7 @@ fn shape_text_result(
         notes,
         zero_hit,
         regex_note.is_some(),
+        case_insensitive_hits,
         primary,
         &result,
     );
@@ -786,36 +804,42 @@ fn file_path_of(file: &Value) -> &str {
 }
 
 /// §4.2b: merge overlapping and ADJACENT context windows so no line prints
-/// twice. Hits arrive in line order; a hit whose before-runs into the
-/// previous hit's after-range contributes only its unseen tail.
+/// twice. Hits arrive in line order; the previous hit's after-context gives
+/// up any line at or beyond the next match line, and the next hit's
+/// before-context gives up everything the previous window already printed.
 fn merge_hit_context(hits: &[Value]) -> Vec<Value> {
     let mut merged: Vec<Value> = Vec::with_capacity(hits.len());
-    // (start_line, end_line) of the printed region so far (context
-    // inclusive); context lengths come from the first hit's array sizes.
-    let mut printed: Option<(u64, u64)> = None;
     for hit in hits {
         let line = hit.get("line").and_then(Value::as_u64).unwrap_or(0);
         let before_len = hit["before"].as_array().map_or(0, Vec::len) as u64;
-        let after_len = hit["after"].as_array().map_or(0, Vec::len) as u64;
-        let start = line.saturating_sub(before_len);
-        let end = line + after_len;
         let mut entry = hit.clone();
-        match printed {
-            // Overlapping or adjacent (prev_end + 1 == start): trim the
-            // before-list to the lines the previous window did not print.
-            Some((_, prev_end)) if start <= prev_end + 1 => {
-                let keep = line.saturating_sub(prev_end + 1).min(before_len) as usize;
-                let skip = before_len as usize - keep;
-                if skip > 0 && let Some(arr) = hit["before"].as_array() {
+        if let Some(prev) = merged.last_mut() {
+            let prev_line = prev.get("line").and_then(Value::as_u64).unwrap_or(0);
+            let prev_end = prev_line + prev["after"].as_array().map_or(0, Vec::len) as u64;
+            if line.saturating_sub(before_len) <= prev_end + 1 {
+                // The previous window owns the lines up to prev_end: its
+                // after-context keeps only the lines strictly between the
+                // two matches, so the upcoming match line prints once.
+                let keep_after = line.saturating_sub(prev_line + 1) as usize;
+                if let Some(prev_obj) = prev.as_object_mut()
+                    && let Some(arr) = prev_obj.get_mut("after").and_then(Value::as_array_mut)
+                {
+                    let drop = arr.len().saturating_sub(keep_after);
+                    if drop > 0 {
+                        arr.drain(..drop);
+                    }
+                }
+                // This hit's before-context keeps only the lines past the
+                // previous window's end.
+                let keep_before = line.saturating_sub(prev_end + 1).min(before_len) as usize;
+                let skip = before_len as usize - keep_before;
+                if skip > 0
+                    && let Some(arr) = hit["before"].as_array()
+                {
                     entry["before"] = Value::Array(arr[skip..].to_vec());
                 }
             }
-            _ => {}
         }
-        printed = Some(match printed {
-            Some((prev_start, prev_end)) => (prev_start, prev_end.max(end)),
-            None => (start, end),
-        });
         merged.push(entry);
     }
     merged
@@ -874,68 +898,73 @@ fn collect_file_rows(
     let mut symbol_totals: BTreeMap<(String, &'static str, String), usize> = BTreeMap::new();
     let mut file_rows: Vec<(String, usize)> = Vec::new();
     let mut collapsed_tests: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    // `callsites` shares the matches pipeline (it is the same scan; only the
+    // definition lines are dropped afterwards), so its pages must carry hits.
+    let hit_pages = output_mode == "matches" || output_mode == "callsites";
+    let collapse = output_mode == "matches";
     for (root_id, root) in result.roots.iter().enumerate() {
         for file in &root.files {
             let shown = display_path(primary, root_id, &file.rel);
-            match output_mode {
-                "matches" => {
-                    // §4.2c: test files collapse to one summary line unless
-                    // the caller asked for them in full.
-                    if !include_tests && is_test_path(&shown) {
-                        let entry = collapsed_tests.entry(shown).or_default();
-                        entry.0 += file.match_lines;
-                        entry.1 += file.total_hits;
-                        continue;
-                    }
-                    let mut value = json!({
-                        "file": shown,
-                        "matches": file.match_lines,
-                        "symbols_stale": file.symbols_stale,
-                        "hits": merge_hit_context(
-                            &file.hits.iter().map(|hit| {
-                                let mut value = json!({ "line": hit.line, "text": hit.text });
-                                if hit.col > 1 { value["col"] = json!(hit.col); }
-                                if let Some((name, kind)) = &hit.symbol {
-                                    value["symbol"] = json!(name);
-                                    value["kind"] = json!(kind);
-                                }
-                                if !hit.before.is_empty() { value["before"] = json!(hit.before); }
-                                if !hit.after.is_empty() { value["after"] = json!(hit.after); }
-                                value
-                            }).collect::<Vec<_>>(),
-                        ),
-                    });
-                    // §4.2e: the tail is REACHABLE on the next page; say how
-                    // much of this file is still unpaged.
-                    if file.cap_withheld > 0 {
-                        value["cap_line"] = json!(format!(
-                            "+{} more in this file (next page)",
-                            file.cap_withheld
-                        ));
-                    }
-                    // §4.2a: enclosing-symbol ranges for the grouped header.
-                    if !file.symbol_ranges.is_empty() {
-                        let mut ranges = file.symbol_ranges.clone();
-                        ranges.sort_by(|a, b| a.1.cmp(&b.1));
-                        value["symbol_ranges"] = json!(ranges
+            if hit_pages {
+                // §4.2c: test files collapse to one summary line unless
+                // the caller asked for them in full (matches pages only —
+                // callsites filtering needs every hit to filter on).
+                if collapse && !include_tests && is_test_path(&shown) {
+                    let entry = collapsed_tests.entry(shown).or_default();
+                    entry.0 += file.match_lines;
+                    entry.1 += file.total_hits;
+                    continue;
+                }
+                let mut value = json!({
+                    "file": shown,
+                    "matches": file.match_lines,
+                    "symbols_stale": file.symbols_stale,
+                    "hits": merge_hit_context(
+                        &file.hits.iter().map(|hit| {
+                            let mut value = json!({ "line": hit.line, "text": hit.text });
+                            if hit.col > 1 { value["col"] = json!(hit.col); }
+                            if let Some((name, kind)) = &hit.symbol {
+                                value["symbol"] = json!(name);
+                                value["kind"] = json!(kind);
+                            }
+                            if !hit.before.is_empty() { value["before"] = json!(hit.before); }
+                            if !hit.after.is_empty() { value["after"] = json!(hit.after); }
+                            value
+                        }).collect::<Vec<_>>(),
+                    ),
+                });
+                // §4.2e: the tail is REACHABLE on the next page; say how
+                // much of this file is still unpaged.
+                if file.cap_withheld > 0 {
+                    value["cap_line"] = json!(format!(
+                        "+{} more in this file (next page)",
+                        file.cap_withheld
+                    ));
+                }
+                // §4.2a: enclosing-symbol ranges for the grouped header.
+                if !file.symbol_ranges.is_empty() {
+                    let mut ranges = file.symbol_ranges.clone();
+                    ranges.sort_by_key(|range| range.1);
+                    value["symbol_ranges"] = json!(
+                        ranges
                             .iter()
                             .map(|(name, start, end)| json!({
                                 "name": name,
                                 "start": start,
                                 "end": end,
                             }))
-                            .collect::<Vec<_>>());
-                    }
-                    files_json.push(value);
+                            .collect::<Vec<_>>()
+                    );
                 }
-                "symbols" => {
-                    for (name, kind, count) in &file.symbols {
-                        *symbol_totals
-                            .entry((name.clone(), kind, shown.clone()))
-                            .or_default() += count;
-                    }
+                files_json.push(value);
+            } else if output_mode == "symbols" {
+                for (name, kind, count) in &file.symbols {
+                    *symbol_totals
+                        .entry((name.clone(), kind, shown.clone()))
+                        .or_default() += count;
                 }
-                _ => file_rows.push((shown, file.match_lines)),
+            } else {
+                file_rows.push((shown, file.match_lines));
             }
         }
     }
@@ -979,6 +1008,23 @@ fn trim_to_budget(files: &mut Vec<Value>, token_budget: usize) {
     files.truncate(kept);
 }
 
+/// Per-file resume cursors from a continuation (`resume_cursors`, injected
+/// by `find_paging::merge` from the token). Anything that is not a
+/// map of `string → usize` is ignored, so a malformed token degrades to a
+/// plain first page instead of erroring.
+fn parse_resume_cursors(args: &Value) -> BTreeMap<String, usize> {
+    args.get("resume_cursors")
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter_map(|(key, value)| {
+                    value.as_u64().map(|shown| (key.clone(), shown as usize))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The `matches` response page: hit lists plus the paging/truncation signals.
 fn shape_matches_page(
     value: &mut Value,
@@ -1006,11 +1052,23 @@ fn shape_matches_page(
         // starts exactly where the budget cut off (§6.8 non-overlap).
         let next_offset = if budget_ended {
             offset + shown
-        }
-        else {
+        } else {
             offset + result.returned
         };
-        let token = crate::cli::mcp::find_paging::issue("leindex_find", query_args, next_offset);
+        // §4.2e/§6.8: files that still withhold capped-off matches ride the
+        // token as per-file resume cursors, so the next page skips exactly
+        // what was delivered — per file, not by global offset alone.
+        let cursors = if result.resume.is_empty() {
+            Value::Null
+        } else {
+            json!(result.resume)
+        };
+        let token = crate::cli::mcp::find_paging::issue_with_cursors(
+            "leindex_find",
+            query_args,
+            next_offset,
+            &cursors,
+        );
         value["next_offset"] = json!(next_offset);
         if !token.is_empty() {
             value["next"] = json!(token);
@@ -1114,6 +1172,7 @@ fn zero_reasons(
     primary: &[PrimaryRoot],
     result: &SearchOutput,
     pattern_had_metachars: bool,
+    case_insensitive_hits: usize,
 ) -> Vec<String> {
     let mut reasons = Vec::new();
     if pattern_had_metachars {
@@ -1121,6 +1180,12 @@ fn zero_reasons(
             "the pattern looks like a regex and was also tried as one; neither reading matched"
                 .to_string(),
         );
+    }
+    if case_insensitive_hits > 0 {
+        reasons.push(format!(
+            "0 case-sensitive hits, {case_insensitive_hits} case-insensitive; \
+             pass case:\"insensitive\" to see them"
+        ));
     }
     if result.stats.glob_excluded > 0 {
         reasons.push(format!(
@@ -1138,7 +1203,8 @@ fn zero_reasons(
         } else if primary.iter().all(|r| !r.indexed) {
             reasons.push(
                 "no index was consulted (raw path search); the directory may be empty \
-                 or hold only binary/oversized files".to_string(),
+                 or hold only binary/oversized files"
+                    .to_string(),
             );
         }
     }
@@ -1153,11 +1219,17 @@ fn attach_notes(
     notes: Vec<String>,
     zero_hit: bool,
     pattern_had_metachars: bool,
+    case_insensitive_hits: usize,
     primary: &[PrimaryRoot],
     result: &SearchOutput,
 ) {
     if zero_hit {
-        value["zero_reasons"] = json!(zero_reasons(primary, result, pattern_had_metachars));
+        value["zero_reasons"] = json!(zero_reasons(
+            primary,
+            result,
+            pattern_had_metachars,
+            case_insensitive_hits
+        ));
     }
     if let Some(first) = notes.first() {
         value["note"] = json!(first);
@@ -1171,22 +1243,25 @@ fn attach_notes(
 /// caller who typed it in a literal almost certainly meant the regex.
 fn looks_like_regex(pattern: &str) -> bool {
     let mut chars = pattern.chars().peekable();
-    let mut escaped = false;
     while let Some(c) = chars.next() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
         match c {
-            '\\' => escaped = true,
+            '\\' => match chars.peek() {
+                // \b, \d, \w … are regex classes: as a literal they are
+                // backslash-plus-letter text, so the two readings differ.
+                Some(next) if next.is_alphanumeric() => return true,
+                // \. and friends escape a metachar: the literal and the
+                // escaped-regex readings match the same text, so no retry.
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            },
             // Alternation, repetition-with-a-partner, anchors, classes and
             // groups are the shapes that make a literal reading useless.
+            // A trailing lone `.` is a plain literal (no retry); a dot with
+            // anything after it changes the regex reading.
             '|' | '^' | '$' | '[' | '(' => return true,
-            '.' => {
-                if chars.peek().is_some() {
-                    return true;
-                }
-            }
+            '.' if chars.peek().is_some() => return true,
             _ => {}
         }
     }
@@ -1205,16 +1280,16 @@ async fn exists_result(
         offset: 0,
         limit: Some(1),
         per_file_cap: 1,
+        skip_in_file: BTreeMap::new(),
         context: 0,
         max_line_chars: 200,
         deadline: search_deadline(window.timeout_ms),
         collect_hits: true,
         want_symbols: false,
     };
-    let result =
-        tokio::task::spawn_blocking(move || search(&specs, &compiled, &options)).await;
-    let result: SearchOutput = result
-        .map_err(|e| JsonRpcError::internal_error(format!("find failed: {e}")))?;
+    let result = tokio::task::spawn_blocking(move || search(&specs, &compiled, &options)).await;
+    let result: SearchOutput =
+        result.map_err(|e| JsonRpcError::internal_error(format!("find failed: {e}")))?;
     let exists = result.stats.match_lines > 0;
     let mut first = json!(null);
     for root in &result.roots {
@@ -1251,8 +1326,16 @@ async fn exists_result(
 /// call surface. Find is registry-free by design, so this stays syntactic —
 /// the PDG-backed variant belongs to symbol_lookup.
 fn filter_callsites(value: &mut Value, pattern: &str) {
-    let definition_marker = format!("{pattern}(");
-    let keywords = ["fn ", "function ", "def ", "func ", "class ", "struct ", "impl "];
+    // The caller may search the bare name or `name(`; both mean the same
+    // call surface. Strip the paren so the marker is exactly `name(`.
+    let name = pattern.trim_end_matches('(');
+    let definition_marker = format!("{name}(");
+    // A definition line names the function after one of these keywords
+    // ("pub fn", "async def", "export function", ...). A bare modifier is
+    // not enough, and a call at line start has an empty prefix, which is a
+    // call — not a vacuous definition.
+    const DEFINITION_KEYWORDS: [&str; 7] =
+        ["fn", "function", "def", "func", "class", "struct", "impl"];
     let mut callsites = 0usize;
     if let Some(files) = value.get_mut("files").and_then(Value::as_array_mut) {
         for file in files {
@@ -1265,9 +1348,12 @@ fn filter_callsites(value: &mut Value, pattern: &str) {
                             return true;
                         };
                         let trimmed = text.trim_start();
-                        let is_definition = trimmed.contains(&definition_marker)
-                            && keywords.iter().any(|kw| trimmed.starts_with(kw));
-                        !is_definition
+                        let Some(marker_pos) = trimmed.find(&definition_marker) else {
+                            return true;
+                        };
+                        !trimmed[..marker_pos]
+                            .split_whitespace()
+                            .any(|token| DEFINITION_KEYWORDS.contains(&token))
                     });
                     hits.len()
                 });
@@ -1294,6 +1380,32 @@ fn ceiling_sentence() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Shape a response the way the paging tests always do: no roots, no
+    /// regex note, no case recount, empty query args.
+    fn shape(
+        pattern: &str,
+        output: &str,
+        result: SearchOutput,
+        offset: usize,
+        limit: Option<usize>,
+    ) -> Value {
+        let base = find_window(&serde_json::json!({})).unwrap();
+        shape_text_result(
+            pattern,
+            output,
+            &[],
+            result,
+            &FindWindow {
+                offset,
+                limit,
+                ..base
+            },
+            None,
+            0,
+            &serde_json::json!({}),
+        )
+    }
 
     #[test]
     fn test_find_window_limit_zero_maps_to_ceiling_not_unbounded() {
@@ -1396,6 +1508,430 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_find_ignored_dir_found_via_paths_bypasses_ignore_rules() {
+        // §3.7: an explicitly named directory is searched RAW. The default
+        // inventory consults git ignore rules and would hide the target.
+        let dir = project();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let ignored = elsewhere.path().join("target/debug");
+        std::fs::create_dir_all(&ignored).unwrap();
+        std::fs::write(ignored.join("artifact.txt"), "the hidden parse_config\n").unwrap();
+        std::fs::write(elsewhere.path().join(".gitignore"), "target/\n").unwrap();
+        let value = run(
+            dir.path(),
+            json!({"pattern": "parse_config", "paths": [elsewhere.path().to_string_lossy()]}),
+        )
+        .await;
+        assert_eq!(
+            value["total_files"], 1,
+            "the git-ignored directory must be searched when named in paths"
+        );
+        let file = value["files"][0]["file"].as_str().unwrap();
+        assert!(file.contains("target/debug/artifact.txt"), "file: {file}");
+    }
+
+    #[tokio::test]
+    async fn test_find_paths_file_root_is_never_doubled() {
+        // §3.7: a paths entry naming one FILE displays as that path exactly —
+        // the engine reports the bare file name as rel, and joining root+rel
+        // again produced the doubled `g6.log/g6.log`.
+        let dir = project();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let file = elsewhere.path().join("solo.log");
+        std::fs::write(&file, "parse_config appears here\n").unwrap();
+        let value = run(
+            dir.path(),
+            json!({"pattern": "parse_config", "paths": [file.to_string_lossy()]}),
+        )
+        .await;
+        assert_eq!(value["total_files"], 1);
+        let shown = value["files"][0]["file"].as_str().unwrap();
+        assert_eq!(
+            shown,
+            file.to_string_lossy(),
+            "a named file must render as its own path, got {shown}"
+        );
+        assert!(
+            !shown.ends_with("solo.log/solo.log"),
+            "the doubled path is the defect"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_literal_metachar_pattern_auto_retries_as_regex() {
+        // §3.8: `a|b` as a literal matches nothing; the file holds b. The
+        // zero-hit literal search gets ONE retry as a regex, the results
+        // arrive, and the note says what happened. A lone `.` must NOT
+        // trigger the retry.
+        let dir = project();
+        let value = run(dir.path(), json!({"pattern": "zzz|other"})).await;
+        assert_eq!(value["total_matches"], 1, "b-side of the regex");
+        assert_eq!(
+            value["note"].as_str().unwrap_or_default(),
+            "(interpreted as regex)"
+        );
+        let lone_dot = run(dir.path(), json!({"pattern": "."})).await;
+        assert!(
+            lone_dot["total_matches"].as_u64().unwrap() > 0,
+            "a lone dot matches literally and needs no reinterpretation"
+        );
+        let both_dead = run(dir.path(), json!({"pattern": "zzz|qqq"})).await;
+        assert_eq!(both_dead["total_matches"], 0);
+        assert!(
+            both_dead["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("both matched nothing"),
+            "note: {}",
+            both_dead["note"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_context_merge_never_prints_a_line_twice() {
+        // §4.2b: touching windows must not print a line twice — measured per
+        // FILE, because line numbers across different files legitimately
+        // collide.
+        let dir = project();
+        let value = run(
+            dir.path(),
+            json!({"pattern": "parse_config", "context_lines": 2}),
+        )
+        .await;
+        let seen = collect_printed_lines(&value);
+        let unique: std::collections::BTreeSet<_> = seen.iter().cloned().collect();
+        assert_eq!(
+            seen.len(),
+            unique.len(),
+            "a line printed twice is the defect; printed {seen:?}"
+        );
+    }
+
+    /// Every context line the page prints, as (file, line) pairs.
+    fn collect_printed_lines(value: &Value) -> Vec<(String, u64)> {
+        let mut lines = Vec::new();
+        for file in value["files"].as_array().unwrap() {
+            let path = file["file"].as_str().unwrap_or("").to_string();
+            for hit in file["hits"].as_array().unwrap() {
+                let line = hit["line"].as_u64().unwrap();
+                let before_len = hit["before"].as_array().map_or(0, Vec::len) as u64;
+                for offset in 0..before_len {
+                    lines.push((path.clone(), line - before_len + offset));
+                }
+                lines.push((path.clone(), line));
+                let after_len = hit["after"].as_array().map_or(0, Vec::len) as u64;
+                for offset in 1..=after_len {
+                    lines.push((path.clone(), line + offset));
+                }
+            }
+        }
+        lines
+    }
+
+    #[tokio::test]
+    async fn test_find_tests_rank_after_source_and_collapse() {
+        // §4.2c: default — test-file entries come after source entries and
+        // collapse to one summary line each; include_tests=true shows them
+        // in full, still ranked last.
+        let dir = project();
+        std::fs::write(
+            dir.path().join("src/lib_test.rs"),
+            "parse_config in tests\n",
+        )
+        .unwrap();
+        let collapsed = run(dir.path(), json!({"pattern": "parse_config"})).await;
+        let files = collapsed["files"].as_array().unwrap();
+        let test_positions: Vec<usize> = files
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.get("collapsed").is_some())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(test_positions.len(), 1, "one collapsed test entry");
+        assert_eq!(
+            test_positions[0],
+            files.len() - 1,
+            "the collapsed entry rides at the end"
+        );
+        assert!(
+            files[test_positions[0]]["collapsed"]
+                .as_str()
+                .unwrap()
+                .starts_with("tests: ")
+        );
+        let source_entry = files
+            .iter()
+            .find(|f| f.get("collapsed").is_none())
+            .expect("source files stay detailed");
+        assert!(source_entry.get("hits").is_some());
+
+        let expanded = run(
+            dir.path(),
+            json!({"pattern": "parse_config", "include_tests": true}),
+        )
+        .await;
+        let expanded_files = expanded["files"].as_array().unwrap();
+        assert!(
+            expanded_files.iter().all(|f| f.get("collapsed").is_none()),
+            "include_tests=true shows tests in full"
+        );
+        let last = expanded_files.last().unwrap()["file"].as_str().unwrap();
+        assert!(
+            last.ends_with("_test.rs"),
+            "tests still rank after source, got {last}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_token_budget_fills_greedily_and_emits_next() {
+        // §4.2d: a tiny budget keeps one row, ends the page early, and the
+        // continuation offset moves by the rows SHOWN (non-overlap §6.8).
+        let dir = project();
+        let first = run(
+            dir.path(),
+            json!({"pattern": "parse_config", "token_budget": 12}),
+        )
+        .await;
+        assert_eq!(first["has_more"], true);
+        assert!(
+            first["files"].as_array().unwrap().len() < 2,
+            "the budget must cut the page short"
+        );
+        assert!(first["next"].as_str().is_some());
+        assert!(first["budget_note"].is_null() || first["budget_note"].as_str().is_some());
+        let second = run(
+            dir.path(),
+            json!({"pattern": "parse_config", "offset": first["next_offset"]}),
+        )
+        .await;
+        let first_files: Vec<&str> = first["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["file"].as_str().unwrap())
+            .collect();
+        let second_files: Vec<&str> = second["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["file"].as_str().unwrap())
+            .collect();
+        for file in &first_files {
+            assert!(
+                !second_files.contains(file),
+                "page 2 re-served {file}: pages overlap"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_find_per_file_cap_overflow_reachable_on_next_page() {
+        // §4.2e: the cap bounds DISPLAY, not reach. Past-cap matches must
+        // appear on the next offset page (the old text claimed they appear
+        // on no page). lib.rs holds 2 matches; cap 1 shows 1 and announces
+        // the withheld tail.
+        let dir = project();
+        let first = run(
+            dir.path(),
+            json!({"pattern": "parse_config", "per_file_cap": 1}),
+        )
+        .await;
+        let lib = first["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["file"].as_str().unwrap().ends_with("lib.rs"))
+            .unwrap();
+        // `matches` stays the honest total (2); the DISPLAYED hits are capped.
+        assert_eq!(lib["matches"], 2);
+        assert_eq!(lib["hits"].as_array().unwrap().len(), 1);
+        assert_eq!(lib["cap_line"], "+1 more in this file (next page)");
+        assert_eq!(first["withheld_by_cap"], 1);
+        let second = run(
+            dir.path(),
+            json!({"pattern": "parse_config", "per_file_cap": 1, "offset": first["next_offset"]}),
+        )
+        .await;
+        assert!(
+            second["total_matches"].as_u64().unwrap() >= 1,
+            "past-cap matches must be reachable on the next page"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_new_output_modes() {
+        // §4.2f: definitions routes through the symbols machinery (with no
+        // symbol index it answers honestly and says so); callsites drop the
+        // definition line; exists answers and points at the hit.
+        let dir = project();
+        let defs = run(
+            dir.path(),
+            json!({"pattern": "parse_config", "output": "definitions"}),
+        )
+        .await;
+        assert_eq!(defs["output"], "definitions");
+        assert_eq!(defs["target"], "symbols");
+        assert_eq!(
+            defs["note"].as_str().unwrap_or_default(),
+            "Symbol search needs an index: run leindex_manage action=index"
+        );
+
+        let calls = run(
+            dir.path(),
+            json!({"pattern": "parse_config(", "output": "callsites"}),
+        )
+        .await;
+        assert_eq!(calls["output"], "callsites");
+        assert_eq!(
+            calls["total_matches"], 1,
+            "the one call site; definition excluded"
+        );
+        let texts: Vec<&str> = calls["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|f| f["hits"].as_array().unwrap().iter())
+            .map(|h| h["text"].as_str().unwrap())
+            .collect();
+        assert!(
+            texts.iter().all(|t| !t.trim_start().starts_with("pub fn ")),
+            "the definition line must not ride in callsites: {texts:?}"
+        );
+
+        let exists = run(
+            dir.path(),
+            json!({"pattern": "parse_config", "output": "exists"}),
+        )
+        .await;
+        assert_eq!(exists["exists"], true);
+        assert_eq!(exists["first"]["line"], 1);
+        let missing = run(
+            dir.path(),
+            json!({"pattern": "zzz_nothing_zzz", "output": "exists"}),
+        )
+        .await;
+        assert_eq!(missing["exists"], false);
+    }
+
+    #[tokio::test]
+    async fn test_find_zero_result_reports_reasons() {
+        // §6.7: a case-sensitive zero with insensitive hits names the case
+        // mismatch; a zero with no candidates hints at ignore rules.
+        let dir = project();
+        let case = run(
+            dir.path(),
+            json!({"pattern": "PARSE_CONFIG", "case": "sensitive"}),
+        )
+        .await;
+        assert_eq!(case["total_matches"], 0);
+        let reasons: Vec<&str> = case["zero_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r.as_str().unwrap())
+            .collect();
+        assert!(
+            reasons.iter().any(|r| r.contains("case-insensitive")),
+            "reasons: {reasons:?}"
+        );
+
+        let no_candidates = run(
+            dir.path(),
+            json!({"pattern": "zzz_nothing_zzz", "exclude_globs": ["*.rs", "*.md"]}),
+        )
+        .await;
+        assert_eq!(no_candidates["total_matches"], 0);
+        let reasons: Vec<&str> = no_candidates["zero_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r.as_str().unwrap())
+            .collect();
+        assert!(
+            reasons.iter().any(|r| r.contains("excluded")),
+            "reasons: {reasons:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_next_token_pages_without_overlap() {
+        // §6.8: the token alone (plus project_path) continues the stream;
+        // the two pages must not share a file entry.
+        let dir = project();
+        let first = run(dir.path(), json!({"pattern": "parse_config", "limit": 1})).await;
+        let token = first["next"].as_str().expect("page 1 must issue next");
+        let registry = Arc::new(ProjectRegistry::new(2));
+        let second = FindHandler
+            .execute(
+                &registry,
+                json!({"next": token, "project_path": dir.path().to_string_lossy()}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second["pattern"], "parse_config", "the query is replayed");
+        // §6.8 non-overlap is hit-level: a file with more hits than the
+        // page limit legitimately appears on both pages (its NEXT hits),
+        // but no (file, line) pair may repeat.
+        let hit_set = |page: &Value| -> std::collections::BTreeSet<(String, u64)> {
+            page["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|file| {
+                    let path = file["file"].as_str().unwrap().to_string();
+                    file["hits"]
+                        .as_array()
+                        .map(|hits| {
+                            hits.iter()
+                                .filter_map(|hit| {
+                                    hit["line"].as_u64().map(|line| (path.clone(), line))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect()
+        };
+        let first_hits = hit_set(&first);
+        let second_hits = hit_set(&second);
+        let second_files: Vec<&str> = second["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["file"].as_str().unwrap())
+            .collect();
+        assert!(
+            !second_files.is_empty(),
+            "token page must serve the stream's remainder"
+        );
+        for hit in &second_hits {
+            assert!(
+                !first_hits.contains(hit),
+                "token page re-served {hit:?}: pages overlap"
+            );
+        }
+        assert_eq!(second["offset"], first["next_offset"]);
+    }
+
+    #[test]
+    fn test_find_regex_like_heuristic_lone_dot_exempt() {
+        // §3.8 heuristic, unit-level: the metacharacters that CHANGE meaning
+        // fire; a LONE dot (e.g. a filename or version fragment) does not.
+        assert!(looks_like_regex("a|b"));
+        assert!(looks_like_regex("foo.*bar"));
+        assert!(looks_like_regex(r"\bword\b"));
+        assert!(looks_like_regex("[a-z]+"));
+        assert!(looks_like_regex("(a)"));
+        assert!(
+            looks_like_regex("3.14"),
+            "a dot next to other chars is regex-shaped"
+        );
+        assert!(!looks_like_regex("."), "a lone dot is literal-shaped");
+        assert!(!looks_like_regex("word."));
+        assert!(!looks_like_regex("plain"));
+    }
+
+    #[tokio::test]
     async fn test_find_output_modes() {
         let dir = project();
         let count = run(
@@ -1439,14 +1975,14 @@ mod tests {
         };
 
         // Control: a normal page keeps paging.
-        let value = shape_text_result("p", "matches", &[], more(), 10, Some(50));
+        let value = shape("p", "matches", more(), 10, Some(50));
         assert_eq!(value["has_more"], true);
         assert_eq!(value["next_offset"], 15);
         assert!(value.get("truncated_by_ceiling").is_none());
 
         // The page starting AT the ceiling: returned hits are served in
         // full, but the continuation is refused with an explanation.
-        let value = shape_text_result("p", "matches", &[], more(), MAX_LIMIT, Some(50));
+        let value = shape("p", "matches", more(), MAX_LIMIT, Some(50));
         assert_eq!(value["has_more"], false);
         assert!(value["next_offset"].is_null());
         assert_eq!(value["truncated_by_ceiling"], true);
@@ -1455,7 +1991,7 @@ mod tests {
 
         // The straddling page (offset + returned crosses the ceiling): same
         // honest end, no clamped overlap.
-        let value = shape_text_result("p", "matches", &[], more(), MAX_LIMIT - 2, Some(50));
+        let value = shape("p", "matches", more(), MAX_LIMIT - 2, Some(50));
         assert_eq!(value["has_more"], false);
         assert!(value["next_offset"].is_null());
         assert_eq!(value["truncated_by_ceiling"], true);
@@ -1470,10 +2006,9 @@ mod tests {
     /// `ceiling_ended && result.complete` unreachable).
     #[test]
     fn test_window_stop_at_ceiling_reports_the_ceiling_not_the_budget() {
-        let value = shape_text_result(
+        let value = shape(
             "p",
             "matches",
-            &[],
             SearchOutput {
                 returned: 50,
                 has_more: true,
@@ -1498,10 +2033,9 @@ mod tests {
     /// on a deadline stop, making this reachable at offset == MAX_LIMIT).
     #[test]
     fn test_zero_hit_page_ends_the_stream() {
-        let value = shape_text_result(
+        let value = shape(
             "p",
             "matches",
-            &[],
             SearchOutput {
                 returned: 0,
                 has_more: true,
@@ -1530,10 +2064,9 @@ mod tests {
     /// and a deadline stop at the ceiling lost the ceiling sentence.
     #[test]
     fn test_deadline_stopped_page_at_ceiling_reports_both_causes() {
-        let value = shape_text_result(
+        let value = shape(
             "p",
             "matches",
-            &[],
             SearchOutput {
                 returned: 50,
                 has_more: true,
@@ -1560,10 +2093,9 @@ mod tests {
     /// carries `stopped_by_deadline`.
     #[test]
     fn test_budget_note_applies_to_summary_modes() {
-        let value = shape_text_result(
+        let value = shape(
             "p",
             "count",
-            &[],
             SearchOutput {
                 has_more: false,
                 complete: false,

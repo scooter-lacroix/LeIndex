@@ -1614,11 +1614,22 @@ fn render_find(data: &Value) -> String {
     render_find_summary(&mut out, data, &pattern);
     render_find_output_section(&mut out, data);
     if data["has_more"] == true {
-        let _ = writeln!(
-            out,
-            "… more results: offset={}",
-            find_num(data, "next_offset")
-        );
+        match data.get("next").and_then(Value::as_str) {
+            Some(token) => {
+                let _ = writeln!(
+                    out,
+                    "… more results: offset={} next={token}",
+                    find_num(data, "next_offset")
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    out,
+                    "… more results: offset={}",
+                    find_num(data, "next_offset")
+                );
+            }
+        }
     }
     if let Some(note) = data.get("note").and_then(Value::as_str) {
         let _ = writeln!(out, "{note}");

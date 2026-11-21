@@ -369,6 +369,10 @@ to switch between projects."
                     "default": 0,
                     "minimum": 0
                 },
+                "next": {
+                    "type": "string",
+                    "description": "Continuation token from a previous page's `next`; pass it (plus project_path) alone to continue without re-sending the query"
+                },
                 "search_mode": {
                     "type": "string",
                     "enum": ["code", "prose", "auto", "exact", "semantic"],
@@ -407,6 +411,26 @@ to switch between projects."
         registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
+        // §6.8: `next` alone (with project_path) continues a previous call
+        // without re-sending the query.
+        if let Some(token) = args
+            .get("next")
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+        {
+            let resumed = crate::cli::mcp::find_paging::resume("leindex_search", token).map_err(
+                |reason| {
+                    JsonRpcError::invalid_params_with_suggestion(reason, "Re-send the full query")
+                },
+            )?;
+            let merged = crate::cli::mcp::find_paging::merge(
+                &resumed.args,
+                &args,
+                resumed.offset,
+                &Value::Null,
+            );
+            return Box::pin(self.execute(registry, merged)).await;
+        }
         let params = parse_search_params(&args)?;
         let started = Instant::now();
         let (route, route_name, query_type) =
@@ -455,14 +479,23 @@ to switch between projects."
             ));
         }
 
+        let has_more = params.offset + total_returned < total_filtered;
         let mut payload = serde_json::json!({
             "results": serde_json::to_value(&page).map_err(|e|
                 JsonRpcError::internal_error(format!("Serialization error: {}", e)))?,
             "offset": params.offset,
             "count": total_returned,
-            "has_more": params.offset + total_returned < total_filtered,
+            "has_more": has_more,
             "retrieval": retrieval_meta(&guard, route, route_name, &params.budget, started)
         });
+        if has_more {
+            let next_offset = params.offset + total_returned;
+            let token = crate::cli::mcp::find_paging::issue("leindex_search", &args, next_offset);
+            payload["next_offset"] = serde_json::json!(next_offset);
+            if !token.is_empty() {
+                payload["next"] = serde_json::json!(token);
+            }
+        }
         annotate_search_payload(&mut payload, &low_signal_json, started);
         Ok(wrap_with_meta(payload, &guard))
     }

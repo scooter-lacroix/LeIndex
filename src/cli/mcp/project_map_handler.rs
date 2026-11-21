@@ -77,6 +77,10 @@ scoping to subdirectories, sorting, and pagination."
                     "default": 0,
                     "minimum": 0
                 },
+                "next": {
+                    "type": "string",
+                    "description": "Continuation token from a previous page's `next`; pass it (plus project_path) alone to continue without re-sending the arguments"
+                },
                 "limit": {
                     "type": "integer",
                     "description": "Maximum number of files to return (default: unlimited, subject to token_budget)",
@@ -96,6 +100,25 @@ scoping to subdirectories, sorting, and pagination."
         registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
+        // §6.8: `next` alone (with project_path) continues a previous call
+        // without re-sending the arguments.
+        if let Some(token) = args
+            .get("next")
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+        {
+            let resumed = crate::cli::mcp::find_paging::resume("leindex_project_map", token)
+                .map_err(|reason| {
+                    JsonRpcError::invalid_params_with_suggestion(reason, "Re-send the full query")
+                })?;
+            let merged = crate::cli::mcp::find_paging::merge(
+                &resumed.args,
+                &args,
+                resumed.offset,
+                &Value::Null,
+            );
+            return Box::pin(self.execute(registry, merged)).await;
+        }
         let sort_by = args
             .get("sort_by")
             .and_then(|v| v.as_str())
@@ -177,18 +200,26 @@ scoping to subdirectories, sorting, and pagination."
             ));
         }
 
-        Ok(wrap_with_meta(
-            serde_json::json!({
-                "project_root": project_root.display().to_string(),
-                "scope": scope_path.display().to_string(),
-                "total_files_in_scope": total_before_pagination,
-                "offset": offset,
-                "count": truncated_files.len(),
-                "has_more": offset + truncated_files.len() < total_before_pagination,
-                "files": truncated_files
-            }),
-            &guard,
-        ))
+        let has_more = offset + truncated_files.len() < total_before_pagination;
+        let mut payload = serde_json::json!({
+            "project_root": project_root.display().to_string(),
+            "scope": scope_path.display().to_string(),
+            "total_files_in_scope": total_before_pagination,
+            "offset": offset,
+            "count": truncated_files.len(),
+            "has_more": has_more,
+            "files": truncated_files
+        });
+        if has_more {
+            let next_offset = offset + payload["count"].as_u64().unwrap_or(0) as usize;
+            let token =
+                crate::cli::mcp::find_paging::issue("leindex_project_map", &args, next_offset);
+            payload["next_offset"] = serde_json::json!(next_offset);
+            if !token.is_empty() {
+                payload["next"] = serde_json::json!(token);
+            }
+        }
+        Ok(wrap_with_meta(payload, &guard))
     }
 
     /// Grouped-by-community response: reads persisted Leiden labels and

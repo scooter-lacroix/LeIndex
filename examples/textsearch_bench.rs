@@ -23,6 +23,7 @@ fn main() {
                 root: root.clone(),
                 index: idx,
                 filter: FileFilter::default(),
+                bypass_ignore: false,
             };
             let opts = SearchOptions {
                 limit: None,
