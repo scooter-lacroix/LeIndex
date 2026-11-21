@@ -99,6 +99,10 @@ pub mod index_cache;
 pub mod index_freshness;
 /// Registry-owned resumable indexing job state.
 pub mod index_job;
+
+/// Sandboxed `run` capability (§4.4): allow-listed tool execution, structured
+/// output parsers, scoped diagnostics, and how-to-test discovery.
+pub(crate) mod run;
 /// Core orchestration logic for indexing and search.
 pub mod leindex;
 /// Canonical project identity for live, non-hydrating MCP reads.
