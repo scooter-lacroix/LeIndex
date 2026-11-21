@@ -65,11 +65,16 @@ fn test_parse_cargo_test_aggregates_suites_and_failures() {
     assert!(parsed.headline.contains("2 suites"), "{}", parsed.headline);
     assert_eq!(parsed.error_count, 0);
     assert!(parsed.warning_counts.is_empty());
-    // Every failing test carries the first panic line from its stdout block.
-    for failure in &parsed.failures {
-        assert!(failure.detail.contains("panicked"), "{}", failure.name);
-        assert!(failure.detail.contains("assertion `left == right` failed"));
-    }
+    // Every failing test carries exactly the first panic line of its block.
+    let details: Vec<&str> = parsed.failures.iter().map(|f| f.detail.as_str()).collect();
+    assert_eq!(
+        details,
+        vec![
+            "thread 'tests::a::test_one' panicked at src/a.rs:12:5:",
+            "thread 'tests::a::test_two' panicked at src/a.rs:40:9:",
+            "thread 'tests::b::test_three' panicked at src/b.rs:7:5:",
+        ]
+    );
     let names: Vec<&str> = parsed.failures.iter().map(|f| f.name.as_str()).collect();
     assert_eq!(
         names,
@@ -174,7 +179,10 @@ fn test_parse_file_line_col_counts_unique_locations() {
     assert_eq!(parsed.error_count, 3, "unique locations counted once");
     assert_eq!(parsed.failures.len(), 3);
     assert_eq!(parsed.failures[0].name, "src/main.rs:12:5");
-    assert_eq!(parsed.failures[0].detail, "error: variable does not need to be mutable");
+    assert_eq!(
+        parsed.failures[0].detail,
+        "error: variable does not need to be mutable"
+    );
     assert!(parsed.headline.contains("3 issues"));
 }
 
@@ -209,7 +217,10 @@ fn test_render_ends_with_absolute_log_path() {
         Some(PathBuf::from("/mnt/storage/logs/run-test.log")),
     );
     let rendered = summary.render();
-    assert!(rendered.ends_with("/mnt/storage/logs/run-test.log"), "{rendered}");
+    assert!(
+        rendered.ends_with("/mnt/storage/logs/run-test.log"),
+        "{rendered}"
+    );
     assert!(rendered.contains("cargo test: 3 failed, 6 passed (2 suites)"));
     assert!(rendered.contains("✗ tests::a::test_one"));
     assert!(rendered.chars().count() <= MAX_RENDER_CHARS);
@@ -221,7 +232,8 @@ fn test_render_caps_at_1200_with_note() {
     for i in 0..300 {
         failures.push(Failure {
             name: format!("test_case_{i}"),
-            detail: "assertion `left == right` failed with a long explanatory message line".to_string(),
+            detail: "assertion `left == right` failed with a long explanatory message line"
+                .to_string(),
         });
     }
     let summary = Summary {
@@ -234,8 +246,15 @@ fn test_render_caps_at_1200_with_note() {
         log_path: Some(PathBuf::from("/var/logs/x.log")),
     };
     let rendered = summary.render();
-    assert!(rendered.chars().count() <= MAX_RENDER_CHARS, "len={}", rendered.chars().count());
-    assert!(rendered.contains("output truncated"), "truncation announced");
+    assert!(
+        rendered.chars().count() <= MAX_RENDER_CHARS,
+        "len={}",
+        rendered.chars().count()
+    );
+    assert!(
+        rendered.contains("output truncated"),
+        "truncation announced"
+    );
     assert!(rendered.ends_with("/var/logs/x.log"));
 }
 

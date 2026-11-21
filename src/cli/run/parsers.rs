@@ -114,7 +114,10 @@ fn truncate_to_chars(text: &str, limit: usize) -> String {
         return text.to_string();
     }
     let kept: String = text.chars().take(limit.saturating_sub(48)).collect();
-    format!("{kept}… [output truncated — {} chars cut]", text.chars().count() - kept.chars().count())
+    format!(
+        "{kept}… [output truncated — {} chars cut]",
+        text.chars().count() - kept.chars().count()
+    )
 }
 
 /// Assemble a [`Summary`] from a parser result. Pure: no I/O.
@@ -165,7 +168,9 @@ pub(crate) fn parse_cargo_test(output: &str) -> Parsed {
     let mut block: Option<String> = None;
     let mut block_lines: Vec<String> = Vec::new();
 
-    let finish_block = |block: &mut Option<String>, lines: &mut Vec<String>, out: &mut BTreeMap<String, String>| {
+    let finish_block = |block: &mut Option<String>,
+                        lines: &mut Vec<String>,
+                        out: &mut BTreeMap<String, String>| {
         if let Some(name) = block.take() {
             let detail = lines
                 .iter()
@@ -184,7 +189,10 @@ pub(crate) fn parse_cargo_test(output: &str) -> Parsed {
 
         if let Some(rest) = line.strip_prefix("test result:") {
             suites += 1;
-            let words: Vec<&str> = rest.split_whitespace().collect();
+            let words: Vec<&str> = rest
+                .split_whitespace()
+                .map(|word| word.trim_matches(|c| c == ';' || c == '.'))
+                .collect();
             passed += count_after(&words, "passed").unwrap_or(0);
             failed += count_after(&words, "failed").unwrap_or(0);
             continue;
@@ -214,7 +222,12 @@ pub(crate) fn parse_cargo_test(output: &str) -> Parsed {
             || (line.starts_with("----") && line.ends_with(" stderr ----"))
         {
             finish_block(&mut block, &mut block_lines, &mut block_details);
-            let name = line.trim_start_matches("----").trim_end_matches(" stdout ----").trim_end_matches(" stderr ----").trim().to_string();
+            let name = line
+                .trim_start_matches("----")
+                .trim_end_matches(" stdout ----")
+                .trim_end_matches(" stderr ----")
+                .trim()
+                .to_string();
             block = Some(name);
             continue;
         }
@@ -279,7 +292,9 @@ pub(crate) fn parse_cargo_json(output: &str) -> Parsed {
         let level = message["level"].as_str().unwrap_or("");
         let code = message["code"]["code"].as_str().map(str::to_string);
         let span = message["spans"].as_array().and_then(|spans| spans.first());
-        let file = span.and_then(|s| s["file_name"].as_str()).map(str::to_string);
+        let file = span
+            .and_then(|s| s["file_name"].as_str())
+            .map(str::to_string);
         let line_number = span.and_then(|s| s["line_start"].as_u64());
         let location = match (&file, line_number) {
             (Some(file), Some(line)) => format!("{file}:{line}"),
@@ -326,12 +341,16 @@ pub(crate) fn parse_pytest(output: &str) -> Parsed {
     let mut passed = 0usize;
     let mut failed = 0usize;
     let mut errors = 0usize;
+    let mut error_lines = 0usize;
     let mut failures: Vec<Failure> = Vec::new();
 
     for line in output.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("===") && trimmed.contains(" in ") && trimmed.ends_with("===") {
-            let words: Vec<&str> = trimmed.split_whitespace().collect();
+            let words: Vec<&str> = trimmed
+                .split_whitespace()
+                .map(|word| word.trim_matches(','))
+                .collect();
             let label_count = |label: &str| {
                 words
                     .windows(2)
@@ -341,7 +360,7 @@ pub(crate) fn parse_pytest(output: &str) -> Parsed {
             };
             passed += label_count("passed");
             failed += label_count("failed");
-            errors += label_count("error");
+            errors = errors.max(label_count("error"));
             continue;
         }
         for kind in ["FAILED ", "ERROR "] {
@@ -351,12 +370,14 @@ pub(crate) fn parse_pytest(output: &str) -> Parsed {
                     None => (rest.to_string(), String::new()),
                 };
                 if kind == "ERROR " {
-                    errors += 1;
+                    error_lines += 1;
                 }
                 failures.push(Failure { name, detail });
             }
         }
     }
+    // The session summary and the `ERROR` lines describe the same errors.
+    let errors = errors.max(error_lines);
 
     let mut headline = format!("pytest: {failed} failed, {passed} passed");
     if errors > 0 {
@@ -468,7 +489,12 @@ fn tsc_line(line: &str) -> Option<(String, String, String, String)> {
     let code_end = rest.find(':')?;
     let code = rest[..code_end].trim().to_string();
     let message = rest[code_end + 1..].trim().to_string();
-    Some(("(tsconfig)".to_string(), severity.to_string(), code, message))
+    Some((
+        "(tsconfig)".to_string(),
+        severity.to_string(),
+        code,
+        message,
+    ))
 }
 
 /// Parse generic `file:line:col` diagnostics.
@@ -526,10 +552,7 @@ fn file_line_col(line: &str) -> Option<(String, String)> {
             continue;
         }
         let path = line[..i].trim();
-        if path.is_empty()
-            || path.contains(' ')
-            || (!path.contains('/') && !path.contains('.'))
-        {
+        if path.is_empty() || path.contains(' ') || (!path.contains('/') && !path.contains('.')) {
             i += 1;
             continue;
         }

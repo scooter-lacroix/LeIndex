@@ -1,358 +1,426 @@
 //! Sandboxed execution for the `run` capability (§4.4).
 //!
-//! Security shape (non-negotiable):
-//! - allow-listed programs only, with per-program subcommand filters;
-//! - argv is passed as an array straight to `execvp` — no shell ever
-//!   interprets it; a single-string command is accepted only when it carries
-//!   no shell metacharacters (it is split on whitespace, never quoted);
-//! - the working directory is the project root (or a caller-supplied
-//!   *relative* subdirectory), both canonicalized and checked to stay inside
-//!   the canonical project root;
-//! - `./script/*` entries must exist, be regular files, and canonicalize
-//!   inside the project — `../` and symlink escapes are refused;
-//! - stdin is closed, a timeout is mandatory, and the output env forces
-//!   `CARGO_TERM_COLOR=never`, `NO_COLOR=1` and no pager;
-//! - captured output is scrubbed through [`LogScrubber`] *before* it touches
-//!   disk, and each stream is size-capped (bytes past the cap are drained so
-//!   the child never blocks on a full pipe, counted, and the drop announced).
+//! - allow-listed programs only; argv array is primary, a single string is
+//!   accepted only when free of shell metacharacters (split on whitespace);
+//! - no shell ever interprets the command;
+//! - cwd is canonicalized and must stay inside the canonical project root;
+//! - `script/*` executables must canonicalize inside `<project>/script/`;
+//! - stdin is null, the environment is forced colourless/pagerless;
+//! - one deadline covers the child AND output collection, and on expiry the
+//!   whole process group is killed, so a descendant holding the pipes open
+//!   cannot hang the call;
+//! - output is capped, scrubbed line by line by `LogScrubber` before it is
+//!   stored, and the cut is announced in the log.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
-use super::run_log::{self, StoredLog};
+use super::parsers::{self, Summary, ToolKind};
+use super::run_log::{self, MAX_LOG_BYTES, StoredLog};
+use crate::observability::LogScrubber;
 
-/// Default wall-clock limit. Mandatory: a run may raise it, never remove it.
+/// Timeout applied when the caller gives none. A timeout can be raised up to
+/// [`MAX_TIMEOUT_SECS`] but never removed.
 pub(crate) const DEFAULT_TIMEOUT_SECS: u64 = 600;
+/// Upper bound for a caller-supplied timeout.
+pub(crate) const MAX_TIMEOUT_SECS: u64 = 3600;
 
-/// Per-stream cap on what is *retained* (memory and disk). Past the cap the
-/// pipe keeps being drained so the child cannot deadlock; bytes are counted
-/// and the drop is written into the stored log.
-pub(crate) const MAX_STREAM_BYTES: usize = 4 * 1024 * 1024;
+/// Characters only a shell understands; a single-string command containing
+/// any is refused.
+const SHELL_METACHARS: &[char] = &[';', '|', '&', '$', '`', '>', '<', '"', '\'', '\\', '\n'];
 
-/// Characters that only make sense to a shell. A single-string command
-/// containing any of them is rejected with a hint to pass `argv` instead.
-const SHELL_METACHARS: &[char] = &[
-    ';', '|', '&', '$', '`', '(', ')', '<', '>', '\n', '\r', '"', '\'', '\\', '*',
-];
+/// Reserved room inside the log cap for the truncation note.
+const NOTE_RESERVE: usize = 256;
 
-/// Everything that went wrong before (or during) a sandboxed run.
+/// Everything that can go wrong before or during a run.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RunError {
-    /// No command was given.
+    /// No command given.
     Empty,
-    /// Program is not on the allow-list.
+    /// Program (or python module) is not on the allow-list.
     NotAllowed(String),
     /// A single-string command carried shell metacharacters.
     ShellMetacharacters(String),
-    /// A path (cwd or script) escapes the project.
+    /// cwd or script path escapes the project.
     PathEscape(String),
-    /// A `./script/*` entry that does not exist.
+    /// `script/*` entry does not exist.
     MissingScript(String),
-    /// The process could not be spawned.
+    /// Spawn failure.
     Spawn(String),
-    /// The mandatory timeout elapsed; the child was killed.
-    Timeout(u64),
-    /// The stored log could not be written.
+    /// Log store failure.
     Log(String),
 }
 
 impl std::fmt::Display for RunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RunError::Empty => write!(f, "no command given"),
-            RunError::NotAllowed(program) => write!(
+            Self::Empty => write!(f, "no command given"),
+            Self::NotAllowed(what) => write!(
                 f,
-                "program '{program}' is not on the run allow-list \
-                 (cargo, npm, pnpm, yarn, npx tsc, pytest, python -m pytest, \
-                 go test|build|vet, make, just, ./script/*)"
+                "'{what}' is not allowed; allow-list: cargo, npm, pnpm, yarn, npx, pytest, \
+                 python -m pytest|pyright, go, make, just, script/*"
             ),
-            RunError::ShellMetacharacters(command) => write!(
+            Self::ShellMetacharacters(command) => write!(
                 f,
-                "command string contains shell metacharacters and is refused: \
-                 '{command}'. Pass argv as an array instead — it is executed \
-                 without a shell"
+                "command string has shell metacharacters ('{command}'); pass argv as an array \
+                 (no shell is used)"
             ),
-            RunError::PathEscape(path) => {
-                write!(f, "path '{path}' escapes the project and is refused")
+            Self::PathEscape(path) => write!(f, "path '{path}' escapes the project"),
+            Self::MissingScript(script) => {
+                write!(f, "script '{script}' not found in <project>/script/")
             }
-            RunError::MissingScript(script) => {
-                write!(f, "script '{script}' does not exist in the project")
-            }
-            RunError::Spawn(error) => write!(f, "failed to spawn: {error}"),
-            RunError::Timeout(secs) => write!(f, "timed out after {secs}s and was killed"),
-            RunError::Log(error) => write!(f, "log store error: {error}"),
+            Self::Spawn(error) => write!(f, "spawn failed: {error}"),
+            Self::Log(error) => write!(f, "log store: {error}"),
         }
     }
 }
 
-/// Build argv from the two accepted forms. The array form is used verbatim
-/// (executed without a shell). The single-string form is split on whitespace
-/// but refused outright when it contains shell metacharacters.
+impl std::error::Error for RunError {}
+
+/// One run request.
+pub(crate) struct RunRequest<'a> {
+    /// Canonical or raw project root.
+    pub project_root: &'a Path,
+    /// Storage dir that owns `logs/`.
+    pub storage: &'a Path,
+    /// Array form (primary).
+    pub argv: Option<&'a [String]>,
+    /// Single-string form.
+    pub command: Option<&'a str>,
+    /// Working directory (absolute or project-relative).
+    pub cwd: Option<&'a Path>,
+    /// Timeout in seconds; `None` means [`DEFAULT_TIMEOUT_SECS`].
+    pub timeout_secs: Option<u64>,
+    /// Log handle name; `None` generates `run-<ms>`.
+    pub name: Option<&'a str>,
+}
+
+/// Build argv from the two accepted forms.
 pub(crate) fn argv_from_parts(
     command: Option<&str>,
     argv: Option<&[String]>,
 ) -> Result<Vec<String>, RunError> {
     if let Some(argv) = argv {
-        if argv.is_empty() {
-            return Err(RunError::Empty);
-        }
-        return Ok(argv.to_vec());
+        return if argv.is_empty() {
+            Err(RunError::Empty)
+        } else {
+            Ok(argv.to_vec())
+        };
     }
-    let Some(command) = command else {
-        return Err(RunError::Empty);
-    };
+    let command = command.ok_or(RunError::Empty)?;
     if command.chars().any(|c| SHELL_METACHARS.contains(&c)) {
         return Err(RunError::ShellMetacharacters(command.to_string()));
     }
     let split: Vec<String> = command.split_whitespace().map(str::to_string).collect();
     if split.is_empty() {
-        return Err(RunError::Empty);
+        Err(RunError::Empty)
+    } else {
+        Ok(split)
     }
-    Ok(split)
 }
 
-/// Allow-list with per-program subcommand filters.
-fn is_allowed(argv: &[String]) -> Result<(), RunError> {
-    let program = argv[0].as_str();
-    let args = &argv[1..];
+/// `script/x` and `./script/x` (no `..`) name a project script.
+fn script_relative(program: &str) -> Option<&str> {
+    let rel = program.strip_prefix("./").unwrap_or(program);
+    (rel.starts_with("script/")
+        && !Path::new(rel)
+            .components()
+            .any(|c| c == Component::ParentDir))
+    .then_some(rel)
+}
+
+/// Allow-list. Returns the script path when argv[0] is a project script.
+fn check_allowed(argv: &[String]) -> Result<Option<String>, RunError> {
+    let program = argv.first().ok_or(RunError::Empty)?.as_str();
+    if let Some(rel) = script_relative(program) {
+        return Ok(Some(rel.to_string()));
+    }
     let allowed = match program {
-        "cargo" | "npm" | "pnpm" | "yarn" | "pytest" | "make" | "just" => true,
-        // `npx <anything-but-tsc>` would happily download a package; only the
-        // TypeScript compiler is allowed through.
-        "npx" => args.first().map(String::as_str) == Some("tsc"),
-        // `python -c '…'` and friends stay out; only the pytest module form.
+        "cargo" | "npm" | "pnpm" | "yarn" | "npx" | "pytest" | "go" | "make" | "just" => true,
         "python" | "python3" => {
-            args.len() >= 2 && args[0] == "-m" && args[1] == "pytest"
+            argv.get(1).map(String::as_str) == Some("-m")
+                && matches!(argv.get(2).map(String::as_str), Some("pytest" | "pyright"))
         }
-        "go" => matches!(
-            args.first().map(String::as_str),
-            Some("test" | "build" | "vet")
-        ),
-        // Existence and confinement are checked against the real filesystem
-        // in [`validate_workdir`]; the prefix alone only narrows the shape.
-        p if p.starts_with("./script/") => true,
         _ => false,
     };
     if allowed {
-        Ok(())
+        Ok(None)
     } else {
-        Err(RunError::NotAllowed(program.to_string()))
+        Err(RunError::NotAllowed(argv.join(" ")))
     }
 }
 
-/// Validate the request and return the canonical working directory.
-fn validate_workdir(
+/// Canonical project root, the working directory, and the absolute script
+/// path (when argv[0] is a script). Every path is confined to the root.
+fn resolve_paths(
     argv: &[String],
     project_root: &Path,
     cwd: Option<&Path>,
-) -> Result<PathBuf, RunError> {
-    let program = argv
-        .first()
-        .ok_or(RunError::Empty)?
-        .clone();
-    is_allowed(argv)?;
+) -> Result<(PathBuf, PathBuf, Option<PathBuf>), RunError> {
+    let script = check_allowed(argv)?;
     let root = std::fs::canonicalize(project_root)
         .map_err(|_| RunError::PathEscape(project_root.display().to_string()))?;
-
     let workdir = match cwd {
         None => root.clone(),
         Some(cwd) => {
-            // Absolute cwds are refused outright: confinement is defined
-            // relative to the project, never to the machine.
-            if cwd.is_absolute() {
-                return Err(RunError::PathEscape(cwd.display().to_string()));
-            }
-            let joined = root.join(cwd);
+            let joined = if cwd.is_absolute() {
+                cwd.to_path_buf()
+            } else {
+                root.join(cwd)
+            };
             let canonical = std::fs::canonicalize(&joined)
                 .map_err(|_| RunError::PathEscape(cwd.display().to_string()))?;
-            if !canonical.starts_with(&root) {
+            if !canonical.starts_with(&root) || !canonical.is_dir() {
                 return Err(RunError::PathEscape(cwd.display().to_string()));
             }
             canonical
         }
     };
-
-    if program.starts_with("./script/") {
-        let script = root.join(&program);
-        let canonical = std::fs::canonicalize(&script)
-            .map_err(|_| RunError::MissingScript(program.clone()))?;
-        if !canonical.is_file() || !canonical.starts_with(&root) {
-            // Either a symlink/.. escape or a directory: both refused.
-            return Err(RunError::PathEscape(program));
+    let script_path = match script {
+        None => None,
+        Some(rel) => {
+            let canonical = std::fs::canonicalize(root.join(&rel))
+                .map_err(|_| RunError::MissingScript(rel.clone()))?;
+            if !canonical.is_file() || !canonical.starts_with(root.join("script")) {
+                return Err(RunError::PathEscape(rel));
+            }
+            Some(canonical)
         }
-    }
-    Ok(workdir)
+    };
+    Ok((root, workdir, script_path))
 }
 
-/// Output environment: deterministic, colorless, pagerless.
-fn child_env() -> HashMap<String, String> {
-    let mut env: HashMap<String, String> = std::env::vars().collect();
+/// Parser for a command, from its argv.
+pub(crate) fn tool_kind(argv: &[String]) -> ToolKind {
+    let has = |needle: &str| argv.iter().any(|a| a == needle);
+    match argv[0].as_str() {
+        "cargo" if argv.iter().any(|a| a.starts_with("--message-format=json")) => {
+            ToolKind::CargoJson
+        }
+        "cargo" if has("test") => ToolKind::CargoTest,
+        "pytest" => ToolKind::Pytest,
+        "python" | "python3" if has("pytest") => ToolKind::Pytest,
+        "npx" if has("tsc") => ToolKind::Tsc,
+        "tsc" => ToolKind::Tsc,
+        _ => ToolKind::UnknownTool,
+    }
+}
+
+/// `cargo check|clippy|build` gets JSON output so errors dedupe by code and
+/// warnings count per lint.
+fn with_json_format(mut argv: Vec<String>) -> Vec<String> {
+    let machine = argv.iter().any(|a| a.starts_with("--message-format"));
+    let compiles = argv
+        .get(1)
+        .is_some_and(|sub| matches!(sub.as_str(), "check" | "clippy" | "build"));
+    if argv[0] == "cargo" && compiles && !machine {
+        argv.push("--message-format=json".to_string());
+    }
+    argv
+}
+
+fn child_env(command: &mut Command) {
     for (key, value) in [
         ("CARGO_TERM_COLOR", "never"),
         ("NO_COLOR", "1"),
         ("PAGER", "cat"),
         ("GIT_PAGER", "cat"),
-        ("MANPAGER", "cat"),
-        ("TERM", "dumb"),
+        ("GIT_TERMINAL_PROMPT", "0"),
     ] {
-        env.insert(key.to_string(), value.to_string());
+        command.env(key, value);
     }
-    env
 }
 
-/// One drained output stream: what was kept (capped) and what was dropped.
-struct Captured {
-    text: String,
-    kept: usize,
+/// Shared capped buffer fed by both pipes; bytes past the cap are counted.
+#[derive(Default)]
+struct Sink {
+    bytes: Vec<u8>,
     dropped: usize,
 }
 
-async fn drain_stream<R: tokio::io::AsyncRead + Unpin>(mut pipe: R) -> Captured {
-    let mut captured = Captured {
-        text: String::new(),
-        kept: 0,
-        dropped: 0,
-    };
+async fn pump<R: tokio::io::AsyncRead + Unpin>(mut pipe: R, sink: Arc<Mutex<Sink>>) {
     let mut buf = vec![0u8; 8192];
-    loop {
-        match pipe.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                let room = MAX_STREAM_BYTES.saturating_sub(captured.kept);
-                let keep = room.min(n);
-                if keep > 0 {
-                    captured.text.push_str(&String::from_utf8_lossy(&buf[..keep]));
-                }
-                captured.kept += keep;
-                captured.dropped += n - keep;
-            }
+    while let Ok(n) = pipe.read(&mut buf).await {
+        if n == 0 {
+            break;
+        }
+        let mut sink = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let room = (MAX_LOG_BYTES - NOTE_RESERVE).saturating_sub(sink.bytes.len());
+        let keep = room.min(n);
+        sink.bytes.extend_from_slice(&buf[..keep]);
+        sink.dropped += n - keep;
+    }
+}
+
+/// Kill the child and its whole process group.
+fn kill_tree(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
+        // SAFETY: plain signal delivery to the group this call created with
+        // `process_group(0)`; no memory is touched.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
         }
     }
-    captured
+    let _ = child.start_kill();
 }
 
-/// Result of one sandboxed run: process outcome plus the stored log.
-pub(crate) struct RunOutcome {
-    /// Process exit code; `None` when the run was killed by the timeout.
-    pub exit_code: Option<i32>,
-    /// True when the mandatory timeout elapsed and the child was killed.
-    pub timed_out: bool,
-    /// Wall-clock duration in milliseconds (including the kill on timeout).
-    pub duration_ms: u64,
-    /// The stored log (name + absolute path).
-    pub log: StoredLog,
-    /// Combined, scrubbed output the parsers see.
-    pub captured: String,
+/// Scrub line by line (`LogScrubber` redacts the first match per call), then
+/// enforce the hard cap with an announced cut.
+fn finish_log(raw: &[u8], dropped: usize, timed_out: Option<u64>) -> String {
+    let text = String::from_utf8_lossy(raw);
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        out.push_str(&LogScrubber::redact(line));
+        out.push('\n');
+    }
+    if dropped > 0 {
+        out.push_str(&format!(
+            "[log truncated: {dropped} bytes dropped past the 8 MiB cap]\n"
+        ));
+    }
+    if let Some(secs) = timed_out {
+        out.push_str(&format!("[killed: timed out after {secs}s]\n"));
+    }
+    if out.len() > MAX_LOG_BYTES {
+        let mut cut = MAX_LOG_BYTES - NOTE_RESERVE;
+        while !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+        out.push_str("\n[log truncated after scrubbing: 8 MiB cap]\n");
+    }
+    out
 }
 
-/// Execute an allow-listed command inside the project.
-///
-/// `log` must come from [`run_log::prepare`]; output is scrubbed and written
-/// there before this function returns.
-pub(crate) async fn execute(
-    project_root: &Path,
+/// Run an allow-listed command and summarise it.
+pub(crate) async fn run(request: RunRequest<'_>) -> Result<Summary, RunError> {
+    let argv = with_json_format(argv_from_parts(request.command, request.argv)?);
+    let (root, workdir, script_path) = resolve_paths(&argv, request.project_root, request.cwd)?;
+    let log = run_log::prepare(request.storage, request.name)
+        .map_err(|error| RunError::Log(error.to_string()))?;
+    let timeout_secs = request
+        .timeout_secs
+        .unwrap_or(DEFAULT_TIMEOUT_SECS)
+        .clamp(1, MAX_TIMEOUT_SECS);
+    let (exit_code, duration_ms, raw, dropped, timed_out) =
+        execute(&argv, &root, &workdir, script_path, timeout_secs).await?;
+    store_and_summarise(
+        &argv,
+        &log,
+        exit_code,
+        duration_ms,
+        &raw,
+        dropped,
+        timed_out,
+        request.storage,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn store_and_summarise(
     argv: &[String],
-    cwd: Option<&Path>,
-    timeout: Duration,
     log: &StoredLog,
-) -> Result<RunOutcome, RunError> {
-    let workdir = validate_workdir(argv, project_root, cwd)?;
-    let mut command = Command::new(&argv[0]);
+    exit_code: i32,
+    duration_ms: u64,
+    raw: &[u8],
+    dropped: usize,
+    timed_out: Option<u64>,
+    storage: &Path,
+) -> Result<Summary, RunError> {
+    let content = finish_log(raw, dropped, timed_out);
+    std::fs::write(&log.path, &content).map_err(|error| RunError::Log(error.to_string()))?;
+    run_log::enforce_retention(storage, run_log::KEEP_LOGS)
+        .map_err(|error| RunError::Log(error.to_string()))?;
+    let mut summary = parsers::summarize(
+        tool_kind(argv),
+        &content,
+        exit_code,
+        duration_ms,
+        Some(log.path.clone()),
+    );
+    if let Some(secs) = timed_out {
+        summary.headline = format!(
+            "timed out after {secs}s and was killed; {}",
+            summary.headline
+        );
+    }
+    Ok(summary)
+}
+
+async fn execute(
+    argv: &[String],
+    root: &Path,
+    workdir: &Path,
+    script_path: Option<PathBuf>,
+    timeout_secs: u64,
+) -> Result<(i32, u64, Vec<u8>, usize, Option<u64>), RunError> {
+    let program = script_path
+        .as_deref()
+        .map_or_else(|| PathBuf::from(&argv[0]), Path::to_path_buf);
+    let mut command = Command::new(program);
     command
         .args(&argv[1..])
-        .current_dir(&workdir)
+        .current_dir(workdir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    for (key, value) in child_env() {
-        command.env(key, value);
-    }
-    // Cargo builds spawned by LeIndex land in the project's own storage so a
-    // run never contends with (or pollutes) the caller's interactive target
-    // dir. Script wrappers exec cargo, so they inherit the same override.
-    if argv[0] == "cargo" || argv[0].starts_with("./script/") {
-        let target = run_log::storage_dir(project_root).join("target");
-        command.env("CARGO_TARGET_DIR", target);
-    }
-
-    let mut child = command
-        .spawn()
-        .map_err(|error| RunError::Spawn(error.to_string()))?;
-    let stdout_pipe = child.stdout.take().ok_or_else(|| RunError::Spawn("stdout unavailable".to_string()))?;
-    let stderr_pipe = child.stderr.take().ok_or_else(|| RunError::Spawn("stderr unavailable".to_string()))?;
-    let stdout_task = tokio::spawn(drain_stream(stdout_pipe));
-    let stderr_task = tokio::spawn(drain_stream(stderr_pipe));
+    child_env(&mut command);
+    command.env("LEINDEX_RUN_PROJECT", root);
+    #[cfg(unix)]
+    command.process_group(0);
 
     let started = Instant::now();
-    let wait = child.wait();
-    let (status, timed_out) = match tokio::time::timeout(timeout, wait).await {
-        Ok(status) => (status, false),
+    let deadline = started + Duration::from_secs(timeout_secs);
+    let mut child = command
+        .spawn()
+        .map_err(|error| RunError::Spawn(format!("{}: {error}", argv[0])))?;
+    let sink = Arc::new(Mutex::new(Sink::default()));
+    let mut pumps = Vec::new();
+    if let Some(pipe) = child.stdout.take() {
+        pumps.push(tokio::spawn(pump(pipe, sink.clone())));
+    }
+    if let Some(pipe) = child.stderr.take() {
+        pumps.push(tokio::spawn(pump(pipe, sink.clone())));
+    }
+
+    // One deadline for the child AND the pipes: a descendant that outlives
+    // the child and keeps the pipes open would otherwise block forever.
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let finished = tokio::time::timeout(remaining, async {
+        let status = child.wait().await;
+        for task in &mut pumps {
+            let _ = task.await;
+        }
+        status
+    })
+    .await;
+
+    let (exit_code, timed_out) = match finished {
+        Ok(Ok(status)) => (status.code().unwrap_or(-1), None),
+        Ok(Err(error)) => return Err(RunError::Spawn(error.to_string())),
         Err(_) => {
-            // The child is killed via the Command handle; reap it so the
-            // pipes close and the drain tasks finish.
-            let _ = child.start_kill();
+            kill_tree(&mut child);
             let _ = child.wait().await;
-            (
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "timeout",
-                )),
-                true,
-            )
+            for task in &pumps {
+                task.abort();
+            }
+            (-1, Some(timeout_secs))
         }
     };
-    let stdout_captured = stdout_task.await.unwrap_or_else(|_| Captured {
-        text: String::new(),
-        kept: 0,
-        dropped: 0,
-    });
-    let stderr_captured = stderr_task.await.unwrap_or_else(|_| Captured {
-        text: String::new(),
-        kept: 0,
-        dropped: 0,
-    });
-    let duration_ms = started.elapsed().as_millis() as u64;
-
-    // Scrub before anything touches disk or a return path.
-    let mut content = crate::observability::LogScrubber::redact(&stdout_captured.text);
-    if !stderr_captured.text.is_empty() {
-        content.push_str("\n----- stderr -----\n");
-        content.push_str(&crate::observability::LogScrubber::redact(&stderr_captured.text));
-    }
-    let total_dropped = stdout_captured.dropped + stderr_captured.dropped;
-    if total_dropped > 0 {
-        content.push_str(&format!(
-            "\n[log truncated: {total_dropped} bytes past the {MAX_STREAM_BYTES}-byte cap were drained and dropped]\n"
-        ));
-    }
-    run_log::write_log(&log.path, &content).map_err(|error| RunError::Log(error.to_string()))?;
-    run_log::enforce_retention(project_root, super::KEEP_LOGS);
-
-    let exit_code = if timed_out {
-        None
-    } else {
-        status.ok().and_then(|status| status.code())
-    };
-    let mut captured = stdout_captured.text;
-    if !stderr_captured.text.is_empty() {
-        captured.push('\n');
-        captured.push_str(&stderr_captured.text);
-    }
-    Ok(RunOutcome {
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let sink = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    Ok((
         exit_code,
-        timed_out,
         duration_ms,
-        log: log.clone(),
-        captured,
-    })
+        sink.bytes.clone(),
+        sink.dropped,
+        timed_out,
+    ))
 }
-
-#[cfg(test)]
-#[path = "sandbox_test.rs"]
-mod sandbox_tests;
