@@ -110,14 +110,21 @@ pub fn grep_count(pattern: &str, root: &Path, fixed_strings: bool) -> Option<Str
     Some(run_stdout(&mut cmd))
 }
 
-/// Locate `rg` on PATH. Claude Code's Grep requires ripgrep; when absent the
-/// NATIVE arm cannot honestly run grep steps and callers must skip loudly.
+/// Locate `rg` on PATH and start every benchmark search with `--no-config`,
+/// so a developer's `RIPGREP_CONFIG_PATH` (for example `--max-count=1`)
+/// cannot change what the NATIVE arm measures. Each helper still appends its
+/// own explicit flags on top of this constructor.
+///
+/// Claude Code's Grep requires ripgrep; when absent the NATIVE arm cannot
+/// honestly run grep steps and callers must skip loudly.
 fn rg_command() -> Option<Command> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
         let candidate = dir.join("rg");
         if is_executable(&candidate) {
-            return Some(Command::new(candidate));
+            let mut command = Command::new(candidate);
+            command.arg("--no-config");
+            return Some(command);
         }
     }
     None

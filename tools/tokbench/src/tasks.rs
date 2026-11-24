@@ -35,12 +35,25 @@ use std::process::Command;
 use tokio::runtime::Runtime;
 
 /// Measure one call into the rollup.
+///
+/// A tokenizer failure is recorded on the rollup (`tokenizer_failed`, with
+/// the reason in `note`) instead of being replaced by an estimate; the
+/// call itself contributes no tokens, and `run_all` restarts the whole run
+/// with the estimator so the report stays single-sourced.
 fn measure(m: &mut TaskMetrics, counter: &Counter, mode: Mode, tool: &str, text: &str) {
     let chars = text.chars().count();
+    let tokens = match counter.count(text) {
+        Ok(tokens) => tokens,
+        Err(error) => {
+            m.tokenizer_failed = true;
+            m.note = format!("tokenizer encode failed for {tool}: {error}");
+            return;
+        }
+    };
     m.record(&Call {
         mode,
         tool: tool.to_string(),
-        tokens: counter.count(text),
+        tokens,
         chars,
     });
 }
@@ -629,7 +642,16 @@ pub fn task4_leindex(
             return m;
         }
     };
-    m.success = log.contains("tokbench") && after.contains("outbound.rs");
+    // The SAME postcondition as the native arm, checked on the same ground
+    // truth (git status after the commit): the commit landed, the file that
+    // must stay unstaged is still dirty, and the committed file is clean. A
+    // weaker check here (only "log mentions tokbench and outbound.rs is
+    // dirty") would pass a result that leaves both files dirty, which the
+    // native arm correctly fails.
+    m.success = log.contains("tokbench: stage routes only")
+        && after.contains("outbound.rs")
+        && !after.contains("routes.rs")
+        && committed.contains("tokbench");
     if !m.success {
         m.note = "commit/staging state assertion failed".into();
     }
@@ -982,14 +1004,61 @@ pub struct CorpusRun {
 /// every path-bearing text between runs and jitter token counts. The root
 /// is swept on entry and exit; the harness is a serial dev tool and does
 /// not support concurrent invocations.
-pub fn run_all(rt: &Runtime, counter: &Counter) -> Result<CorpusRun> {
+/// Run all 7 tasks for both arms and return the run together with the
+/// counter that actually measured it, so the caller labels the report with
+/// the counter that produced the numbers.
+///
+/// If the tokenizer fails to encode any measured text, the WHOLE run is
+/// redone with the chars/4 estimator and the returned counter is the
+/// estimator. A report therefore never mixes tokenizer-derived and estimated
+/// numbers, and an estimate is never presented under the `Tokenizer` label.
+/// The estimator cannot fail, so one restart is enough.
+pub fn run_all(rt: &Runtime, counter: &Counter) -> (Result<CorpusRun>, Counter) {
     let scratch_dir = std::env::temp_dir().join("tokbench-scratch");
-    let _ = std::fs::remove_dir_all(&scratch_dir);
-    std::fs::create_dir_all(&scratch_dir).context("tokbench scratch dir")?;
-    let run = run_all_in(&scratch_dir, rt, counter);
+    let outcome = run_all_in_scratch(rt, counter, &scratch_dir);
     // Clean up even when a task returns Err; best-effort on the sweep.
     let _ = std::fs::remove_dir_all(&scratch_dir);
-    run
+    outcome
+}
+
+/// [`run_all`] against an explicit scratch root (tests pass a tempdir).
+pub fn run_all_in_scratch(
+    rt: &Runtime,
+    counter: &Counter,
+    scratch: &Path,
+) -> (Result<CorpusRun>, Counter) {
+    let _ = std::fs::remove_dir_all(scratch);
+    if let Err(error) = std::fs::create_dir_all(scratch) {
+        return (Err(error).context("tokbench scratch dir"), counter.clone());
+    }
+    let run = run_all_in(scratch, rt, counter);
+    let failure = match &run {
+        Ok(run) => run
+            .tasks
+            .iter()
+            .find(|(native, leindex)| native.tokenizer_failed || leindex.tokenizer_failed)
+            .map(|(native, leindex)| {
+                if native.tokenizer_failed {
+                    native.note.clone()
+                } else {
+                    leindex.note.clone()
+                }
+            }),
+        Err(_) => None,
+    };
+    if let Some(reason) = failure {
+        eprintln!(
+            "tokbench: tokenizer failed to encode measured text ({reason}); \
+             restarting the whole run with the chars/4 estimator"
+        );
+        let estimator = Counter::estimate();
+        let _ = std::fs::remove_dir_all(scratch);
+        let rerun = std::fs::create_dir_all(scratch)
+            .context("tokbench scratch dir")
+            .and_then(|_| run_all_in(scratch, rt, &estimator));
+        return (rerun, estimator);
+    }
+    (run, counter.clone())
 }
 
 /// Body of [`run_all`] against an explicit scratch root.

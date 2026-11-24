@@ -400,6 +400,10 @@ pub fn materialize(dest: &Path) -> Result<()> {
     }
     for args in [
         ["init"].as_slice(),
+        // Fixture-local isolation from the developer's global git config: a
+        // global `commit.gpgSign=true` would make the fixture commit require a
+        // signing key and fail `materialize` before any task runs.
+        ["config", "commit.gpgSign", "false"].as_slice(),
         ["config", "user.email", "tokbench@example.test"].as_slice(),
         ["config", "user.name", "tokbench fixture"].as_slice(),
         ["add", "."].as_slice(),

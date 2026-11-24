@@ -263,11 +263,15 @@ arms and counts **real tokenizer output tokens** — not estimates.
 ### How to run
 
 ```bash
-cargo xtask tokbench                 # markdown table to stdout + JSON report
-cargo xtask tokbench -- --output /tmp/tokbench.json     # with JSON report
-cargo xtask tokbench gate            # exits non-zero unless every task has
-                                     # ≥40% fewer tokens, ≤ round trips, and
-                                     # equal success (not wired into CI)
+# `--output` is what writes the JSON report; without it only the markdown
+# table is printed.
+cargo xtask tokbench -- --output /tmp/tokbench.json   # markdown table + JSON report
+cargo xtask tokbench run                              # markdown table only
+cargo xtask tokbench gate -- --output /tmp/tokbench-gate.json
+                                     # same, plus gate verdicts; exits non-zero
+                                     # unless every task has ≥40% fewer tokens,
+                                     # ≤ round trips, and equal success (not
+                                     # wired into CI)
 ```
 
 The harness is fully offline: the fixture workspace is GENERATED from an embedded
@@ -284,20 +288,30 @@ ripgrep modes, Edit message, git CLI) are documented in
 
 - **Tool-output tokens** per call, counted with the LeIndex embedder
   `tokenizer.json` (the real BPE tokenizer already in the workspace lockfile).
-  If the tokenizer file is absent the harness falls back to chars/4 and labels
-  every number `ESTIMATE` in the report header — it never presents an estimate
-  as tokenizer-derived. Both arms always use the same counter.
+  Truncation and padding configured in that file are cleared before
+  measuring, so the count reflects the whole tool response. If the tokenizer
+  file is absent the harness falls back to chars/4 and labels every number
+  `ESTIMATE` in the report header. If a loaded tokenizer fails to encode
+  some measured text, the WHOLE run is redone with chars/4 and labelled
+  `ESTIMATE` — it never presents an estimate as tokenizer-derived, and never
+  mixes counters within one report. Both arms always use the same counter.
 - **Round trips**: number of tool calls (the session-cost driver).
 - **Success**: a scripted correctness assertion per task, applied identically
-  to both arms (e.g. "the commit exists and only the right file is staged").
+  to both arms. Each assertion is checked on ground truth (the fixture's git
+  state and file contents after the task), not on the tool's self-report.
+  Task 4, for example, requires in BOTH arms that the commit exists, that
+  `routes.rs` is clean afterwards, and that `outbound.rs` is still dirty.
 - **Per-mode token share** (read / find / edit / git / run) per arm.
 
 ### Determinism
 
 Six of the seven tasks reproduce byte-identical JSON across consecutive runs.
 The harness pins everything that leaks into measured text: rg runs with
-`--sort=path`, fixture commits use fixed git timestamps (the commit hash lands
-in `git log` output), and the scratch root is stable instead of a random
+`--sort=path` and `--no-config` (a developer's `RIPGREP_CONFIG_PATH` cannot
+change what is measured), fixture commits use fixed git timestamps (the
+commit hash lands in `git log` output) and a fixture-local
+`commit.gpgSign=false` (a developer's global signing setting cannot fail the
+fixture commit), and the scratch root is stable instead of a random
 tempdir (fixture paths appear in git status and LeIndex file headers). The
 residual variance is ±0.1% on task 4's git-mode text: LeIndex responses embed
 live timing fields (e.g. `stats.millis` in find payloads) that vary run to

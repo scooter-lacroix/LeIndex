@@ -66,6 +66,11 @@ pub struct TaskMetrics {
     pub success: bool,
     /// Why success is false, or why the task could not run in this build.
     pub note: String,
+    /// The tokenizer failed to encode some measured text. `run_all` watches
+    /// this flag and restarts the WHOLE run with the estimator, so a report
+    /// never mixes tokenizer-derived and estimated numbers, and never labels
+    /// an estimate as a tokenizer count.
+    pub tokenizer_failed: bool,
 }
 
 impl TaskMetrics {
@@ -78,6 +83,7 @@ impl TaskMetrics {
             by_mode: BTreeMap::new(),
             success: false,
             note: String::new(),
+            tokenizer_failed: false,
         }
     }
 
@@ -99,12 +105,21 @@ impl TaskMetrics {
     }
 }
 
-/// Reduction vs native, in percent (100.0 when native is 0).
+/// Reduction vs native, in percent, signed. A LeIndex arm that used MORE
+/// tokens yields a negative reduction (100 native vs 150 LeIndex is -50.0),
+/// so a regression's size is visible in every report instead of collapsing
+/// to `0.0` and reading like an equal-token result. The gate still fails on
+/// any value below 40, negatives included.
+///
+/// Degenerate native=0 case: both arms free is `100.0`; a non-zero LeIndex
+/// total against a free native arm is a regression of unbounded relative
+/// size, reported as `-100.0` so it fails the gate and never reads as a
+/// perfect score.
 pub fn token_reduction_pct(native: usize, leindex: usize) -> f64 {
     if native == 0 {
-        return if leindex == 0 { 100.0 } else { 0.0 };
+        return if leindex == 0 { 100.0 } else { -100.0 };
     }
-    100.0 * (native.saturating_sub(leindex)) as f64 / native as f64
+    100.0 * (native as f64 - leindex as f64) / native as f64
 }
 
 /// The gate verdict for one task: ≥40% fewer tokens, ≤ round trips, equal

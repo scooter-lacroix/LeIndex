@@ -16,9 +16,34 @@ fn test_reduction_pct_known_values() {
     assert_eq!(token_reduction_pct(100, 60), 40.0);
     assert_eq!(token_reduction_pct(100, 0), 100.0);
     assert_eq!(token_reduction_pct(100, 100), 0.0);
-    // Increase reads as 0 reduction, never negative.
-    assert_eq!(token_reduction_pct(60, 100), 0.0);
+    // An INCREASE is a negative reduction, not 0.0: the size of the
+    // regression must stay visible in every report.
+    assert_eq!(token_reduction_pct(100, 150), -50.0);
+    assert_eq!(token_reduction_pct(60, 100), -66.66666666666667);
     assert_eq!(token_reduction_pct(0, 0), 100.0);
+    // A non-free arm against a free native arm is a regression, never a
+    // perfect score.
+    assert_eq!(token_reduction_pct(0, 10), -100.0);
+}
+
+#[test]
+fn test_gate_fails_on_token_increase() {
+    let mut native = TaskMetrics::new(1);
+    let mut leindex = TaskMetrics::new(1);
+    native.record(&call(Mode::Read, 100));
+    native.success = true;
+    leindex.record(&call(Mode::Read, 100));
+    leindex.success = true;
+    assert!(
+        !task_passes_gate(&native, &leindex),
+        "equal tokens is not a 40% reduction"
+    );
+    leindex.tokens = 150;
+    assert!(
+        !task_passes_gate(&native, &leindex),
+        "a token increase must fail the gate"
+    );
+    assert!(token_reduction_pct(native.tokens, leindex.tokens) < 0.0);
 }
 
 #[test]

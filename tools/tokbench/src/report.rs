@@ -62,7 +62,7 @@ Every task runs a REAL LeIndex capability on this build: task 3 through `leindex
             "—"
         };
         out.push_str(&format!(
-            "| {} | {} | {} | {reduction:.1}% | {} | {} | {} | {} | {verdict} — {note} |\n",
+            "| {} | {} | {} | {reduction:.1}% | {} | {} | {} | {} | {verdict} — {} |\n",
             leindex.task,
             native.tokens,
             leindex.tokens,
@@ -70,6 +70,7 @@ Every task runs a REAL LeIndex capability on this build: task 3 through `leindex
             leindex.round_trips,
             native.success,
             leindex.success,
+            table_cell(note),
         ));
     }
     let (native_tok, leindex_tok, native_rt, leindex_rt) = totals(run);
@@ -89,6 +90,19 @@ Every task runs a REAL LeIndex capability on this build: task 3 through `leindex
         ));
     }
     out
+}
+
+/// Render `text` as the contents of one Markdown table cell: line breaks
+/// collapsed to spaces and `|` escaped, so a multiline tool output in a
+/// note cannot split the task row. The full text is kept verbatim in the
+/// JSON report; only the table projection is flattened.
+fn table_cell(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ")
+        .replace('|', "\\|")
 }
 
 /// The JSON report value.
@@ -150,3 +164,7 @@ pub fn gate_lines(run: &CorpusRun) -> Vec<String> {
     ));
     lines
 }
+
+#[cfg(test)]
+#[path = "report_test.rs"]
+mod tests;

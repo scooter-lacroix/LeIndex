@@ -67,7 +67,12 @@ fn main() -> Result<()> {
     );
 
     let rt = tokio::runtime::Runtime::new().context("tokio runtime")?;
-    let run = tasks::run_all(&rt, &counter).context("corpus run")?;
+    // `run_all` restarts the whole run with the estimator if the tokenizer
+    // cannot encode some measured text, and hands back the counter that
+    // produced the numbers so the report never mislabels them.
+    let (run, counter) = tasks::run_all(&rt, &counter);
+    let run = run.context("corpus run")?;
+    eprintln!("tokbench: report measured with: {}", counter.provenance());
 
     print!("{}", report::markdown(&run, &counter));
     if let Some(path) = output {

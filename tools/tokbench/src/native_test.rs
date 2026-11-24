@@ -48,6 +48,70 @@ fn test_edit_message_mirrors_claude_code_shape() {
     assert!(msg.contains("has been edited"), "got: {msg}");
 }
 
+/// A developer's ripgrep configuration must not leak into the benchmark:
+/// `RIPGREP_CONFIG_PATH` with `--max-count=1` would otherwise cap every
+/// helper at one match per file and fail tasks for reasons unrelated to the
+/// fixture.
+#[test]
+fn test_grep_ignores_ripgrep_config_path() {
+    let (dir, path) = temp_file("needle\nneedle\nneedle\n");
+    let config = dir.path().join("rgrc");
+    std::fs::write(&config, "--max-count=1\n").unwrap();
+    let Some(mut command) = rg_command() else {
+        eprintln!("skipping: rg not on PATH");
+        return;
+    };
+    // Run through the shared constructor exactly as the helpers do, with the
+    // hostile configuration active for the child.
+    command
+        .env("RIPGREP_CONFIG_PATH", &config)
+        .arg("-c")
+        .arg("needle")
+        .arg(&path);
+    let out = command.output().expect("rg runs");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let count = |text: &str| -> usize {
+        text.rsplit(':')
+            .next()
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(0)
+    };
+    assert_eq!(
+        count(&text),
+        3,
+        "rg config leaked into the benchmark: {text}"
+    );
+
+    // Control: the same configuration DOES cap a plain ripgrep invocation,
+    // so the assertion above is proof of `--no-config`, not of an inert file.
+    let rg = {
+        let mut found = None;
+        if let Some(paths) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&paths) {
+                let candidate = dir.join("rg");
+                if is_executable(&candidate) {
+                    found = Some(candidate);
+                    break;
+                }
+            }
+        }
+        found.expect("rg located above")
+    };
+    let control = std::process::Command::new(rg)
+        .env("RIPGREP_CONFIG_PATH", &config)
+        .arg("-c")
+        .arg("needle")
+        .arg(&path)
+        .output()
+        .expect("rg runs");
+    let control_text = String::from_utf8_lossy(&control.stdout);
+    assert_eq!(
+        count(&control_text),
+        1,
+        "control: RIPGREP_CONFIG_PATH should cap a plain rg at one match: {control_text}"
+    );
+}
+
 #[test]
 fn test_git_captures_real_cli_output() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -61,6 +125,9 @@ fn test_git_captures_real_cli_output() {
     };
     for args in [
         ["init"].as_slice(),
+        // Same fixture-local isolation as `corpus::materialize`: never
+        // require the developer's signing key for a throwaway commit.
+        &["config", "commit.gpgSign", "false"][..],
         &["config", "user.email", "t@example.test"][..],
         &["config", "user.name", "t"][..],
         ["add", "."].as_slice(),
