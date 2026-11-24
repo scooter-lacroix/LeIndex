@@ -64,6 +64,7 @@ fn test_find_scope_prefers_nearest_package_and_skips_workspace_root() {
         Scope::Cargo {
             package: "inner".to_string(),
             dir: root.join("crates/inner"),
+            workspace_root: root.clone(),
         }
     );
     let tsc = find_scope(&root, &root.join("web/src/app.ts")).unwrap();
@@ -205,6 +206,94 @@ fn test_check_scoped_compiles_test_targets() {
     assert_eq!(stored.len(), 1, "{stored:?}");
     assert_eq!(stored[0].severity, Severity::Error);
     assert_eq!(stored[0].line, 2);
+}
+
+/// Cargo prints diagnostic `file_name` relative to the WORKSPACE root, which
+/// for a real member is an ancestor of the member directory the check ran
+/// in. Resolving against the member cwd stored `<root>/member/member/...`,
+/// which matched no file, so the diagnostic vanished from `diagnostics_for`
+/// and the read overlay.
+#[test]
+fn test_check_scoped_resolves_cargo_paths_against_the_workspace_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    write(
+        &root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"member\"]\n",
+    );
+    write(
+        &root.join("member/Cargo.toml"),
+        "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write(&root.join("member/src/lib.rs"), "mod foo;\n");
+    write(
+        &root.join("member/src/foo.rs"),
+        "pub fn f() -> u32 { \"not a number\" }\n",
+    );
+
+    let summary = check_scoped(&root, Path::new("member/src/foo.rs"), 5).unwrap();
+    assert_ne!(summary.exit_code, 0, "{}", summary.render());
+    assert_eq!(summary.error_count, 1, "{}", summary.render());
+    // Stored under the real file, so a later read of that file finds it.
+    let stored = diagnostics_for(&root, Path::new("member/src/foo.rs"), 1..=1);
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    assert_eq!(stored[0].code.as_deref(), Some("E0308"));
+    assert_eq!(stored[0].file, root.join("member/src/foo.rs"));
+    // And never under the doubled path the cwd-based base produced.
+    assert!(
+        !stored[0].file.to_string_lossy().contains("member/member"),
+        "{stored:?}"
+    );
+}
+
+/// The three workspace shapes Cargo resolves, which decide the base:
+/// a package that is its own workspace root, a package listed by an
+/// ancestor's `members`, and a package an ancestor's `exclude` pushes out.
+#[test]
+fn test_cargo_workspace_root_follows_manifest_claims() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+
+    // Stand-alone package: no [workspace] anywhere => its own root.
+    write(
+        &root.join("solo/Cargo.toml"),
+        "[package]\nname = \"solo\"\n",
+    );
+    assert_eq!(cargo_workspace_root(&root.join("solo")), root.join("solo"));
+
+    // A member with its own `[workspace]` table is its own root even under
+    // a parent workspace (the shape the earlier fixture had).
+    write(
+        &root.join("ws/Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/*\"]\nexclude = [\"crates/own\"]\n",
+    );
+    write(
+        &root.join("ws/crates/a/Cargo.toml"),
+        "[package]\nname = \"a\"\n",
+    );
+    write(
+        &root.join("ws/crates/own/Cargo.toml"),
+        "[package]\nname = \"own\"\n[workspace]\n",
+    );
+    write(
+        &root.join("ws/crates/deep/x/Cargo.toml"),
+        "[package]\nname = \"deep\"\n",
+    );
+    // Listed by `crates/*`: the parent is the root.
+    assert_eq!(
+        cargo_workspace_root(&root.join("ws/crates/a")),
+        root.join("ws")
+    );
+    // Excluded by name: the parent does not claim it; its own table does.
+    assert_eq!(
+        cargo_workspace_root(&root.join("ws/crates/own")),
+        root.join("ws/crates/own")
+    );
+    // Two levels under `crates/*` is not matched by a one-level glob.
+    assert_eq!(
+        cargo_workspace_root(&root.join("ws/crates/deep/x")),
+        root.join("ws/crates/deep/x")
+    );
 }
 
 /// A workspace member nested under the project root is only reachable when

@@ -131,7 +131,16 @@ enum Scope {
     /// directory upward, so a member nested below the project root is only
     /// reachable when the check runs inside that member (or an ancestor
     /// that is itself a workspace root above it).
-    Cargo { package: String, dir: PathBuf },
+    ///
+    /// `workspace_root` is the directory Cargo resolves that workspace to
+    /// (see [`cargo_workspace_root`]). Cargo prints every diagnostic
+    /// `file_name` relative to it — NOT to `dir` — so that is the base the
+    /// paths are resolved against.
+    Cargo {
+        package: String,
+        dir: PathBuf,
+        workspace_root: PathBuf,
+    },
     /// `npx tsc --noEmit` from this directory.
     Tsc(PathBuf),
 }
@@ -156,6 +165,7 @@ fn find_scope(project_root: &Path, file: &Path) -> Result<Scope> {
                 return Ok(Scope::Cargo {
                     package: name.to_string(),
                     dir: current.clone(),
+                    workspace_root: cargo_workspace_root(&current),
                 });
             }
         }
@@ -174,10 +184,85 @@ fn find_scope(project_root: &Path, file: &Path) -> Result<Scope> {
     ))
 }
 
+/// The workspace root Cargo resolves a package directory to.
+///
+/// Cargo walks upward from the package directory and stops at the first
+/// `Cargo.toml` whose `[workspace]` table claims it: a root with no
+/// `members` list, or one whose `members`/`exclude` admit the package. A
+/// `[workspace]` table inside the package itself (`members = []` or not
+/// listing itself) therefore makes the package its own root — which is why
+/// a stand-alone member prints `src/lib.rs` while a workspace member prints
+/// `member/src/lib.rs`. Stops at `project_root` so a stray parent manifest
+/// outside the project can never become the base.
+///
+/// Everything is decided from the manifest text, not `cargo metadata`, so
+/// no second Cargo process is spawned for every scoped check.
+fn cargo_workspace_root(member_dir: &Path) -> PathBuf {
+    /// Does Cargo member pattern `pattern` list the project-relative path
+    /// `rel`? Cargo accepts a literal path, `dir/*` (one level) and
+    /// `dir/**` (any depth); the latter two are matched here without a glob
+    /// dependency.
+    fn lists(pattern: &str, rel: &str) -> bool {
+        if let Some(prefix) = pattern.strip_suffix("/**") {
+            return rel == prefix || rel.starts_with(&format!("{prefix}/"));
+        }
+        if let Some(prefix) = pattern.strip_suffix("/*") {
+            return match rel.strip_prefix(&format!("{prefix}/")) {
+                Some(rest) => !rest.contains('/'),
+                None => false,
+            };
+        }
+        pattern == rel
+    }
+
+    let mut current = Some(member_dir.to_path_buf());
+    while let Some(dir) = current {
+        let manifest = dir.join("Cargo.toml");
+        if let Ok(text) = std::fs::read_to_string(&manifest)
+            && let Ok(table) = text.parse::<toml::Table>()
+            && let Some(workspace) = table.get("workspace")
+        {
+            let claims_root = match workspace.get("members").and_then(toml::Value::as_array) {
+                // No `members` key: a root package or a virtual manifest
+                // whose members are discovered implicitly. It is the root.
+                None => true,
+                Some(_) => {
+                    let rel = member_dir
+                        .strip_prefix(&dir)
+                        .map(|r| r.to_string_lossy().replace('\\', "/"))
+                        .unwrap_or_default();
+                    let strs = |key: &str| -> Vec<String> {
+                        workspace
+                            .get(key)
+                            .and_then(toml::Value::as_array)
+                            .map(|xs| {
+                                xs.iter()
+                                    .filter_map(toml::Value::as_str)
+                                    .map(str::to_string)
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    };
+                    let listed = strs("members").iter().any(|g| lists(g, &rel));
+                    let excluded = strs("exclude").iter().any(|g| lists(g, &rel));
+                    listed && !excluded
+                }
+            };
+            if claims_root {
+                return dir;
+            }
+        }
+        current = dir.parent().map(Path::to_path_buf);
+    }
+    // No workspace claims the package anywhere above it: Cargo still runs
+    // it as its own root, so its directory is the base.
+    member_dir.to_path_buf()
+}
+
 /// `cargo check` JSON lines to diagnostics. Messages without a span (the
 /// "aborting due to" trailer) carry no location and are skipped. `file_name`
-/// is relative to the workspace root Cargo resolved from its working
-/// directory, so `base` is the directory the check ran in.
+/// is relative to the workspace root Cargo resolved, so `base` is that root
+/// (see [`cargo_workspace_root`]) — not the directory the check ran in.
 pub(crate) fn parse_cargo_diagnostics(base: &Path, output: &str) -> Vec<Diagnostic> {
     let mut found: Vec<Diagnostic> = Vec::new();
     for line in output.lines() {
@@ -276,7 +361,11 @@ pub(crate) fn check_scoped(project_root: &Path, file: &Path, max: usize) -> Resu
     }
     let scope = find_scope(&root, &file)?;
     let (argv, cwd): (Vec<String>, Option<PathBuf>) = match &scope {
-        Scope::Cargo { package, dir } => (
+        Scope::Cargo {
+            package,
+            dir,
+            workspace_root: _,
+        } => (
             [
                 "cargo",
                 "check",
@@ -317,10 +406,10 @@ pub(crate) fn check_scoped(project_root: &Path, file: &Path, max: usize) -> Resu
     let output = std::fs::read_to_string(&log_path)
         .with_context(|| format!("read {}", log_path.display()))?;
     let diagnostics = match &scope {
-        // Cargo prints `file_name` relative to the workspace root it resolved
-        // from its working directory, so paths are resolved against the cwd
-        // the check ran in — the same rule `tsc` paths follow below.
-        Scope::Cargo { dir, .. } => parse_cargo_diagnostics(dir, &output),
+        // Cargo prints `file_name` relative to the WORKSPACE root it resolved
+        // (which may be an ancestor of the member the check ran in), so that
+        // is the base. `tsc` paths are relative to the cwd it ran in.
+        Scope::Cargo { workspace_root, .. } => parse_cargo_diagnostics(workspace_root, &output),
         Scope::Tsc(dir) => parse_tsc_diagnostics(dir, &output),
     };
     record(&storage, &diagnostics)?;
