@@ -65,7 +65,23 @@ use file_identity::identity;
 // re-exported here so `engine::list_files` stays the public path.
 #[path = "engine_inventory.rs"]
 mod inventory;
-pub use inventory::{InventoryTruncation, list_files, list_files_matching, list_files_reporting};
+pub use inventory::{
+    InventoryTruncation, list_files, list_files_matching, list_files_raw, list_files_reporting,
+};
+
+// The per-file scan and windowing pipeline lives in `engine_paging.rs`;
+// re-exported here so `engine::search` calls the same fns as before.
+#[path = "engine_paging.rs"]
+mod paging;
+pub(super) use paging::{ingest_scanned_files, scan_file};
+
+// Per-file read and hit-construction primitives live in `engine_scan.rs`.
+#[path = "engine_scan.rs"]
+mod scan;
+pub use scan::{ScanRefusal, read_scannable, read_scannable_reason};
+pub(super) use scan::{
+    build_hit, index_candidate_contained, path_stays_inside, read_scan_file, resolve_symbol_index,
+};
 
 // ── Index building ───────────────────────────────────────────────────────────
 
@@ -204,13 +220,13 @@ pub fn dirty_files(root: &Path, index: &TextIndex) -> Arc<Vec<String>> {
                 let Some(known) = index.file(id) else {
                     return true;
                 };
-                match std::fs::metadata(root.join(rel.as_str())) {
+                match std::fs::metadata(root.join(rel)) {
                     // Every recorded field must match: size and mtime can be
                     // forged by a metadata-preserving copy, so ctime/ino are
                     // part of the comparison wherever the platform records
                     // them (0 = not available on either side, a no-op term).
                     Ok(meta) => {
-                        identity(&root.join(rel.as_str()), &meta)
+                        identity(&root.join(rel), &meta)
                             != FileIdentity {
                                 size: known.size,
                                 mtime_ns: known.mtime_ns,
@@ -527,7 +543,7 @@ pub struct SearchOutput {
     pub stats: SearchStats,
 }
 
-struct Candidate {
+pub(crate) struct Candidate {
     rel: String,
     abs: PathBuf,
     id: Option<u32>,
@@ -566,8 +582,12 @@ fn root_candidates(
         // ignore rules, no trigram index (an index built from `git
         // ls-files` would silently re-apply the very rules being bypassed),
         // no side effects. The plain walk only ever skips VCS metadata and
-        // package caches (NEVER_WALK), never .gitignore content.
-        let (rels, trunc) = list_files_reporting(&spec.root, 1_000_000, deadline);
+        // package caches (NEVER_WALK), never .gitignore content — so the
+        // raw walk, not the git-aware listing, is the inventory.
+        let (rels, trunc) = (
+            list_files_raw(&spec.root, 1_000_000, deadline),
+            InventoryTruncation::default(),
+        );
         truncation = trunc;
         for rel in rels {
             set.insert(
@@ -672,426 +692,6 @@ fn clip_line(line: &[u8], col: usize, max_chars: usize) -> String {
     text
 }
 
-fn context_lines(
-    data: &[u8],
-    line_start: usize,
-    line_end: usize,
-    n: usize,
-    max: usize,
-) -> (Vec<String>, Vec<String>) {
-    let mut before = Vec::new();
-    let mut cursor = line_start;
-    while before.len() < n && cursor > 0 {
-        let prev_end = cursor - 1;
-        let prev_start = memchr::memrchr(b'\n', &data[..prev_end]).map_or(0, |p| p + 1);
-        before.push(clip_line(&data[prev_start..prev_end], 0, max));
-        cursor = prev_start;
-    }
-    before.reverse();
-    let mut after = Vec::new();
-    let mut cursor = line_end + 1;
-    while after.len() < n && cursor <= data.len() && line_end < data.len() {
-        let next_end = memchr::memchr(b'\n', &data[cursor.min(data.len())..])
-            .map_or(data.len(), |p| cursor + p);
-        after.push(clip_line(&data[cursor.min(data.len())..next_end], 0, max));
-        cursor = next_end + 1;
-        if next_end >= data.len() {
-            break;
-        }
-    }
-    (before, after)
-}
-
-/// Why a candidate yielded no bytes to scan.
-///
-/// The two halves mean opposite things to a caller: [`NotScannable`] input is
-/// *legitimately* unmatched — nothing a pattern could match lives in a binary
-/// or an oversized file, so it is a clean miss — while [`Unreadable`] names a
-/// file this scan never examined, whose matches are unknown rather than absent.
-/// Collapsing them into one `None` let a structural search answer
-/// `has_more: false` over a file it had failed to open (Codex P2).
-///
-/// [`NotScannable`]: ScanRefusal::NotScannable
-/// [`Unreadable`]: ScanRefusal::Unreadable
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScanRefusal {
-    /// Policy says this input is not source we scan: not a regular file,
-    /// oversized, binary, or not valid UTF-8.
-    NotScannable,
-    /// The file could not be read — a stat or open failure such as denied
-    /// permissions or a transient I/O error. Its contents are unknown, so a
-    /// caller must not treat it as having been searched and come up empty.
-    Unreadable,
-}
-
-fn read_scan_file(path: &Path) -> Result<Vec<u8>, ScanRefusal> {
-    let meta = match std::fs::metadata(path) {
-        Ok(meta) => meta,
-        // A path that no longer exists has no contents to find, so it is not an
-        // unknown file: reporting it unreadable would pin a caller's
-        // "incomplete" flag forever on a broken symlink or a file that moved
-        // between the walk and this open.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ScanRefusal::NotScannable);
-        }
-        Err(_) => return Err(ScanRefusal::Unreadable),
-    };
-    if !meta.is_file() || meta.len() > MAX_SCAN_FILE_BYTES {
-        return Err(ScanRefusal::NotScannable);
-    }
-    let data = std::fs::read(path).map_err(|error| {
-        // Same race as the stat above: a file that vanished between the walk
-        // and this read has no contents to find, so it is a clean miss, not an
-        // unknown file whose absence must pin `has_more`.
-        if error.kind() == std::io::ErrorKind::NotFound {
-            ScanRefusal::NotScannable
-        } else {
-            ScanRefusal::Unreadable
-        }
-    })?;
-    if looks_binary(&data) {
-        return Err(ScanRefusal::NotScannable);
-    }
-    Ok(data)
-}
-
-/// Read a file as text under the same policy a scan uses: regular file, no
-/// bigger than [`MAX_SCAN_FILE_BYTES`], not binary.
-///
-/// Structural search needs the source as `&str` (ast-grep's `StrDoc`), so the
-/// bytes from [`read_scan_file`] are converted here rather than duplicating the
-/// size and binary rules in a second module where they could drift.
-/// Non-UTF-8 files are skipped: they cannot be handed to ast-grep.
-///
-/// Use [`read_scannable_reason`] when the caller must tell a policy refusal
-/// from a file it failed to read.
-pub fn read_scannable(path: &Path) -> Option<String> {
-    read_scannable_reason(path).ok()
-}
-
-/// [`read_scannable`], keeping the reason so a caller can distinguish policy
-/// refusals from files it could not open.
-pub fn read_scannable_reason(path: &Path) -> Result<String, ScanRefusal> {
-    match String::from_utf8(read_scan_file(path)?) {
-        Ok(text) => Ok(text),
-        // Valid UTF-8 is a precondition of parsing, not a read failure: the
-        // bytes were read fine and simply cannot hold an ast-grep match.
-        Err(_) => Err(ScanRefusal::NotScannable),
-    }
-}
-
-fn resolve_symbol_index<'a>(
-    index: Option<&'a TextIndex>,
-    candidate: &Candidate,
-    options: &SearchOptions,
-) -> Option<(&'a TextIndex, u32)> {
-    match (index, candidate.id, candidate.dirty) {
-        (Some(index), Some(id), false) if options.want_symbols && index.has_symbols() => {
-            Some((index, id))
-        }
-        _ => None,
-    }
-}
-
-fn build_hit(
-    data: &[u8],
-    start: usize,
-    line_start: usize,
-    line_no: u32,
-    options: &SearchOptions,
-    symbol: Option<(String, &'static str)>,
-) -> Hit {
-    let line_end = memchr::memchr(b'\n', &data[start..]).map_or(data.len(), |p| start + p);
-    let (before, after) = if options.context > 0 {
-        context_lines(
-            data,
-            line_start,
-            line_end,
-            options.context,
-            options.max_line_chars,
-        )
-    } else {
-        (Vec::new(), Vec::new())
-    };
-    Hit {
-        line: line_no,
-        col: (start - line_start + 1) as u32,
-        text: clip_line(
-            &data[line_start..line_end],
-            start - line_start,
-            options.max_line_chars,
-        ),
-        before,
-        after,
-        symbol,
-    }
-}
-
-/// Whether `path` still resolves inside the canonical `root`.
-///
-/// Index-seeded paths were recorded at inventory time and may have been
-/// re-pointed since; a tracked regular file swapped for a symlink (at the
-/// leaf or via a parent component) would otherwise be followed into content
-/// outside the root. Canonicalization never follows a trailing symlink whose
-/// target is missing, and a resolution that escapes `root` fails the prefix
-/// check — both fail closed.
-pub(super) fn path_stays_inside(
-    path: &std::path::Path,
-    root_canonical: Option<&std::path::Path>,
-) -> bool {
-    root_canonical.is_some_and(|root| {
-        std::fs::canonicalize(path).is_ok_and(|resolved| resolved.starts_with(root))
-    })
-}
-
-/// Whether an index-seeded candidate may still be read: its path was
-/// recorded at inventory time and may have been re-pointed since, and a
-/// tracked regular file swapped for a symlink (at the leaf or via a parent
-/// component) would be followed into content outside the root. Fresh-walk
-/// candidates cannot escape (the walk does not follow links) and explicit
-/// file roots are caller-requested paths, so only index-seeded candidates
-/// are revalidated.
-fn index_candidate_contained(
-    candidate: &Candidate,
-    root_canonical: Option<&std::path::Path>,
-) -> bool {
-    match (candidate.id, root_canonical) {
-        (Some(_), Some(root)) => path_stays_inside(&candidate.abs, Some(root)),
-        _ => true,
-    }
-}
-
-/// How many hits a file may buffer for the requested global window
-/// [offset, offset+limit): `offset + limit` when bounded, 0 (everything)
-/// when `limit` is `None` or this is count-only. The per-file cap shapes
-/// the pagination stream (see `window_file_hits`) but must never bound
-/// COLLECTION below the window: a file whose capped stream is shorter than
-/// the window must still contribute everything it has, and a file whose
-/// stream runs past the window needs its tail buffered so later offsets
-/// can reach it.
-fn page_collect_bound(options: &SearchOptions) -> usize {
-    match (options.collect_hits, options.limit) {
-        (false, _) => 0,
-        (true, Some(limit)) => options.offset.saturating_add(limit),
-        (true, None) => 0,
-    }
-}
-
-fn scan_file(
-    candidate: &Candidate,
-    compiled: &Compiled,
-    options: &SearchOptions,
-    index: Option<&TextIndex>,
-    root_canonical: Option<&std::path::Path>,
-) -> Option<FileResult> {
-    if !index_candidate_contained(candidate, root_canonical) {
-        return None;
-    }
-    // Text search keeps its historical shape: a file it cannot read is a
-    // non-match, not an incomplete result. `has_more` for this axis is built
-    // from the index plan, not from per-file read outcomes, so a refusal here
-    // is dropped rather than escalated.
-    let data = read_scan_file(&candidate.abs).ok()?;
-    let symbol_index = resolve_symbol_index(index, candidate, options);
-    let mut result = FileResult {
-        rel: candidate.rel.clone(),
-        symbols_stale: options.want_symbols && candidate.dirty && candidate.id.is_some(),
-        ..Default::default()
-    };
-    let mut tallies: BTreeMap<(String, &'static str), usize> = BTreeMap::new();
-    let mut symbol_spans: BTreeMap<String, (u32, u32)> = BTreeMap::new();
-    let (mut line_no, mut counted_to, mut last_line_start) = (1u32, 0usize, usize::MAX);
-    let collect_bound = page_collect_bound(options);
-    for found in compiled.regex.find_iter(&data) {
-        let start = found.start();
-        let line_start = memchr::memrchr(b'\n', &data[..start]).map_or(0, |p| p + 1);
-        if line_start == last_line_start {
-            continue;
-        }
-        last_line_start = line_start;
-        line_no += memchr::memchr_iter(b'\n', &data[counted_to..line_start]).count() as u32;
-        counted_to = line_start;
-        result.match_lines += 1;
-
-        let symbol = symbol_index
-            .and_then(|(index, id)| index.enclosing_symbol(id, start))
-            .map(|(name, kind, span_start, span_end)| {
-                *tallies.entry((name.clone(), kind)).or_default() += 1;
-                symbol_spans
-                    .entry(name.clone())
-                    .or_insert((span_start, span_end));
-                (name, kind)
-            });
-        let reportable =
-            options.collect_hits && (collect_bound == 0 || result.hits.len() < collect_bound);
-        if !reportable {
-            continue;
-        }
-        result.hits.push(build_hit(
-            &data, start, line_start, line_no, options, symbol,
-        ));
-    }
-    if result.match_lines == 0 {
-        return None;
-    }
-    // A page limit stopped collection while matches remained: the caller
-    // must report has_more even if the buffered hits alone did not exceed
-    // the window (the defaults' collect_bound == window_end shape). There
-    // is no per_file_cap term: the cap shapes what a page SHOWS, not the
-    // stream (see `window_file_hits`), so matches beyond the buffer are
-    // exactly the ones a later offset must reach — flagging them is the
-    // whole point.
-    result.collected_truncated = collect_bound > 0 && result.match_lines > result.hits.len();
-    // Byte spans → 1-based line numbers for the enclosing-symbol ranges the
-    // grouped renderer prints (`path › name (L2336-2428): N hits`); the same
-    // conversion shape `symbols.rs` uses for its hits.
-    let line_of =
-        |at: usize| 1 + memchr::memchr_iter(b'\n', &data[..at.min(data.len())]).count() as u32;
-    result.symbol_ranges = symbol_spans
-        .into_iter()
-        .map(|(name, (start, end))| {
-            (
-                name,
-                line_of(start as usize),
-                line_of(end.saturating_sub(1).max(start) as usize),
-            )
-        })
-        .collect();
-    result.symbols = tallies
-        .into_iter()
-        .map(|((name, kind), count)| (name, kind, count))
-        .collect();
-    Some(result)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn window_file_hits(
-    file: &mut FileResult,
-    seen_hits: &mut usize,
-    root_index: usize,
-    options: &SearchOptions,
-    window_end: Option<usize>,
-    page_hits: &mut usize,
-    cursors: &mut BTreeMap<String, usize>,
-) {
-    // The per-file cap shapes what a page SHOWS without shrinking the
-    // pagination stream: every buffered hit occupies a position in the
-    // stream (`seen_hits` walks the uncapped sequence on every request), so
-    // plain-offset pages tile it exactly once. Dropping past-cap hits from
-    // the stream (the previous behavior) made them appear on no page while
-    // `match_lines` kept counting them — a silent drop the caller could
-    // never page into.
-    //
-    // On a continuation page (`skip_in_file` non-empty) the global offset
-    // no longer windows: tails of capped files sit at stream positions
-    // BELOW the next offset whenever files interleave. Each file skips its
-    // resume cursor instead, shows up to the cap of NEW hits, and the page
-    // stops after `limit` shown hits. Files visited here keep or advance
-    // their cursor in `cursors`; exhausted files drop out.
-    let continuation = !options.skip_in_file.is_empty();
-    let key = format!("{root_index}:{}", file.rel);
-    let skip = options.skip_in_file.get(&key).copied().unwrap_or(0);
-    let mut skipped = 0usize;
-    let mut tail = 0usize;
-    let per_file_cap = options.per_file_cap;
-    file.total_hits = file.hits.len();
-    file.shown = 0;
-    let mut windowed = Vec::with_capacity(file.hits.len());
-    for hit in file.hits.drain(..) {
-        let position = *seen_hits;
-        *seen_hits += 1;
-        let mut shown = false;
-        if continuation {
-            if skipped < skip {
-                // Delivered by an earlier page.
-                skipped += 1;
-            } else if options.limit.is_some_and(|limit| *page_hits >= limit) {
-                // Page budget spent: this hit and every remaining hit of
-                // the file stay undelivered — they must NOT advance the
-                // cursor, or the next page would skip over them.
-                break;
-            } else if per_file_cap == 0 || file.shown < per_file_cap {
-                shown = true;
-            }
-            // else: the file's cap is spent; keep scanning so the next
-            // page resumes past everything shown so far.
-        } else {
-            let in_window =
-                position >= options.offset && window_end.is_none_or(|end| position < end);
-            shown = in_window && (per_file_cap == 0 || file.shown < per_file_cap);
-            // The tail is every buffered hit at or after the window start
-            // that this page did not show. Hits BEFORE the offset were
-            // delivered by earlier pages and must not resurrect the stream
-            // (a stale tail there would make bare-offset paging loop
-            // forever).
-            if !shown && position >= options.offset {
-                tail += 1;
-            }
-        }
-        if shown {
-            file.shown += 1;
-            *page_hits += 1;
-            windowed.push(hit);
-        }
-    }
-    file.hits = windowed;
-    file.cap_withheld = if per_file_cap == 0 {
-        0
-    } else if continuation {
-        file.total_hits - skipped - file.shown
-    } else {
-        tail
-    };
-    // §6.8: the resume cursor is what this file has already DELIVERED —
-    // shown hits plus everything earlier pages took (skip on a
-    // continuation; the pre-offset window on a first page). Every visited
-    // file gets an entry, not only capped ones: the next page must skip a
-    // fully-delivered file just as surely as it must resume a capped one.
-    // A file absent from the map was never visited (budget break) and is
-    // served fresh.
-    let cursor = if continuation {
-        skip + file.shown
-    } else {
-        file.total_hits - tail
-    };
-    if cursor > 0 || file.cap_withheld > 0 {
-        cursors.insert(key, cursor);
-    } else {
-        cursors.remove(&key);
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn ingest_scanned_files(
-    scanned: Vec<Option<FileResult>>,
-    root_index: usize,
-    root_out: &mut RootOutput,
-    output: &mut SearchOutput,
-    options: &SearchOptions,
-    seen_hits: &mut usize,
-    window_end: Option<usize>,
-    page_hits: &mut usize,
-    cursors: &mut BTreeMap<String, usize>,
-) -> bool {
-    let mut truncated = false;
-    for mut file in scanned.into_iter().flatten() {
-        output.stats.files_matched += 1;
-        output.stats.match_lines += file.match_lines;
-        truncated |= file.collected_truncated;
-        window_file_hits(
-            &mut file, seen_hits, root_index, options, window_end, page_hits, cursors,
-        );
-        // Summed after windowing: `window_file_hits` is what sets
-        // `cap_withheld`.
-        output.cap_withheld += file.cap_withheld;
-        output.returned += file.hits.len();
-        if !options.collect_hits || !file.hits.is_empty() {
-            root_out.files.push(file);
-        }
-    }
-    truncated
-}
-
 /// Run `query` over `roots`.
 pub fn search(roots: &[RootSpec], compiled: &Compiled, options: &SearchOptions) -> SearchOutput {
     let started = Instant::now();
@@ -1109,9 +709,10 @@ pub fn search(roots: &[RootSpec], compiled: &Compiled, options: &SearchOptions) 
     // instead of globally.
     let continuation = !options.skip_in_file.is_empty();
     let mut page_hits = 0usize;
-    // Seed with the incoming cursors so files this page never reaches (a
-    // budget break mid-scan) keep their resume state instead of being
-    // re-served on the next page.
+    // Continuation pages stop delivering at `limit`, but has_more must not
+    // be assumed from that stop; the scan keeps probing until it finds an
+    // undelivered hit (`probe_found`) or exhausts the candidates.
+    let mut probe_found = false;
     let mut cursors: BTreeMap<String, usize> = options.skip_in_file.clone();
     let mut seen_hits = 0usize;
     let chunk_size = worker_threads() * 8;
@@ -1173,11 +774,14 @@ pub fn search(roots: &[RootSpec], compiled: &Compiled, options: &SearchOptions) 
                 window_end,
                 &mut page_hits,
                 &mut cursors,
+                &mut probe_found,
             );
             if continuation {
-                // The page holds its full budget; more files still hold
-                // undelivered hits.
-                if options.limit.is_some_and(|limit| page_hits >= limit) {
+                // When the page holds its full budget, keep scanning for
+                // evidence that an undelivered hit still exists before
+                // claiming has_more — a page that ends exactly at the data
+                // end must not advertise an empty next page.
+                if options.limit.is_some_and(|limit| page_hits >= limit) && probe_found {
                     output.has_more = true;
                     output.complete = false;
                     output.roots.push(std::mem::take(&mut root_out));
@@ -1220,13 +824,20 @@ pub fn search(roots: &[RootSpec], compiled: &Compiled, options: &SearchOptions) 
     output
 }
 
+// Regression tests extracted from this file to keep it under the 2000-line
+// budget (the `_test.rs` sibling convention). They compile inside the engine
+// module and reuse the fixtures defined in `tests` below.
+#[cfg(test)]
+#[path = "engine_test.rs"]
+mod engine_test;
+
 #[cfg(test)]
 mod tests {
     use super::super::symbols::search_symbols;
     use super::*;
     use std::fs;
 
-    fn write(dir: &Path, rel: &str, text: &str) {
+    pub(super) fn write(dir: &Path, rel: &str, text: &str) {
         let path = dir.join(rel);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, text).unwrap();
@@ -1253,7 +864,7 @@ mod tests {
         dir
     }
 
-    fn q(pattern: &str) -> Query {
+    pub(super) fn q(pattern: &str) -> Query {
         Query {
             pattern: pattern.into(),
             regex: false,
@@ -1268,7 +879,7 @@ mod tests {
         Arc::new(TextIndex::open(&out).unwrap())
     }
 
-    fn spec(dir: &Path, index: Option<Arc<TextIndex>>) -> RootSpec {
+    pub(super) fn spec(dir: &Path, index: Option<Arc<TextIndex>>) -> RootSpec {
         RootSpec {
             root: dir.to_path_buf(),
             index,
@@ -1277,7 +888,7 @@ mod tests {
         }
     }
 
-    fn paths(output: &SearchOutput) -> Vec<String> {
+    pub(super) fn paths(output: &SearchOutput) -> Vec<String> {
         output
             .roots
             .iter()

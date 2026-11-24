@@ -443,6 +443,18 @@ pub fn list_files_reporting(
     list_files_matching(dir, limit, deadline, |_| true)
 }
 
+/// Every file under `dir` as a plain filesystem walk sees it, sorted, forward
+/// slashes. Unlike [`list_files`], this never consults git: no `git ls-files`,
+/// so no ignore rules either. An explicitly named path must be searched exactly
+/// as it exists on disk, and an index built from a git listing would silently
+/// re-apply the rules being bypassed. Only `NEVER_WALK` (metadata and package
+/// caches) is skipped, symlinked directories are not followed, and nothing is
+/// written. Truncation is not reported here; use [`list_files_matching`] when
+/// the caller must distinguish an empty tree from a cut-short walk.
+pub fn list_files_raw(dir: &Path, limit: usize, deadline: Option<Instant>) -> Vec<String> {
+    walk_inventory(dir, limit, deadline, |_| true).0
+}
+
 /// [`list_files_reporting`], keeping only files `admit` allows, with `limit`
 /// applied to the ADMITTED files.
 ///
