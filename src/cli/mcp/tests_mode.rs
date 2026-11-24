@@ -139,10 +139,18 @@ fn cargo_package(file: &str) -> Option<String> {
 
 /// The `module::path::to::fn` string cargo expects for a unit test.
 ///
-/// The path is read off the syntax tree: from the function item to the file
-/// root, every enclosing `mod_item` (including `#[path]` variants) contributes
-/// its name, so `src/foo/mod.rs`, nested `mod tests` and renamed module files
-/// all resolve the same way the compiler sees them.
+/// Two things contribute to the path:
+///
+/// 1. the OUT-OF-LINE ancestry: for `src/foo.rs`, the enclosing `foo` module
+///    is declared in `src/lib.rs` (`mod foo;`), not in the file itself. It is
+///    recovered by walking the crate root's `mod` declarations (see
+///    [`out_of_line_module_ancestry`]) until the chain reaches this file.
+/// 2. the INLINE ancestry inside the file: from the function item to the file
+///    root, every enclosing `mod_item` (including `#[path]` variants).
+///
+/// Without (1) the filter for `src/foo.rs`'s `tests::test_x` came out as
+/// `tests::test_x`; `--exact` then matched nothing and cargo exited 0 after
+/// running zero tests, so a failing test read as a pass.
 fn unit_module_path(
     source: &crate::cli::mcp::call_sites::FileSource,
     node: &Node,
@@ -150,20 +158,189 @@ fn unit_module_path(
 ) -> Option<String> {
     let tree = source.tree.as_ref()?;
     let fn_node = crate::cli::mcp::call_sites::node_for_range(tree.root_node(), node.byte_range)?;
-    let mut modules: Vec<String> = Vec::new();
+    // Inline ancestors, collected nearest-first then reversed to root order.
+    let mut inline: Vec<String> = Vec::new();
     let mut cursor = fn_node;
     while let Some(parent) = cursor.parent() {
         if parent.kind() == "mod_item"
             && let Some(name) = parent.child_by_field_name("name")
             && let Ok(name) = name.utf8_text(source.text.as_bytes())
         {
-            modules.push(name.to_string());
+            inline.push(name.to_string());
         }
         cursor = parent;
     }
-    modules.reverse();
+    inline.reverse();
+    let mut modules = out_of_line_module_ancestry(&node.file_path).unwrap_or_default();
+    modules.extend(inline);
     modules.push(fn_name.to_string());
     Some(modules.join("::"))
+}
+
+/// Module path of the out-of-line module whose file IS `file`, by resolving
+/// `mod` declarations from the crate root with the compiler's rules.
+///
+/// A `mod x;` declared in a file is looked up relative to the declaring
+/// module's directory, which is the file's own directory for a root or
+/// `mod.rs`, and `<dir>/<stem>/` for any other file (so `src/foo.rs`'s
+/// children live in `src/foo/`). An inline `mod a { mod b; }` makes `a` part
+/// of that directory. `#[path = "p"]` is relative to the same directory.
+///
+/// Only the chain that actually reaches `file` is returned; an empty chain
+/// means `file` IS the crate root. The walk is bounded (depth 32, 4,000
+/// declarations) so a pathological tree cannot spin.
+fn out_of_line_module_ancestry(file: &str) -> Option<Vec<String>> {
+    use std::path::{Path, PathBuf};
+
+    fn parse(text: &str) -> Option<tree_sitter::Tree> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&crate::parse::traits::languages::rust::language())
+            .ok()?;
+        parser.parse(text, None)
+    }
+
+    /// `#[path = "…"]` on a `mod_item`, if present.
+    ///
+    /// In the tree-sitter Rust grammar an attribute is a SIBLING
+    /// `attribute_item` immediately before the item it decorates, not a
+    /// child of it, so look at the previous sibling.
+    fn path_attribute(item: tree_sitter::Node<'_>, text: &str) -> Option<String> {
+        let mut prev = item.prev_sibling();
+        while let Some(node) = prev {
+            if node.kind() != "attribute_item" {
+                break;
+            }
+            let rendered = node.utf8_text(text.as_bytes()).ok()?;
+            if let Some(value) = rendered
+                .trim_start_matches("#[")
+                .trim_end_matches(']')
+                .trim()
+                .strip_prefix("path")
+                .and_then(|rest| rest.trim().strip_prefix('='))
+                .map(|v| v.trim().trim_matches('"'))
+                && !value.is_empty()
+            {
+                return Some(value.to_string());
+            }
+            prev = node.prev_sibling();
+        }
+        None
+    }
+
+    /// The directory that `mod x;` declared in (`file`, `is_mod_rs`) with an
+    /// inline-nesting of `inline` resolves against.
+    fn module_dir(file: &Path, is_mod_rs: bool, inline: &[String]) -> PathBuf {
+        let dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
+        let mut base = if is_mod_rs {
+            dir
+        } else {
+            let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            dir.join(stem)
+        };
+        for segment in inline {
+            base = base.join(segment);
+        }
+        base
+    }
+
+    /// Where `mod x;` (with optional `#[path]`) lands, or `None` when neither
+    /// candidate exists on disk.
+    fn resolve(base: &Path, name: &str, attr: Option<&str>) -> Option<PathBuf> {
+        if let Some(rel) = attr {
+            let p = base.join(rel);
+            return p.is_file().then_some(p);
+        }
+        let flat = base.join(format!("{name}.rs"));
+        if flat.is_file() {
+            return Some(flat);
+        }
+        let nested = base.join(name).join("mod.rs");
+        nested.is_file().then_some(nested)
+    }
+
+    let target = Path::new(file);
+    let canonical_target = target.canonicalize().ok()?;
+    let mut package_dir = target.parent()?.to_path_buf();
+    for _ in 0..16 {
+        if package_dir.join("Cargo.toml").is_file() {
+            break;
+        }
+        if !package_dir.pop() {
+            return None;
+        }
+    }
+    let root = ["lib.rs", "main.rs"]
+        .into_iter()
+        .map(|r| package_dir.join("src").join(r))
+        .find(|p| p.is_file())?;
+    let same = |p: &Path| p.canonicalize().ok() == Some(canonical_target.clone());
+    if same(&root) {
+        return Some(Vec::new());
+    }
+
+    // Files still to expand, with the module path that declares them.
+    let mut queue = vec![(root, true, Vec::<String>::new())];
+    let mut visited = 0usize;
+    while let Some((file, is_mod_rs, prefix)) = queue.pop() {
+        if prefix.len() > 32 {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let Some(tree) = parse(&text) else {
+            continue;
+        };
+        // Walk every `mod_item` at any depth, tracking inline nesting so the
+        // resolution directory is right for children of inline modules.
+        let mut walk = vec![(tree.root_node(), Vec::<String>::new(), prefix.clone())];
+        while let Some((node, inline, path)) = walk.pop() {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() != "mod_item" {
+                    if child.child_count() > 0 {
+                        walk.push((child, inline.clone(), path.clone()));
+                    }
+                    continue;
+                }
+                visited += 1;
+                if visited > 4_000 {
+                    return None;
+                }
+                let Some(name) = child
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(text.as_bytes()).ok())
+                else {
+                    continue;
+                };
+                let mut path = path.clone();
+                path.push(name.to_string());
+                let has_body = child
+                    .children(&mut child.walk())
+                    .any(|c| c.kind() == "declaration_list");
+                if has_body {
+                    // Inline module: descend with it added to the nesting.
+                    let mut inline = inline.clone();
+                    inline.push(name.to_string());
+                    walk.push((child, inline, path));
+                    continue;
+                }
+                let base = module_dir(&file, is_mod_rs, &inline);
+                let attr = path_attribute(child, &text);
+                let Some(resolved) = resolve(&base, name, attr.as_deref()) else {
+                    continue;
+                };
+                if same(&resolved) {
+                    return Some(path);
+                }
+                let child_is_mod_rs =
+                    resolved.file_name().and_then(|n| n.to_str()) == Some("mod.rs");
+                queue.push((resolved, child_is_mod_rs, path));
+            }
+        }
+    }
+    None
 }
 
 /// The exact command that runs one test.
@@ -427,6 +604,129 @@ mod tests {
             cmd, "cargo test -p proj --lib inner::tests::test_x -- --exact",
             "command: {cmd}"
         );
+    }
+
+    /// A real crate on disk whose unit tests live in out-of-line modules.
+    fn crate_with_out_of_line_tests() -> tempfile::TempDir {
+        let dir = manifest_dir("outline");
+        let src = dir.path().join("src");
+        std::fs::write(
+            src.join("lib.rs"),
+            "pub mod foo;\npub mod nested;\n#[path = \"renamed.rs\"]\npub mod aliased;\n",
+        )
+        .unwrap();
+        // src/foo.rs declares a child of its own -> src/foo/child.rs
+        std::fs::write(
+            src.join("foo.rs"),
+            "mod child;\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn test_in_foo() {\n        assert!(true);\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(src.join("foo")).unwrap();
+        std::fs::write(
+            src.join("foo").join("child.rs"),
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn test_in_child() {\n        assert!(true);\n    }\n}\n",
+        )
+        .unwrap();
+        // src/nested/mod.rs style
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+        std::fs::write(
+            src.join("nested").join("mod.rs"),
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn test_in_modrs() {\n        assert!(true);\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("renamed.rs"),
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn test_in_aliased() {\n        assert!(true);\n    }\n}\n",
+        )
+        .unwrap();
+        // A root-level test, and an inline module inside the root.
+        std::fs::write(
+            src.join("lib.rs"),
+            "pub mod foo;\npub mod nested;\n#[path = \"renamed.rs\"]\npub mod aliased;\n\nmod inline_root {\n    mod tests {\n        #[test]\n        fn test_in_inline_root() {\n            assert!(true);\n        }\n    }\n}\n#[test]\nfn test_at_root() {\n    assert!(true);\n}\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    fn command_for_test_in(dir: &tempfile::TempDir, rel: &str, name: &str) -> String {
+        let file = dir.path().join("src").join(rel);
+        let source = std::fs::read_to_string(&file).unwrap();
+        let src = parse_rust(&source);
+        let start = source.find(&format!("fn {name}")).unwrap();
+        let test_fn = node(
+            name,
+            &file.display().to_string(),
+            "rust",
+            (start, source.len()),
+        );
+        command_for(&test_fn, Some(1), Some(&src))
+    }
+
+    /// For a test in `src/foo.rs`, the enclosing `foo` module is declared in
+    /// `src/lib.rs`, not in the file. The filter used to come out as
+    /// `tests::test_x`; `--exact` then matched nothing and cargo exited 0
+    /// after running zero tests, so a failing test read as a pass.
+    #[test]
+    fn test_unit_test_filter_includes_out_of_line_module_ancestry() {
+        let dir = crate_with_out_of_line_tests();
+        assert_eq!(
+            command_for_test_in(&dir, "foo.rs", "test_in_foo"),
+            "cargo test -p outline --lib foo::tests::test_in_foo -- --exact"
+        );
+        // Child of a non-mod-rs file: `src/foo.rs` -> `src/foo/child.rs`.
+        assert_eq!(
+            command_for_test_in(&dir, "foo/child.rs", "test_in_child"),
+            "cargo test -p outline --lib foo::child::tests::test_in_child -- --exact"
+        );
+        // `mod.rs` style.
+        assert_eq!(
+            command_for_test_in(&dir, "nested/mod.rs", "test_in_modrs"),
+            "cargo test -p outline --lib nested::tests::test_in_modrs -- --exact"
+        );
+        // `#[path = "…"]` alias keeps the declared name, not the file name.
+        assert_eq!(
+            command_for_test_in(&dir, "renamed.rs", "test_in_aliased"),
+            "cargo test -p outline --lib aliased::tests::test_in_aliased -- --exact"
+        );
+        // Root-level and inline-in-root tests are unchanged.
+        assert_eq!(
+            command_for_test_in(&dir, "lib.rs", "test_at_root"),
+            "cargo test -p outline --lib test_at_root -- --exact"
+        );
+        assert_eq!(
+            command_for_test_in(&dir, "lib.rs", "test_in_inline_root"),
+            "cargo test -p outline --lib inline_root::tests::test_in_inline_root -- --exact"
+        );
+    }
+
+    /// The filter must actually run the test: `--exact` with a wrong path
+    /// runs zero tests and still exits 0. Run the generated command against
+    /// real cargo on a FAILING test and require a non-zero exit.
+    #[test]
+    fn test_generated_exact_filter_runs_the_test_under_real_cargo() {
+        let dir = crate_with_out_of_line_tests();
+        // Make the out-of-line test fail.
+        let foo = dir.path().join("src/foo.rs");
+        let text = std::fs::read_to_string(&foo)
+            .unwrap()
+            .replace("assert!(true)", "assert!(false)");
+        std::fs::write(&foo, text).unwrap();
+        let command = command_for_test_in(&dir, "foo.rs", "test_in_foo");
+        assert!(command.starts_with("cargo test -p outline"), "{command}");
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .current_dir(dir.path())
+            .env("CARGO_TERM_COLOR", "never")
+            .output()
+            .expect("cargo available");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("test foo::tests::test_in_foo ... FAILED"),
+            "the test must actually run: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.status.success(), "a failing test must fail the run");
     }
 
     #[test]

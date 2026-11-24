@@ -183,7 +183,7 @@ pub(crate) fn caller_is_test(node: &Node, file_text: Option<&str>) -> bool {
 /// `#[proptest]`, `@pytest.mark…`). Jest is name/path based, so it is covered
 /// by [`looks_like_test_name`] / [`looks_like_test_file`].
 fn attributes_mention_test(text: &str, fn_start: usize) -> bool {
-    let before = &text[..fn_start.min(text.len())];
+    let before = &text[..floor_char_boundary(text, fn_start)];
     for line in before.lines().rev() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -438,9 +438,25 @@ fn names_match(callee_text: &str, callee: &str, callee_last: &str) -> bool {
     text == callee || callee.ends_with(text) || text.ends_with(callee)
 }
 
+/// Largest byte index `<= byte` that is a UTF-8 char boundary of `text`.
+///
+/// Byte offsets come from the persisted PDG while `text` is the LIVE file:
+/// once the file changes after indexing, a stale offset can land in the
+/// middle of a multi-byte character (a leading comment growing from `//x`
+/// to `//aé` pushes the old function start into `é`). Clamping to the
+/// string length does not make such an offset a boundary, and slicing
+/// there panics. Every stale-offset slice must go through this first.
+pub(crate) fn floor_char_boundary(text: &str, byte: usize) -> usize {
+    let mut bound = byte.min(text.len());
+    while bound > 0 && !text.is_char_boundary(bound) {
+        bound -= 1;
+    }
+    bound
+}
+
 /// 1-based line number of a byte offset.
 pub(crate) fn byte_to_line(text: &str, byte: usize) -> usize {
-    let bound = byte.min(text.len());
+    let bound = floor_char_boundary(text, byte);
     1 + text.as_bytes()[..bound]
         .iter()
         .filter(|b| **b == b'\n')
@@ -449,7 +465,7 @@ pub(crate) fn byte_to_line(text: &str, byte: usize) -> usize {
 
 /// The trimmed line containing `byte`, capped to [`MAX_SITE_LINE_CHARS`].
 pub(crate) fn line_at(text: &str, byte: usize) -> String {
-    let bound = byte.min(text.len());
+    let bound = floor_char_boundary(text, byte);
     let before = text[..bound].rsplit('\n').next().unwrap_or("");
     let rest = text[bound..].split('\n').next().unwrap_or("");
     let full = format!("{before}{rest}").trim().to_string();
@@ -674,6 +690,38 @@ mod tests {
         assert!(looks_like_test_file("web/app.test.ts"));
         assert!(looks_like_test_file("web/app.spec.js"));
         assert!(!looks_like_test_file("src/lib.rs"));
+    }
+
+    /// A caller's byte range comes from the persisted PDG while the file
+    /// text is live. When a leading comment grows by a multi-byte character
+    /// (`//x` -> `//aé`), the stale function start lands inside `é`; slicing
+    /// there used to panic during caller classification instead of
+    /// answering. Every offset-driven slice must floor to a char boundary.
+    #[test]
+    fn test_stale_offsets_inside_a_multibyte_char_do_not_panic() {
+        let indexed = "//x\nfn caller_fn() {}\n";
+        let live = "//aé\nfn caller_fn() {}\n";
+        let stale_start = indexed.find("fn caller_fn").unwrap();
+        assert!(
+            !live.is_char_boundary(stale_start),
+            "fixture must put the stale offset inside a multi-byte char"
+        );
+        // None of these may panic; each floors to the previous boundary.
+        assert!(!attributes_mention_test(live, stale_start));
+        assert_eq!(byte_to_line(live, stale_start), 1);
+        assert_eq!(line_at(live, stale_start), "//aé");
+        assert_eq!(floor_char_boundary(live, stale_start), stale_start - 1);
+        // Past the end floors to the string length; before the start is 0.
+        assert_eq!(floor_char_boundary(live, usize::MAX), live.len());
+        assert_eq!(floor_char_boundary(live, 0), 0);
+        // A valid offset is returned untouched.
+        let real = live.find("fn caller_fn").unwrap();
+        assert_eq!(floor_char_boundary(live, real), real);
+        assert!(!attributes_mention_test(live, real));
+        // Classification still works on a valid offset after the file grew.
+        let with_attr = live.replace("fn caller_fn", "#[test]\nfn caller_fn");
+        let real = with_attr.find("fn caller_fn").unwrap();
+        assert!(attributes_mention_test(&with_attr, real));
     }
 
     #[test]

@@ -128,6 +128,22 @@ fn looks_binary(path: &Path) -> bool {
     head[..read].contains(&0)
 }
 
+/// Normalise `raw` to a forward-slash project-relative path without
+/// consulting the filesystem (so it works for files that no longer exist):
+/// strips `./`, collapses `.` segments and rejects `..` by returning the
+/// raw text unchanged for the caller to reject.
+fn lexical_relative(raw: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for segment in raw.split(['/', '\\']) {
+        match segment {
+            "" | "." => {}
+            ".." => return raw.to_string(),
+            other => out.push(other),
+        }
+    }
+    out.join("/")
+}
+
 /// Expand the requested `paths` into concrete files.
 ///
 /// Directories are walked (`.git` and build-output directories skipped)
@@ -155,17 +171,35 @@ fn expand_paths(
         }
     }
     let dir_rels = dirs.iter().map(|(rel, _)| rel.clone()).collect::<Vec<_>>();
-    for (rel, absolute) in dirs {
+    for (rel, absolute) in &dirs {
         let mut budget = MAX_DISCOVERED;
         walk_dir(
             root,
-            &rel,
-            &absolute,
+            rel,
+            absolute,
             0,
             &mut files,
             &mut skipped,
             &mut budget,
         )?;
+    }
+    // The filesystem walk can only see files that exist. A tracked file
+    // deleted from the worktree is invisible to it, so a bulk
+    // `paths:["."]` used to stage every surviving change and silently leave
+    // the deletions unstaged. Git's own inventory knows about them: add
+    // every deleted tracked path under a requested directory.
+    if !dirs.is_empty()
+        && let Ok(status) = crate::cli::git::status(root)
+    {
+        for deleted in &status.deleted {
+            let rel = deleted.to_string_lossy().replace('\\', "/");
+            let under_requested_dir = dirs.iter().any(|(dir, _)| {
+                dir.is_empty() || rel.starts_with(&format!("{dir}/")) || &rel == dir
+            });
+            if under_requested_dir {
+                files.push(rel);
+            }
+        }
     }
     files.sort();
     files.dedup();
@@ -243,15 +277,33 @@ pub(crate) fn staging_outcome(root: &Path, args: &Value) -> Result<StagingOutcom
             "Provide paths: project-relative files to stage".to_string(),
         )
     })?;
+    // Tracked files deleted from the worktree are stageable (`git add`
+    // records the removal) but no longer exist on disk, so the
+    // canonicalizing containment check cannot resolve them. They are
+    // accepted when git reports them deleted AND their lexical, normalised
+    // form stays inside the project — a deletion can never escape the
+    // root it is reported relative to.
+    let deleted: std::collections::BTreeSet<String> = crate::cli::git::status(root)
+        .map(|status| {
+            status
+                .deleted
+                .iter()
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .collect()
+        })
+        .unwrap_or_default();
     let mut requested = Vec::new();
     for path in paths {
         let raw = path.as_str().unwrap_or_default();
-        validate_file_within_project(raw, root).map_err(|_| {
-            JsonRpcError::invalid_params_with_suggestion(
-                format!("'{raw}' is not a path inside this project"),
-                "Stage project-relative paths only".to_string(),
-            )
-        })?;
+        if validate_file_within_project(raw, root).is_err() {
+            let lexed = lexical_relative(raw);
+            if !deleted.contains(&lexed) {
+                return Err(JsonRpcError::invalid_params_with_suggestion(
+                    format!("'{raw}' is not a path inside this project"),
+                    "Stage project-relative paths only".to_string(),
+                ));
+            }
+        }
         requested.push(raw.to_string());
     }
     if requested.is_empty() {
@@ -928,6 +980,75 @@ mod test {
         git(dir.path(), &["add", "."]);
         git(dir.path(), &["commit", "-q", "-m", "one"]);
         dir
+    }
+
+    /// A tracked file deleted from the worktree is invisible to the
+    /// filesystem walk, so a bulk `paths:["."]` staged every surviving
+    /// change and silently left the deletion unstaged — and naming the
+    /// deleted file explicitly failed the canonicalizing containment check
+    /// because it no longer exists. Both must stage the removal.
+    #[test]
+    fn test_staging_includes_deleted_tracked_files() {
+        let repo = scratch();
+        let root = repo.path();
+        git(root, &["config", "commit.gpgSign", "false"]);
+        std::fs::write(root.join("keep.txt"), "b\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-q", "-m", "two"]);
+        // Modify one tracked file and delete another from the worktree.
+        std::fs::write(root.join("f.txt"), "changed\n").unwrap();
+        std::fs::remove_file(root.join("keep.txt")).unwrap();
+
+        // Bulk: the walk finds f.txt; git's inventory must add keep.txt.
+        let outcome = staging_outcome(root, &serde_json::json!({ "paths": ["."] })).unwrap();
+        assert!(
+            outcome.staged.iter().any(|p| p == "f.txt"),
+            "modified file staged: {:?}",
+            outcome.staged
+        );
+        assert!(
+            outcome.staged.iter().any(|p| p == "keep.txt"),
+            "deleted tracked file must be staged for removal: {:?}",
+            outcome.staged
+        );
+
+        // Explicit: the deleted path is accepted although it no longer exists.
+        let outcome =
+            staging_outcome(root, &serde_json::json!({ "paths": ["./keep.txt"] })).unwrap();
+        assert_eq!(outcome.staged, vec!["./keep.txt".to_string()]);
+
+        // A deleted path scoped to a subdirectory only picks deletions there.
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/g.txt"), "g\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-q", "-m", "three"]);
+        std::fs::remove_file(root.join("sub/g.txt")).unwrap();
+        let outcome = staging_outcome(root, &serde_json::json!({ "paths": ["sub"] })).unwrap();
+        assert!(
+            outcome.staged.iter().any(|p| p == "sub/g.txt"),
+            "{:?}",
+            outcome.staged
+        );
+        assert!(
+            !outcome.staged.iter().any(|p| p == "keep.txt"),
+            "deletion outside the requested directory must not be staged: {:?}",
+            outcome.staged
+        );
+
+        // Containment is still enforced: a nonexistent path that is NOT a
+        // tracked deletion, or one that traverses out, is rejected.
+        let rejected = |paths: serde_json::Value| match staging_outcome(root, &paths) {
+            Err(error) => error.message,
+            Ok(_) => panic!("{paths} must be rejected"),
+        };
+        assert!(
+            rejected(serde_json::json!({ "paths": ["ghost.txt"] }))
+                .contains("not a path inside this project")
+        );
+        assert!(
+            rejected(serde_json::json!({ "paths": ["../outside"] }))
+                .contains("not a path inside this project")
+        );
     }
 
     /// A hook that floods stderr well past the OS pipe buffer (64 KiB on

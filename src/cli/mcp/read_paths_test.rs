@@ -494,3 +494,46 @@ fn test_ledger_file_records_per_session_are_bounded() {
         files.len()
     );
 }
+
+/// `served_*_line` is the range of FOCUS lines actually emitted. The caller
+/// records it in the session ledger, so it must shrink with truncation:
+/// recording the full focus range while the cap cut the body made a later
+/// read of the omitted lines answer `unchanged since read`.
+#[test]
+fn test_elide_reports_only_the_focus_lines_actually_served() {
+    let symbols = vec![
+        symbol_at(ELIDE_SRC, "First", "pub struct First"),
+        symbol_at(ELIDE_SRC, "sibling", "pub fn sibling"),
+        symbol_at(ELIDE_SRC, "focus", "pub fn focus"),
+    ];
+    // Whole focus served: identical to the focus range.
+    let full = elide_around(ELIDE_SRC, &symbols, "focus", "fixture.rs", 500).unwrap();
+    assert_eq!(full.served_start_line, full.focus_start_line);
+    assert_eq!(full.served_end_line, full.focus_end_line);
+    // Cap cuts the body inside the focus item (after `pub fn focus`, before
+    // its body): only the focus lines that made it are reported.
+    let partial = elide_around(ELIDE_SRC, &symbols, "focus", "fixture.rs", 6).unwrap();
+    assert!(partial.body.contains("more lines (elided view truncated"));
+    assert_eq!(partial.served_start_line, partial.focus_start_line);
+    assert!(
+        partial.served_end_line < partial.focus_end_line,
+        "focus must be cut: {}..{}",
+        partial.served_start_line,
+        partial.served_end_line
+    );
+    // The served range must match exactly the focus lines present in the body.
+    let present = (partial.focus_start_line..=partial.focus_end_line)
+        .filter(|n| {
+            partial
+                .body
+                .lines()
+                .any(|l| l.starts_with(&format!("{n} ")))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(present.first(), Some(&partial.served_start_line));
+    assert_eq!(present.last(), Some(&partial.served_end_line));
+    // Cap cuts BEFORE the focus: nothing served (0..0; line numbers are
+    // 1-based, so a zero end can never be a real served line).
+    let none = elide_around(ELIDE_SRC, &symbols, "focus", "fixture.rs", 4).unwrap();
+    assert_eq!((none.served_start_line, none.served_end_line), (0, 0));
+}

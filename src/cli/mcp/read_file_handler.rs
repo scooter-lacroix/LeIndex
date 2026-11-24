@@ -634,14 +634,19 @@ Works for any absolute path, including outside the project — no index required
                 result,
                 project_root.as_deref().unwrap_or(&resolved_file_path),
             );
-            // The focus bytes were served in full — record that range.
-            ledger.record(
-                session,
-                &resolved_file_path,
-                &content_hash,
-                elided.focus_start_line,
-                elided.focus_end_line,
-            );
+            // Record only the focus lines the body actually carried. When
+            // `max_lines` cut the body before or inside the focus item, the
+            // omitted lines were never sent, and recording the full range
+            // made a later read of them answer `unchanged since read`.
+            if elided.served_end_line > 0 {
+                ledger.record(
+                    session,
+                    &resolved_file_path,
+                    &content_hash,
+                    elided.served_start_line,
+                    elided.served_end_line,
+                );
+            }
             return Ok(result);
         }
 
@@ -1009,6 +1014,67 @@ mod tests {
         // Item spans start at the item keyword; the doc comment hangs above.
         assert_eq!(symbol["anchor_line_start"], 3);
         assert_eq!(symbol["anchor_line_end"], 5);
+    }
+
+    /// An elided focus read whose body was cut by `max_lines` must record
+    /// only the focus lines it actually sent. Recording the full range made
+    /// a later plain read of the omitted focus lines answer
+    /// `unchanged since read` although the session never received them.
+    #[tokio::test]
+    async fn test_truncated_elided_read_does_not_mark_omitted_focus_lines_as_served() {
+        let dir = tempdir().unwrap();
+        let path = write_sample(dir.path(), "sample.rs");
+        let registry = test_registry_for(dir.path());
+        let session = test_session("elide-truncated");
+        // alpha collapses to 1 line, then beta's doc + 2 body lines. A cap of
+        // 2 lines serves the doc line only; beta's body lines are cut.
+        let elided = ReadFileHandler
+            .execute(
+                &registry,
+                serde_json::json!({
+                    "file_path": path.to_string_lossy(),
+                    "project_path": dir.path().to_string_lossy(),
+                    "_session": session,
+                    "focus_symbol": "beta",
+                    "max_lines": 2,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(elided["elided"], true);
+        let content = elided["content"].as_str().unwrap();
+        assert!(
+            content.contains("more lines (elided view truncated"),
+            "{content}"
+        );
+        assert!(
+            !content.contains("x + 1"),
+            "beta body must be cut: {content}"
+        );
+
+        // A plain read of beta's body in the same session must return the
+        // lines, not `unchanged since read`.
+        let plain = ReadFileHandler
+            .execute(
+                &registry,
+                serde_json::json!({
+                    "file_path": path.to_string_lossy(),
+                    "project_path": dir.path().to_string_lossy(),
+                    "_session": session,
+                    "start_line": 9,
+                    "end_line": 9,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            plain["unchanged"], true,
+            "omitted focus lines must not read as already served: {plain}"
+        );
+        assert!(
+            plain["content"].as_str().unwrap().contains("x + 1"),
+            "{plain}"
+        );
     }
 
     #[tokio::test]

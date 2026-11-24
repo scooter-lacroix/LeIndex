@@ -194,6 +194,17 @@ pub(crate) struct ElidedOutput {
     /// Focus item line range (1-based, inclusive).
     pub focus_start_line: usize,
     pub focus_end_line: usize,
+    /// Range of FOCUS lines actually present in `body` (1-based, inclusive).
+    ///
+    /// Equal to the focus range when the whole focus item was emitted; a
+    /// narrower range when the `max_lines` cap cut the body inside the focus
+    /// item; `0..0` when the cap cut the body before it (line numbers are
+    /// 1-based, so a zero end is never a real served line). The
+    /// session ledger must record only this, or a later read of the
+    /// omitted lines is answered `unchanged since read` although the
+    /// session never received them.
+    pub served_start_line: usize,
+    pub served_end_line: usize,
     /// Sibling items that were collapsed.
     pub collapsed: Vec<CollapsedItem>,
 }
@@ -368,6 +379,9 @@ pub(crate) fn elide_around(
     let mut out = String::new();
     let mut emitted = 0usize;
     let mut truncated = 0usize;
+    // Focus lines that actually reached `body` (see `served_*_line`).
+    let mut served_start: Option<usize> = None;
+    let mut served_end = 0usize;
     for (idx, line) in content.lines().enumerate() {
         let line_no = idx + 1;
         if emitted >= max_lines {
@@ -399,6 +413,10 @@ pub(crate) fn elide_around(
         out.push_str(line);
         out.push('\n');
         emitted += 1;
+        if in_focus(line_no) {
+            served_start.get_or_insert(line_no);
+            served_end = line_no;
+        }
     }
     if truncated > 0 {
         out.push_str(&format!(
@@ -410,6 +428,10 @@ pub(crate) fn elide_around(
         expand: format!("{file_label}#{focus}"),
         focus_start_line: focus_span.start_line,
         focus_end_line: focus_span.end_line,
+        // No focus line reached the body: an empty range (0..0) so a caller
+        // that records it records nothing.
+        served_start_line: served_start.unwrap_or(0),
+        served_end_line: served_end,
         collapsed,
     })
 }
