@@ -1,7 +1,7 @@
 //! Tests for `how_to_test`.
 
 use super::*;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 fn write(path: &Path, text: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -16,6 +16,27 @@ fn project() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(dir.path()).unwrap();
     (dir, root)
+}
+
+/// Set a DIRECTORY's mtime to an explicit time. `File::set_modified` needs a
+/// writable handle, and Linux refuses to open a directory for writing
+/// (EISDIR), so go through `utimensat` on the path instead.
+#[cfg(unix)]
+fn set_dir_mtime(dir: &Path, time: SystemTime) {
+    let ns: i64 = time
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        .try_into()
+        .expect("mtime fits in i64 nanoseconds");
+    let ts = libc::timespec {
+        tv_sec: ns.div_euclid(1_000_000_000),
+        tv_nsec: ns.rem_euclid(1_000_000_000),
+    };
+    let times = [ts, ts];
+    let c_path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).unwrap();
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
+    assert_eq!(rc, 0, "utimensat failed for {}", dir.display());
 }
 
 #[test]
@@ -34,7 +55,94 @@ fn test_workspace_member_owns_its_files() {
     assert_eq!(got.command, "cargo test -p beta --lib");
     assert_eq!(got.cwd, PathBuf::from("."));
     let xtask = how_to_test(&root, Path::new("tools/xtask/src/main.rs")).unwrap();
-    assert_eq!(xtask.command, "cargo test -p xtask --lib");
+    assert_eq!(xtask.command, "cargo test -p xtask");
+}
+
+#[test]
+fn test_binary_only_member_command_drops_lib() {
+    let (_guard, root) = project();
+    write(
+        &root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/*\"]\n",
+    );
+    write(&root.join("crates/cli/Cargo.toml"), &package("cli"));
+    write(&root.join("crates/cli/src/main.rs"), "");
+    let got = how_to_test(&root, Path::new("crates/cli/src/main.rs")).unwrap();
+    assert_eq!(got.command, "cargo test -p cli");
+}
+
+#[test]
+fn test_integration_test_path_selects_the_test_target() {
+    let (_guard, root) = project();
+    write(
+        &root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/*\"]\n",
+    );
+    write(&root.join("crates/beta/Cargo.toml"), &package("beta"));
+    write(&root.join("crates/beta/tests/integration.rs"), "");
+    let got = how_to_test(&root, Path::new("crates/beta/tests/integration.rs")).unwrap();
+    assert_eq!(got.command, "cargo test -p beta --test integration");
+}
+
+#[test]
+fn test_directory_request_starts_package_search_at_the_directory() {
+    let (_guard, root) = project();
+    write(
+        &root.join("web/package.json"),
+        r#"{"scripts":{"test":"vitest"}}"#,
+    );
+    let got = how_to_test(&root, Path::new("web")).unwrap();
+    assert_eq!(got.command, "npm test");
+    assert_eq!(got.cwd, PathBuf::from("web"));
+}
+
+#[test]
+fn test_dotdot_path_resolves_to_the_real_owner() {
+    let (_guard, root) = project();
+    write(
+        &root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/*\"]\n",
+    );
+    write(&root.join("crates/alpha/Cargo.toml"), &package("alpha"));
+    write(&root.join("crates/beta/Cargo.toml"), &package("beta"));
+    write(&root.join("crates/beta/src/lib.rs"), "");
+    let got = how_to_test(&root, Path::new("crates/alpha/../beta/src/lib.rs")).unwrap();
+    assert_eq!(got.command, "cargo test -p beta --lib");
+}
+
+#[test]
+fn test_traversing_outside_is_rejected_even_when_lexically_inside() {
+    let (_guard, root) = project();
+    std::fs::create_dir_all(root.join("a")).unwrap();
+    let error = how_to_test(&root, Path::new("a/../../outside/src/file.ts")).unwrap_err();
+    assert!(error.to_string().contains("outside the project"), "{error}");
+}
+
+#[test]
+#[cfg(unix)]
+fn test_new_workspace_member_dir_invalidates_cache() {
+    let (_guard, root) = project();
+    write(
+        &root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/*\"]\n",
+    );
+    write(&root.join("crates/a/Cargo.toml"), &package("a"));
+    write(&root.join("crates/a/src/lib.rs"), "");
+    let got = how_to_test(&root, Path::new("crates/a/src/lib.rs")).unwrap();
+    assert_eq!(got.command, "cargo test -p a --lib");
+
+    // A new member appears after the cached discovery; push the wildcard
+    // parent's mtime forward so the invalidation does not depend on clock
+    // granularity. The parent is a directory, so set its mtime by path.
+    write(&root.join("crates/b/Cargo.toml"), &package("b"));
+    write(&root.join("crates/b/src/lib.rs"), "");
+    set_dir_mtime(
+        &root.join("crates"),
+        SystemTime::now() + Duration::from_secs(10),
+    );
+
+    let got = how_to_test(&root, Path::new("crates/b/src/lib.rs")).unwrap();
+    assert_eq!(got.command, "cargo test -p b --lib");
 }
 
 #[test]

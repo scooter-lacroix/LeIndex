@@ -259,6 +259,40 @@ fn test_render_caps_at_1200_with_note() {
 }
 
 #[test]
+fn test_parse_pytest_quiet_mode_summary_without_delimiters() {
+    let output = "tests/test_a.py .F                                              [100%]\n1 failed, 1 passed in 0.12s\nFAILED tests/test_a.py::test_add - AssertionError: 1 + 1 != 3\n";
+    let parsed = parse_pytest(output);
+    assert_eq!(parsed.failures.len(), 1);
+    assert!(parsed.headline.contains("1 failed"), "{}", parsed.headline);
+    assert!(parsed.headline.contains("1 passed"), "{}", parsed.headline);
+    assert_eq!(parsed.failures[0].name, "tests/test_a.py::test_add");
+    assert_eq!(parsed.failures[0].detail, "AssertionError: 1 + 1 != 3");
+}
+
+#[test]
+fn test_render_unknown_tool_tail_keeps_every_line() {
+    let summary = Summary {
+        exit_code: 1,
+        duration_ms: 4,
+        headline: "tool exited with code 1".to_string(),
+        failures: vec![Failure {
+            name: "last output".to_string(),
+            detail: "building\nfatal: dependency unavailable".to_string(),
+        }],
+        error_count: 0,
+        warning_counts: BTreeMap::new(),
+        log_path: None,
+    };
+    let rendered = summary.render();
+    assert!(rendered.contains("building"), "{rendered}");
+    assert!(
+        rendered.contains("fatal: dependency unavailable"),
+        "{rendered}"
+    );
+    assert!(rendered.chars().count() <= MAX_RENDER_CHARS);
+}
+
+#[test]
 fn test_render_typical_failing_cargo_test_summary_is_small() {
     let summary = summarize(
         ToolKind::CargoTest,

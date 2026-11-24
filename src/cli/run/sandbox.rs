@@ -10,7 +10,10 @@
 //!   whole process group is killed, so a descendant holding the pipes open
 //!   cannot hang the call;
 //! - output is capped, scrubbed line by line by `LogScrubber` before it is
-//!   stored, and the cut is announced in the log.
+//!   stored, and the cut is announced in the log. stdout and stderr are
+//!   collected separately and stored as stdout followed by stderr, so a
+//!   structured stdout record (Cargo's JSON lines) can never be split by an
+//!   interleaved stderr chunk.
 
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
@@ -96,7 +99,7 @@ pub(crate) struct RunRequest<'a> {
     pub cwd: Option<&'a Path>,
     /// Timeout in seconds; `None` means [`DEFAULT_TIMEOUT_SECS`].
     pub timeout_secs: Option<u64>,
-    /// Log handle name; `None` generates `run-<ms>`.
+    /// Log handle name; `None` reserves a unique `run-<ms>-<pid>-<n>`.
     pub name: Option<&'a str>,
 }
 
@@ -238,11 +241,25 @@ fn child_env(command: &mut Command) {
     }
 }
 
-/// Shared capped buffer fed by both pipes; bytes past the cap are counted.
+/// Capped buffer fed by one pipe; bytes past the cap are counted.
 #[derive(Default)]
 struct Sink {
     bytes: Vec<u8>,
     dropped: usize,
+}
+
+impl Sink {
+    /// Room left before the cap, reserving space for the truncation note.
+    fn room(&self) -> usize {
+        (MAX_LOG_BYTES - NOTE_RESERVE).saturating_sub(self.bytes.len())
+    }
+
+    /// Append up to the cap; the rest is counted as dropped.
+    fn push(&mut self, chunk: &[u8]) {
+        let keep = self.room().min(chunk.len());
+        self.bytes.extend_from_slice(&chunk[..keep]);
+        self.dropped += chunk.len() - keep;
+    }
 }
 
 async fn pump<R: tokio::io::AsyncRead + Unpin>(mut pipe: R, sink: Arc<Mutex<Sink>>) {
@@ -252,29 +269,34 @@ async fn pump<R: tokio::io::AsyncRead + Unpin>(mut pipe: R, sink: Arc<Mutex<Sink
             break;
         }
         let mut sink = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let room = (MAX_LOG_BYTES - NOTE_RESERVE).saturating_sub(sink.bytes.len());
-        let keep = room.min(n);
-        sink.bytes.extend_from_slice(&buf[..keep]);
-        sink.dropped += n - keep;
+        sink.push(&buf[..n]);
     }
 }
 
 /// Kill the child and its whole process group.
-fn kill_tree(child: &mut tokio::process::Child) {
+///
+/// `pgid` is the process-group id captured when the child was spawned (it
+/// is the child's own pid because the command was started with
+/// `process_group(0)`). It must be passed in explicitly: by the time a run
+/// is torn down the direct child may already have been reaped, and tokio's
+/// `Child::id()` then returns `None`, which would skip the group signal and
+/// leave every descendant alive.
+fn kill_tree(child: &mut tokio::process::Child, pgid: Option<i32>) {
     #[cfg(unix)]
-    if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
+    if let Some(pgid) = pgid {
         // SAFETY: plain signal delivery to the group this call created with
         // `process_group(0)`; no memory is touched.
         unsafe {
-            libc::kill(-pid, libc::SIGKILL);
+            libc::kill(-pgid, libc::SIGKILL);
         }
     }
     let _ = child.start_kill();
 }
 
-/// Scrub line by line (`LogScrubber` redacts the first match per call), then
-/// enforce the hard cap with an announced cut.
-fn finish_log(raw: &[u8], dropped: usize, timed_out: Option<u64>) -> String {
+/// Scrub line by line, then enforce the hard cap with an announced cut.
+/// `LogScrubber::redact` removes every occurrence of each secret pattern on a
+/// line, so one pass per line leaves no secret behind.
+pub(crate) fn finish_log(raw: &[u8], dropped: usize, timed_out: Option<u64>) -> String {
     let text = String::from_utf8_lossy(raw);
     let mut out = String::with_capacity(text.len());
     for line in text.lines() {
@@ -383,13 +405,24 @@ async fn execute(
     let mut child = command
         .spawn()
         .map_err(|error| RunError::Spawn(format!("{}: {error}", argv[0])))?;
-    let sink = Arc::new(Mutex::new(Sink::default()));
+    // Capture the group leader's pid while the child is guaranteed alive:
+    // `Child::id()` returns `None` once the child has been waited on, and
+    // the timeout path below runs exactly then.
+    #[cfg(unix)]
+    let pgid = child.id().and_then(|pid| i32::try_from(pid).ok());
+    #[cfg(not(unix))]
+    let pgid: Option<i32> = None;
+    // stdout and stderr are collected separately so a stderr chunk landing
+    // between two chunks of one stdout record (Cargo's JSON lines) can never
+    // corrupt that record. The stored log is stdout followed by stderr.
+    let stdout_sink = Arc::new(Mutex::new(Sink::default()));
+    let stderr_sink = Arc::new(Mutex::new(Sink::default()));
     let mut pumps = Vec::new();
     if let Some(pipe) = child.stdout.take() {
-        pumps.push(tokio::spawn(pump(pipe, sink.clone())));
+        pumps.push(tokio::spawn(pump(pipe, stdout_sink.clone())));
     }
     if let Some(pipe) = child.stderr.take() {
-        pumps.push(tokio::spawn(pump(pipe, sink.clone())));
+        pumps.push(tokio::spawn(pump(pipe, stderr_sink.clone())));
     }
 
     // One deadline for the child AND the pipes: a descendant that outlives
@@ -408,7 +441,7 @@ async fn execute(
         Ok(Ok(status)) => (status.code().unwrap_or(-1), None),
         Ok(Err(error)) => return Err(RunError::Spawn(error.to_string())),
         Err(_) => {
-            kill_tree(&mut child);
+            kill_tree(&mut child, pgid);
             let _ = child.wait().await;
             for task in &pumps {
                 task.abort();
@@ -417,12 +450,14 @@ async fn execute(
         }
     };
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let sink = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    Ok((
-        exit_code,
-        duration_ms,
-        sink.bytes.clone(),
-        sink.dropped,
-        timed_out,
-    ))
+    let mut stdout = stdout_sink
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let stderr = stderr_sink
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dropped = stdout.dropped + stderr.dropped;
+    let mut raw = std::mem::take(&mut stdout.bytes);
+    raw.extend_from_slice(&stderr.bytes);
+    Ok((exit_code, duration_ms, raw, dropped, timed_out))
 }

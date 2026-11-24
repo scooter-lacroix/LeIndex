@@ -3,6 +3,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Hard cap on one stored log (8 MiB), truncation note included.
@@ -43,28 +44,62 @@ pub(crate) fn sanitize_name(raw: &str) -> Option<String> {
 }
 
 /// Create the logs directory and reserve the log for `name` (default
-/// `run-<unix-ms>`). Returns an error for an invalid name.
+/// `run-<unix-ms>-<pid>-<n>`). Returns an error for an invalid name.
+///
+/// An explicit name is an address the caller chose: it replaces any earlier
+/// log of that name. An anonymous name must be unique per call — two runs
+/// that reach `prepare` in the same millisecond would otherwise share one
+/// path and one `log://` handle, and the second `store_and_summarise` would
+/// overwrite the first run's output. Generated names therefore carry the
+/// process id and an atomic counter, and the file is reserved with
+/// `create_new` so even two processes colliding on the same (millis, pid,
+/// counter) triple cannot land on the same log.
 pub(crate) fn prepare(storage: &Path, name: Option<&str>) -> io::Result<StoredLog> {
-    let name = match name {
-        Some(raw) => sanitize_name(raw).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid log name '{raw}': use 1-64 chars of [A-Za-z0-9_-]"),
-            )
-        })?,
-        None => {
-            let millis = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_millis());
-            format!("run-{millis}")
-        }
-    };
     let dir = logs_dir(storage);
     std::fs::create_dir_all(&dir)?;
     let dir = std::fs::canonicalize(dir)?;
+    let Some(raw) = name else {
+        return reserve_unique(&dir);
+    };
+    let name = sanitize_name(raw).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid log name '{raw}': use 1-64 chars of [A-Za-z0-9_-]"),
+        )
+    })?;
     Ok(StoredLog {
         path: dir.join(format!("{name}.log")),
     })
+}
+
+/// Allocate a log path no other run holds, creating the file exclusively.
+/// A name that already exists is skipped; after a bounded number of
+/// collisions this is an error, never a silent overwrite.
+fn reserve_unique(dir: &Path) -> io::Result<StoredLog> {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    for _ in 0..1000 {
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!(
+            "run-{millis}-{pid}-{sequence}.log",
+            pid = std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => return Ok(StoredLog { path }),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not reserve a unique log name after 1000 attempts",
+    ))
 }
 
 /// Read a stored log by `log://<name>` handle (or bare name).

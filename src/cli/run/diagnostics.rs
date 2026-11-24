@@ -8,6 +8,7 @@
 
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -72,10 +73,25 @@ pub(crate) fn record(storage: &Path, diagnostics: &[Diagnostic]) -> Result<()> {
             .map_or(0, |d| d.as_millis()),
         diagnostics: diagnostics.to_vec(),
     };
-    let temp = dir.join(format!("{STORE_FILE}.tmp"));
+    // A private temporary file per writer: concurrent `record` calls must not
+    // share one temp path (one writer's rename would invalidate another's).
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let temp = dir.join(format!(
+        "{STORE_FILE}.{pid}.{nanos}.{n}.tmp",
+        pid = std::process::id(),
+        nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+        n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
     std::fs::write(&temp, serde_json::to_vec(&store)?)
         .with_context(|| format!("write {}", temp.display()))?;
-    std::fs::rename(&temp, store_path(storage)).context("publish diagnostics store")
+    if let Err(error) = std::fs::rename(&temp, store_path(storage)) {
+        // Do not leave a stale temporary behind when the publish fails.
+        let _ = std::fs::remove_file(&temp);
+        return Err(error).context("publish diagnostics store");
+    }
+    Ok(())
 }
 
 /// The last run's stored diagnostics for `file` within `lines`; empty when
@@ -110,8 +126,12 @@ fn absolute(project_root: &Path, file: &Path) -> PathBuf {
 /// How a file's owning package is checked.
 #[derive(Debug, PartialEq, Eq)]
 enum Scope {
-    /// `cargo check -p <name>`.
-    Cargo(String),
+    /// `cargo check -p <name>` run from `dir`, the directory that holds the
+    /// `[package]` manifest. Cargo resolves the workspace from the working
+    /// directory upward, so a member nested below the project root is only
+    /// reachable when the check runs inside that member (or an ancestor
+    /// that is itself a workspace root above it).
+    Cargo { package: String, dir: PathBuf },
     /// `npx tsc --noEmit` from this directory.
     Tsc(PathBuf),
 }
@@ -133,7 +153,10 @@ fn find_scope(project_root: &Path, file: &Path) -> Result<Scope> {
                 .and_then(|package| package.get("name"))
                 .and_then(toml::Value::as_str)
             {
-                return Ok(Scope::Cargo(name.to_string()));
+                return Ok(Scope::Cargo {
+                    package: name.to_string(),
+                    dir: current.clone(),
+                });
             }
         }
         if current.join("package.json").is_file() {
@@ -152,8 +175,10 @@ fn find_scope(project_root: &Path, file: &Path) -> Result<Scope> {
 }
 
 /// `cargo check` JSON lines to diagnostics. Messages without a span (the
-/// "aborting due to" trailer) carry no location and are skipped.
-pub(crate) fn parse_cargo_diagnostics(project_root: &Path, output: &str) -> Vec<Diagnostic> {
+/// "aborting due to" trailer) carry no location and are skipped. `file_name`
+/// is relative to the workspace root Cargo resolved from its working
+/// directory, so `base` is the directory the check ran in.
+pub(crate) fn parse_cargo_diagnostics(base: &Path, output: &str) -> Vec<Diagnostic> {
     let mut found: Vec<Diagnostic> = Vec::new();
     for line in output.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -184,7 +209,7 @@ pub(crate) fn parse_cargo_diagnostics(project_root: &Path, output: &str) -> Vec<
             continue;
         };
         let diagnostic = Diagnostic {
-            file: absolute(project_root, Path::new(name)),
+            file: absolute(base, Path::new(name)),
             line: usize::try_from(line_start).unwrap_or(usize::MAX),
             severity,
             code: message["code"]["code"].as_str().map(str::to_string),
@@ -251,11 +276,25 @@ pub(crate) fn check_scoped(project_root: &Path, file: &Path, max: usize) -> Resu
     }
     let scope = find_scope(&root, &file)?;
     let (argv, cwd): (Vec<String>, Option<PathBuf>) = match &scope {
-        Scope::Cargo(package) => (
-            ["cargo", "check", "-p", package, "--message-format=json"]
-                .map(String::from)
-                .to_vec(),
-            None,
+        Scope::Cargo { package, dir } => (
+            [
+                "cargo",
+                "check",
+                "-p",
+                package,
+                // Plain `cargo check` selects only lib and bin targets, so a
+                // file that belongs to a test target (or to `#[cfg(test)]`
+                // code) would not be compiled and the check could report
+                // success without ever looking at it. `--all-targets` also
+                // builds tests, examples, benches and build scripts.
+                "--all-targets",
+                "--message-format=json",
+            ]
+            .map(String::from)
+            .to_vec(),
+            // Cargo searches upward from the working directory only; the
+            // project root may not be the workspace this member belongs to.
+            Some(dir.clone()),
         ),
         Scope::Tsc(dir) => (
             ["npx", "tsc", "--noEmit", "--pretty", "false"]
@@ -265,6 +304,10 @@ pub(crate) fn check_scoped(project_root: &Path, file: &Path, max: usize) -> Resu
         ),
     };
     let storage = storage_for(&root);
+    // No explicit log name: a fixed name would be shared by every scoped
+    // check (and by a user run of the same name), so a concurrent check could
+    // overwrite the log before it is parsed here. An anonymous name is
+    // unique per invocation and the summary carries the exact path read back.
     let mut summary = run_blocking(&root, &storage, &argv, cwd.as_deref())?;
 
     let log_path = summary
@@ -274,7 +317,10 @@ pub(crate) fn check_scoped(project_root: &Path, file: &Path, max: usize) -> Resu
     let output = std::fs::read_to_string(&log_path)
         .with_context(|| format!("read {}", log_path.display()))?;
     let diagnostics = match &scope {
-        Scope::Cargo(_) => parse_cargo_diagnostics(&root, &output),
+        // Cargo prints `file_name` relative to the workspace root it resolved
+        // from its working directory, so paths are resolved against the cwd
+        // the check ran in — the same rule `tsc` paths follow below.
+        Scope::Cargo { dir, .. } => parse_cargo_diagnostics(dir, &output),
         Scope::Tsc(dir) => parse_tsc_diagnostics(dir, &output),
     };
     record(&storage, &diagnostics)?;
@@ -312,7 +358,8 @@ fn run_blocking(
                         command: None,
                         cwd,
                         timeout_secs: None,
-                        name: Some("check-scoped"),
+                        // Anonymous: unique per invocation (see `check_scoped`).
+                        name: None,
                     }))
                     .map_err(|error| anyhow!(error.to_string()))
             })

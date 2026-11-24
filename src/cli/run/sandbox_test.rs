@@ -177,8 +177,13 @@ async fn test_run_timeout_kills_descendant_holding_the_pipes() {
     let script_dir = dir.path().join("script");
     std::fs::create_dir_all(&script_dir).unwrap();
     let script = script_dir.join("hang");
-    // The direct child exits at once; the backgrounded sleep keeps stdout open.
-    std::fs::write(&script, "#!/bin/sh\nsleep 60 &\nexit 0\n").unwrap();
+    // The direct child exits at once; the backgrounded sleep keeps stdout
+    // open and records its pid so the test can prove it was terminated.
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nsleep 60 &\necho $! > descendant.pid\nexit 0\n",
+    )
+    .unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     let args = argv(&["script/hang"]);
@@ -195,6 +200,83 @@ async fn test_run_timeout_kills_descendant_holding_the_pipes() {
         "{}",
         summary.headline
     );
+    // The whole process group must be gone, not just the direct child. The
+    // old implementation asked tokio for the child's pid after `wait()` had
+    // already reaped it, got `None`, and skipped the group signal, leaving
+    // this `sleep` alive for the rest of its 60 seconds.
+    let pid_file = dir.path().join("descendant.pid");
+    let pid: i32 = std::fs::read_to_string(&pid_file)
+        .expect("descendant pid recorded")
+        .trim()
+        .parse()
+        .expect("numeric pid");
+    let mut gone = false;
+    for _ in 0..100 {
+        // SAFETY: `kill(pid, 0)` only probes existence; no signal is sent.
+        let alive = unsafe { libc::kill(pid, 0) == 0 };
+        if !alive {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        gone,
+        "descendant sleep (pid {pid}) survived the timeout kill"
+    );
+}
+
+/// stdout and stderr are collected in separate buffers and stored as stdout
+/// followed by stderr, so a stderr line written while a structured stdout
+/// record is in flight can never split that record.
+#[tokio::test]
+async fn test_run_keeps_stdout_records_intact_when_stderr_interleaves() {
+    let dir = tempfile::tempdir().unwrap();
+    let script_dir = dir.path().join("script");
+    std::fs::create_dir_all(&script_dir).unwrap();
+    let script = script_dir.join("interleave");
+    // Half a JSON record, a stderr line, then the rest of the record.
+    let body = format!(
+        "#!/bin/sh\nprintf '%s' '{}'\necho 'warning: something on stderr' >&2\nprintf '%s\n' '{}'\n",
+        r#"{"reason":"compiler-message","message":{"level"#, r#"":"warning"}}"#,
+    );
+    std::fs::write(&script, body).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let args = argv(&["script/interleave"]);
+    let mut req = request(dir.path(), dir.path(), Some(&args), None);
+    req.name = Some("interleave");
+    let summary = run(req).await.unwrap();
+    let stored = std::fs::read_to_string(summary.log_path.unwrap()).unwrap();
+    let mut lines = stored.lines();
+    assert_eq!(
+        lines.next(),
+        Some("{\"reason\":\"compiler-message\",\"message\":{\"level\":\"warning\"}}"),
+        "stdout record was split by stderr: {stored:?}"
+    );
+    assert_eq!(lines.next(), Some("warning: something on stderr"));
+}
+
+#[test]
+fn test_finish_log_redacts_every_secret_on_a_line() {
+    // Distinct multi-character values: a one-letter value would collide with
+    // ordinary words in the scrubbed text and make the survival check
+    // meaningless (e.g. `y` is part of `key`).
+    let raw =
+        b"Bearer s3cr3tA Bearer s3cr3tB\nkey=s3cr3tC key=s3cr3tD\ntoken=s3cr3tE token=s3cr3tF\n";
+    let out = finish_log(raw, 0, None);
+    assert_eq!(
+        out,
+        "Bearer [REDACTED] Bearer [REDACTED]\n\
+         key=[REDACTED] key=[REDACTED]\n\
+         token=[REDACTED] token=[REDACTED]\n"
+    );
+    assert_eq!(out.matches("[REDACTED]").count(), 6, "{out}");
+    for secret in [
+        "s3cr3tA", "s3cr3tB", "s3cr3tC", "s3cr3tD", "s3cr3tE", "s3cr3tF",
+    ] {
+        assert!(!out.contains(secret), "{secret} survived: {out}");
+    }
 }
 
 #[test]
@@ -203,6 +285,56 @@ fn test_log_names_cannot_traverse() {
     assert!(run_log::sanitize_name("../x").is_none());
     assert!(run_log::sanitize_name("a/b").is_none());
     assert!(run_log::sanitize_name("").is_none());
+}
+
+#[test]
+fn test_anonymous_log_names_are_unique_and_reserved() {
+    // Two anonymous runs prepared back to back (same millisecond, same
+    // process) must never share a path: the second write would otherwise
+    // overwrite the first run's output under the same `log://` handle.
+    let dir = tempfile::tempdir().unwrap();
+    let mut paths = Vec::new();
+    for _ in 0..64 {
+        let log = run_log::prepare(dir.path(), None).unwrap();
+        assert!(
+            log.path.is_file(),
+            "anonymous log must be reserved on prepare: {}",
+            log.path.display()
+        );
+        paths.push(log.path);
+    }
+    let mut unique = paths.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), paths.len(), "anonymous log names collided");
+    // The generated name stays a valid handle.
+    let first = paths[0]
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(".log"))
+        .unwrap();
+    assert!(
+        run_log::sanitize_name(first).is_some(),
+        "generated name {first} is not a valid handle"
+    );
+    assert!(run_log::read_by_handle(dir.path(), &run_log::handle(first)).is_ok());
+}
+
+#[test]
+fn test_explicit_log_name_replaces_earlier_log() {
+    // A named run is an address the caller chose; it must still be allowed
+    // to replace an earlier log of the same name (not be refused as a
+    // collision).
+    let dir = tempfile::tempdir().unwrap();
+    let first = run_log::prepare(dir.path(), Some("check-scoped")).unwrap();
+    std::fs::write(&first.path, "first").unwrap();
+    let second = run_log::prepare(dir.path(), Some("check-scoped")).unwrap();
+    assert_eq!(first.path, second.path);
+    std::fs::write(&second.path, "second").unwrap();
+    assert_eq!(
+        run_log::read_by_handle(dir.path(), "log://check-scoped").unwrap(),
+        "second"
+    );
 }
 
 #[test]

@@ -59,7 +59,13 @@ fn test_find_scope_prefers_nearest_package_and_skips_workspace_root() {
     write(&root.join("web/src/app.ts"), "");
 
     let cargo = find_scope(&root, &root.join("crates/inner/src/lib.rs")).unwrap();
-    assert_eq!(cargo, Scope::Cargo("inner".to_string()));
+    assert_eq!(
+        cargo,
+        Scope::Cargo {
+            package: "inner".to_string(),
+            dir: root.join("crates/inner"),
+        }
+    );
     let tsc = find_scope(&root, &root.join("web/src/app.ts")).unwrap();
     assert_eq!(tsc, Scope::Tsc(root.join("web")));
 }
@@ -114,6 +120,43 @@ fn test_diagnostics_for_is_empty_without_a_store() {
     assert!(diagnostics_for(dir.path(), Path::new("a.rs"), 1..=10).is_empty());
 }
 
+#[test]
+fn test_concurrent_record_writers_all_publish_a_valid_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = storage_for(dir.path());
+    let root = dir.path().to_path_buf();
+    let mut writers = Vec::new();
+    for writer in 0..16 {
+        let storage = storage.clone();
+        let root = root.clone();
+        writers.push(std::thread::spawn(move || {
+            let diagnostic = Diagnostic {
+                file: root.join(format!("src/w{writer}.rs")),
+                line: writer + 1,
+                severity: Severity::Warning,
+                code: Some("w".to_string()),
+                message: format!("writer {writer}"),
+            };
+            record(&storage, &[diagnostic])
+        }));
+    }
+    for handle in writers {
+        handle.join().unwrap().unwrap();
+    }
+    // The published store must be valid JSON with diagnostics from at least
+    // one writer (the last publisher wins; earlier renames must not fail).
+    let raw =
+        std::fs::read(crate::cli::run::run_log::logs_dir(&storage).join("last-diagnostics.json"))
+            .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    assert!(
+        value["diagnostics"]
+            .as_array()
+            .is_some_and(|d| !d.is_empty()),
+        "{value}"
+    );
+}
+
 /// Real `cargo check` on a one-file crate with a type error: the diagnostic
 /// is parsed, stored, and read back through `diagnostics_for`.
 #[test]
@@ -137,4 +180,102 @@ fn test_check_scoped_real_cargo_error_is_stored_and_readable() {
     assert_eq!(stored.len(), 1, "{stored:?}");
     assert_eq!(stored[0].code.as_deref(), Some("E0308"));
     assert_eq!(stored[0].severity, Severity::Error);
+}
+
+/// A test-target file (`tests/*.rs`) is not compiled by plain `cargo check`;
+/// the scoped check must include it, or a broken test would read as a pass.
+#[test]
+fn test_check_scoped_compiles_test_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    write(
+        &root.join("Cargo.toml"),
+        "[package]\nname = \"target_probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+    );
+    write(&root.join("src/lib.rs"), "pub fn ok() {}\n");
+    write(
+        &root.join("tests/broken_test.rs"),
+        "#[test]\nfn broken() { let n: u32 = \"not a number\"; drop(n); }\n",
+    );
+
+    let summary = check_scoped(&root, Path::new("tests/broken_test.rs"), 5).unwrap();
+    assert_ne!(summary.exit_code, 0, "{}", summary.render());
+    assert_eq!(summary.error_count, 1, "{}", summary.render());
+    let stored = diagnostics_for(&root, Path::new("tests/broken_test.rs"), 1..=5);
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    assert_eq!(stored[0].severity, Severity::Error);
+    assert_eq!(stored[0].line, 2);
+}
+
+/// A workspace member nested under the project root is only reachable when
+/// Cargo runs from inside that member: Cargo searches upward from the
+/// working directory, never downward into children.
+#[test]
+fn test_check_scoped_runs_member_check_from_the_owning_crate() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    // The project root holds a virtual manifest that does NOT list the
+    // member, mirroring a monorepo where the member is discovered by its own
+    // manifest rather than by the root's `members` list.
+    write(&root.join("Cargo.toml"), "[workspace]\nresolver = \"2\"\n");
+    write(
+        &root.join("backend/Cargo.toml"),
+        "[package]\nname = \"backend\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+    );
+    write(
+        &root.join("backend/src/lib.rs"),
+        "pub fn f() -> u32 { \"not a number\" }\n",
+    );
+
+    let summary = check_scoped(&root, Path::new("backend/src/lib.rs"), 5).unwrap();
+    assert_ne!(summary.exit_code, 0, "{}", summary.render());
+    assert_eq!(summary.error_count, 1, "{}", summary.render());
+    let stored = diagnostics_for(&root, Path::new("backend/src/lib.rs"), 1..=1);
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    assert_eq!(stored[0].code.as_deref(), Some("E0308"));
+}
+
+/// Each scoped check must read back only the log its own run produced. With
+/// a fixed log name, two concurrent checks would share one file and the
+/// slower one could parse the other's output as its own diagnostics.
+#[test]
+fn test_check_scoped_uses_a_unique_log_per_invocation() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    // Two members so each check compiles only its own package's sources.
+    write(
+        &root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"a\", \"b\"]\n",
+    );
+    for member in ["a", "b"] {
+        write(
+            &root.join(member).join("Cargo.toml"),
+            &format!("[package]\nname = \"{member}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        );
+        write(
+            &root.join(member).join("src/lib.rs"),
+            &format!("pub fn f() -> u32 {{ \"{member}\" }}\n"),
+        );
+    }
+
+    let first = check_scoped(&root, Path::new("a/src/lib.rs"), 5).unwrap();
+    let second = check_scoped(&root, Path::new("b/src/lib.rs"), 5).unwrap();
+    let first_log = first.log_path.expect("first log");
+    let second_log = second.log_path.expect("second log");
+    assert_ne!(first_log, second_log, "scoped checks shared one log file");
+    // Neither check may write to the old fixed name.
+    for log in [&first_log, &second_log] {
+        assert_ne!(
+            log.file_name().and_then(|n| n.to_str()),
+            Some("check-scoped.log")
+        );
+    }
+    // Each summary's log holds that check's own primary span and not the
+    // other package's.
+    let first_text = std::fs::read_to_string(&first_log).unwrap();
+    assert!(first_text.contains("a/src/lib.rs"), "{first_text}");
+    assert!(!first_text.contains("b/src/lib.rs"), "{first_text}");
+    let second_text = std::fs::read_to_string(&second_log).unwrap();
+    assert!(second_text.contains("b/src/lib.rs"), "{second_text}");
+    assert!(!second_text.contains("a/src/lib.rs"), "{second_text}");
 }

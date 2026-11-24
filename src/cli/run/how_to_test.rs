@@ -7,7 +7,7 @@
 //! mtimes, and is rebuilt as soon as any of them changes.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
@@ -70,6 +70,51 @@ fn restamp(stamp: &Stamp) -> Stamp {
     stamp.iter().map(|(p, _)| (p.clone(), mtime(p))).collect()
 }
 
+/// Resolve `.`/`..` lexically and canonicalize the deepest existing ancestor,
+/// so containment and member-ownership checks see the real target even when
+/// the path contains traversal (e.g. `crates/a/../b/src/lib.rs`) or symlinks.
+/// A nonexistent leaf path stays resolvable (it is appended un-canonicalized).
+fn normalize_resolved(path: &Path) -> Result<PathBuf> {
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                parts.pop();
+            }
+            Component::RootDir => {
+                parts.clear();
+                parts.push(component.as_os_str().to_os_string());
+            }
+            Component::Prefix(_) | Component::Normal(_) => {
+                parts.push(component.as_os_str().to_os_string());
+            }
+        }
+    }
+    let lexical: PathBuf = parts.iter().collect();
+    let mut base = lexical.clone();
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match base.file_name() {
+            Some(name) if !base.exists() => {
+                suffix.push(name.to_os_string());
+                base.pop();
+            }
+            _ => break,
+        }
+    }
+    let base = if base.as_os_str().is_empty() {
+        lexical
+    } else {
+        std::fs::canonicalize(&base)?
+    };
+    let mut resolved = base;
+    for part in suffix.iter().rev() {
+        resolved.push(part);
+    }
+    Ok(resolved)
+}
+
 /// Gate command for `path` (absolute or project-relative).
 pub(crate) fn how_to_test(project_root: &Path, path: &Path) -> Result<Guidance> {
     let root = std::fs::canonicalize(project_root)?;
@@ -79,6 +124,7 @@ pub(crate) fn how_to_test(project_root: &Path, path: &Path) -> Result<Guidance> 
     } else {
         root.join(path)
     };
+    let absolute = normalize_resolved(&absolute)?;
     if !absolute.starts_with(&root) {
         bail!("{} is outside the project", absolute.display());
     }
@@ -130,7 +176,11 @@ fn discover(root: &Path, stamp: &mut Stamp) -> Facts {
         for pattern in patterns {
             match pattern.strip_suffix("/*") {
                 Some(parent) => {
-                    if let Ok(children) = std::fs::read_dir(root.join(parent)) {
+                    // Stamping the wildcard parent (even when absent) makes a
+                    // newly added member directory invalidate the cache.
+                    let parent_dir = root.join(parent);
+                    stamp.push((parent_dir.clone(), mtime(&parent_dir)));
+                    if let Ok(children) = std::fs::read_dir(&parent_dir) {
                         let mut found: Vec<PathBuf> =
                             children.filter_map(Result::ok).map(|c| c.path()).collect();
                         found.sort();
@@ -268,6 +318,31 @@ fn make_targets(text: &str, just: bool) -> Vec<String> {
     targets
 }
 
+/// Select the Cargo test target for the requested path: integration tests get
+/// `--test <name>`, binary sources drop `--lib` (so binary-only members still
+/// run), and everything else keeps the library default.
+fn cargo_test_target(member: &Member, path: &Path) -> String {
+    let Ok(rel) = path.strip_prefix(&member.dir) else {
+        return " --lib".to_string();
+    };
+    if let Ok(tests_path) = rel.strip_prefix("tests/")
+        && let Some(stem) = tests_path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .filter(|stem| !stem.is_empty())
+    {
+        return format!(" --test {stem}");
+    }
+    let binary_source = rel == Path::new("src/main.rs")
+        || rel.starts_with("src/bin/")
+        || rel.starts_with("examples/");
+    if binary_source {
+        String::new()
+    } else {
+        " --lib".to_string()
+    }
+}
+
 fn relative(root: &Path, dir: &Path) -> PathBuf {
     dir.strip_prefix(root)
         .map(|p| {
@@ -303,7 +378,11 @@ fn guidance(root: &Path, path: &Path, facts: &Facts) -> Result<Guidance> {
             "cargo"
         };
         return Ok(make(
-            format!("{runner} test -p {} --lib", member.name),
+            format!(
+                "{runner} test -p {}{target}",
+                member.name,
+                target = cargo_test_target(member, path)
+            ),
             root,
             format!(
                 "Cargo member `{}` ({})",
@@ -317,8 +396,14 @@ fn guidance(root: &Path, path: &Path, facts: &Facts) -> Result<Guidance> {
         ));
     }
 
-    // Nearest package.json with a test script, walking up to the root.
-    let mut dir = path.parent().map(Path::to_path_buf);
+    // Nearest package.json with a test script, walking up to the root. A
+    // directory request starts at the directory itself; a file request at its
+    // parent.
+    let mut dir = if path.is_dir() {
+        Some(path.to_path_buf())
+    } else {
+        path.parent().map(Path::to_path_buf)
+    };
     while let Some(current) = dir {
         if !current.starts_with(root) {
             break;

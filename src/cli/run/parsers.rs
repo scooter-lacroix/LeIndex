@@ -87,11 +87,21 @@ impl Summary {
             body.push_str(&format!("{total} warnings\n"));
         }
         for failure in &self.failures {
-            let detail = failure.detail.lines().next().unwrap_or("").trim();
-            if detail.is_empty() {
-                body.push_str(&format!("✗ {}\n", failure.name));
-            } else {
-                body.push_str(&format!("✗ {} — {detail}\n", failure.name));
+            body.push_str(&format!("✗ {}", failure.name));
+            let mut detail_lines = failure
+                .detail
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty());
+            match detail_lines.next() {
+                None => body.push('\n'),
+                Some(first) => {
+                    body.push_str(&format!(" — {first}"));
+                    for line in detail_lines {
+                        body.push_str(&format!("\n  {line}"));
+                    }
+                    body.push('\n');
+                }
             }
         }
 
@@ -332,11 +342,40 @@ pub(crate) fn parse_cargo_json(output: &str) -> Parsed {
     }
 }
 
+/// True for a pytest session summary line: the verbose `=== N failed, M passed
+/// in <time> ===` form or the quiet-mode `pytest -q` form without delimiters
+/// (Pytest 8.2 can end `-q` runs with `1 failed, 1 passed in 0.12s`).
+fn is_pytest_summary_line(trimmed: &str) -> bool {
+    if !trimmed.contains(" in ") {
+        return false;
+    }
+    if trimmed.starts_with("===") {
+        return trimmed.ends_with("===");
+    }
+    let counts = trimmed.split(" in ").next().unwrap_or("");
+    !counts.is_empty()
+        && counts.split(',').all(|part| {
+            let mut tokens = part.split_whitespace();
+            let Some(count) = tokens.next().and_then(|t| t.parse::<usize>().ok()) else {
+                return false;
+            };
+            let Some(label) = tokens.next() else {
+                return false;
+            };
+            tokens.next().is_none()
+                && count > 0
+                && matches!(
+                    label,
+                    "passed" | "failed" | "error" | "skipped" | "xfailed" | "xpassed"
+                )
+        })
+}
+
 /// Parse `pytest` text output.
 ///
 /// Reads the final session summary line (`=== N failed, M passed, K error in
-/// <time> ===`) and the `FAILED`/`ERROR` lines, which carry the failure name
-/// and a one-line detail after ` - `.
+/// <time> ===`, or the quiet-mode form) and the `FAILED`/`ERROR` lines, which
+/// carry the failure name and a one-line detail after ` - `.
 pub(crate) fn parse_pytest(output: &str) -> Parsed {
     let mut passed = 0usize;
     let mut failed = 0usize;
@@ -346,7 +385,7 @@ pub(crate) fn parse_pytest(output: &str) -> Parsed {
 
     for line in output.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("===") && trimmed.contains(" in ") && trimmed.ends_with("===") {
+        if is_pytest_summary_line(trimmed) {
             let words: Vec<&str> = trimmed
                 .split_whitespace()
                 .map(|word| word.trim_matches(','))
