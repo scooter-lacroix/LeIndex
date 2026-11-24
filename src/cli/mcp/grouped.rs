@@ -1061,9 +1061,13 @@ pub fn tools_guide_markdown(handlers: &[ToolHandler]) -> String {
         "# LeIndex tool guide\n\nLeIndex exposes {} tools. Pick the tool, then the branch with \
          {selectors}; every other argument is forwarded \
          unchanged to that branch. `project_path` is accepted everywhere (omit it to use the \
-         server's project). Indexing is NOT automatic: an unindexed project answers with a \
-         'project not indexed' error until you run the index action. `tier` (`l0` identity card, \
-         `l1` bounded overview — default, `l2` full detail) is accepted everywhere.\n\nThe \
+         server's project). Indexing is off by default: live reads (read_file, git \
+         status/diff, live text find) work on an unindexed project, while index-dependent \
+         operations (symbol_lookup, project_map, structural/graph queries) answer with a \
+         'project not indexed' error until you run the index action. Set \
+         `LEINDEX_AUTO_INDEX=1` or `[mcp] auto_index = true` to index on first use instead. \
+         `tier` (`l0` identity card, `l1` bounded overview — default, `l2` full detail) is \
+         accepted everywhere.\n\nThe \
          individual tool names (`leindex_search`, \
          `leindex_edit_apply`, ...) still work as direct calls.\n",
         GROUPS.len()
@@ -1627,12 +1631,29 @@ mod tests {
 
     /// The detail dropped from the advertised schema must be recoverable:
     /// `leindex://tools/guide` is the doc-of-record for argument semantics.
+    ///
+    /// The indexing sentence must be scoped to the operations that actually
+    /// need an index: live reads (read_file, git status/diff, live text find)
+    /// work on an unindexed project, and the opt-in auto-index setting exists.
+    /// Saying "every unindexed project errors" misdescribes both.
     #[test]
     fn test_guide_carries_the_project_path_detail() {
         let guide = tools_guide_markdown(&all_tool_handlers());
         assert!(
-            guide.contains("Indexing is NOT automatic"),
+            guide.contains("Indexing is off by default"),
             "detail removed from tools/list must live in the guide:\n{guide}"
+        );
+        assert!(
+            guide.contains("live reads") && guide.contains("index-dependent operations"),
+            "the guide must say which operations need an index:\n{guide}"
+        );
+        assert!(
+            guide.contains("LEINDEX_AUTO_INDEX=1") && guide.contains("auto_index = true"),
+            "the guide must name the opt-in auto-index setting:\n{guide}"
+        );
+        assert!(
+            !guide.contains("Indexing is NOT automatic"),
+            "the over-broad claim must be gone:\n{guide}"
         );
     }
 }

@@ -155,15 +155,26 @@ pub(crate) fn wrap_read_live_meta(mut result: Value, project_root: &std::path::P
     let storage_path = crate::cli::leindex::resolve_existing_storage_path(project_root)
         .unwrap_or_else(|| project_root.join(".leindex"));
     let health = crate::cli::index_freshness::load_health(&storage_path);
-    let (status, generation) = match &health {
-        Some(health) => (health.status, Some(health.generation)),
-        None => (ComponentStatus::NotLoaded, None),
-    };
-    let status_text = match status {
-        ComponentStatus::Initializing => "fresh",
-        // Fresh/Pending: healthy states never read as reindex noise.
-        ComponentStatus::Failed | ComponentStatus::Stale | ComponentStatus::Partial => "stale",
-        _ => "fresh",
+    // `None` means the index state is UNKNOWN: no health snapshot exists, the
+    // component is not loaded, is still initialising, or this build cannot
+    // provide it. None of those establish freshness, and a live read says
+    // nothing about the index, so no freshness status is attached at all —
+    // never a `fresh` badge the index has not earned. Healthy states read
+    // `fresh`; a stale/partial/failed index reads `stale`.
+    let (status_text, generation) = match &health {
+        Some(health) => (
+            match health.status {
+                ComponentStatus::Fresh => Some("fresh"),
+                ComponentStatus::Failed | ComponentStatus::Stale | ComponentStatus::Partial => {
+                    Some("stale")
+                }
+                ComponentStatus::Initializing
+                | ComponentStatus::NotLoaded
+                | ComponentStatus::Unavailable => None,
+            },
+            Some(health.generation),
+        ),
+        None => (None, None),
     };
     if let Some(obj) = result.as_object_mut() {
         let meta = obj
@@ -174,13 +185,17 @@ pub(crate) fn wrap_read_live_meta(mut result: Value, project_root: &std::path::P
                 "read_source".to_string(),
                 Value::String("live_bytes".to_string()),
             );
-            let freshness = meta_obj
-                .entry("freshness".to_string())
-                .or_insert_with(|| Value::Object(serde_json::Map::new()));
-            if let Some(freshness_obj) = freshness.as_object_mut() {
-                freshness_obj.insert("status".to_string(), Value::String(status_text.to_string()));
-                if let Some(generation) = generation {
-                    freshness_obj.insert("generation".to_string(), serde_json::json!(generation));
+            if let Some(status_text) = status_text {
+                let freshness = meta_obj
+                    .entry("freshness".to_string())
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                if let Some(freshness_obj) = freshness.as_object_mut() {
+                    freshness_obj
+                        .insert("status".to_string(), Value::String(status_text.to_string()));
+                    if let Some(generation) = generation {
+                        freshness_obj
+                            .insert("generation".to_string(), serde_json::json!(generation));
+                    }
                 }
             }
         }

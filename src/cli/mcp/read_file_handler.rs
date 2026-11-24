@@ -1074,8 +1074,65 @@ mod tests {
             "read must not report reindex state: {serialized}"
         );
         assert_eq!(result["_meta"]["read_source"], "live_bytes");
-        let status = result["_meta"]["freshness"]["status"].as_str().unwrap();
-        assert_ne!(status, "initializing");
+        // An unindexed project has no health snapshot, so the index state is
+        // UNKNOWN. The read must not attach a `fresh` badge the index has not
+        // earned: no freshness status at all, rather than a guessed one.
+        assert!(
+            result["_meta"]["freshness"].get("status").is_none(),
+            "unknown index state must not read as fresh: {serialized}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_freshness_badge_reflects_a_known_index_state() {
+        use crate::cli::leindex::ComponentStatus;
+        use crate::cli::leindex::IndexHealth;
+        let dir = tempdir().unwrap();
+        let path = write_sample(dir.path(), "sample.rs");
+        let registry = test_registry_for(dir.path());
+        let storage = dir.path().join(".leindex");
+        std::fs::create_dir_all(&storage).unwrap();
+        for (status, expected) in [
+            (ComponentStatus::Fresh, "fresh"),
+            (ComponentStatus::Stale, "stale"),
+            (ComponentStatus::Partial, "stale"),
+            (ComponentStatus::Failed, "stale"),
+            (ComponentStatus::Unavailable, "_absent_"),
+            (ComponentStatus::NotLoaded, "_absent_"),
+        ] {
+            crate::cli::index_freshness::save_health(
+                &storage,
+                &IndexHealth {
+                    status,
+                    generation: 7,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let result = ReadFileHandler
+                .execute(
+                    &registry,
+                    serde_json::json!({
+                        "file_path": path.to_string_lossy(),
+                        "project_path": dir.path().to_string_lossy(),
+                        "_session": test_session("freshness-known"),
+                    }),
+                )
+                .await
+                .unwrap();
+            if expected == "_absent_" {
+                assert!(
+                    result["_meta"]["freshness"].get("status").is_none(),
+                    "{status:?} must not be labelled fresh or stale: {result}"
+                );
+            } else {
+                assert_eq!(
+                    result["_meta"]["freshness"]["status"], expected,
+                    "{status:?}"
+                );
+                assert_eq!(result["_meta"]["freshness"]["generation"], 7, "{status:?}");
+            }
+        }
     }
 
     #[tokio::test]

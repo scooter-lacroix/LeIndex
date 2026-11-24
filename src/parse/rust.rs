@@ -888,6 +888,54 @@ fn extract_rust_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
 /// bounded by nesting depth to keep pathological inputs cheap.
 const MACRO_REPARSE_DEPTH: usize = 3;
 
+/// Standard macros whose arguments are tokens for the compiler, not code
+/// that runs at the call site. A function named inside `stringify!(leaf())`
+/// is NOT called, so recording `leaf` from its body would add a false `Call`
+/// edge (visible in caller lists and test lookups). The set is explicit:
+/// anything not listed is treated as evaluating its arguments, which is the
+/// conservative choice for `assert!`, `format!`, `vec!`, `tokio::spawn!`, …
+const MACROS_WHOSE_ARGUMENTS_ARE_NOT_EVALUATED: &[&str] = &[
+    "stringify",
+    "concat",
+    "concat_bytes",
+    "include",
+    "include_str",
+    "include_bytes",
+    "cfg",
+    "env",
+    "option_env",
+    "module_path",
+    "line",
+    "file",
+    "column",
+    "compile_error",
+    "asm",
+    "global_asm",
+    "naked_asm",
+];
+
+/// Rewrite a `token_tree`'s outer `(...)` or `{...}` delimiter to `[...]`,
+/// leaving `[...]` and anything malformed untouched. Used for `vec!` so the
+/// repeat form `vec![expr; n]` re-parses as an array expression.
+fn normalise_outer_delimiter_to_brackets(text: &str) -> String {
+    let bytes = text.as_bytes();
+    if bytes.len() < 2 {
+        return text.to_string();
+    }
+    let (open, close) = match (bytes[0], bytes[bytes.len() - 1]) {
+        (b'(', b')') => ("(", ")"),
+        (b'{', b'}') => ("{", "}"),
+        _ => return text.to_string(),
+    };
+    let inner = &text[1..text.len() - 1];
+    // Only a balanced outer pair is rewritten: a body that opens and closes
+    // differently is not a delimiter-wrapped token tree.
+    if inner.matches(open).count() > inner.matches(close).count() {
+        return text.to_string();
+    }
+    format!("[{inner}]")
+}
+
 fn extract_rust_calls_depth(
     node: &tree_sitter::Node<'_>,
     source: &[u8],
@@ -949,22 +997,42 @@ fn extract_rust_calls_depth(
     /// DSL tokens would be worse. The wrapper ladder matters because a
     /// multi-argument macro body (`callee(1), 2`) is not valid Rust at file
     /// level, and a statement body is not valid inside parentheses.
+    ///
+    /// `macro_name` is the invoked macro's identifier (`vec`, `stringify`,
+    /// …) and drives two exceptions to the generic reparse:
+    ///
+    /// * [`MACROS_WHOSE_ARGUMENTS_ARE_NOT_EVALUATED`]: the body is tokens
+    ///   for the compiler, not code that runs, so nothing in it is a call.
+    /// * `vec`: the repeat form `vec![expr; n]` is valid, but the extracted
+    ///   `token_tree` text keeps its own delimiter. Every wrapper leaves the
+    ///   `;` inside those parentheses/braces, so none of the three
+    ///   candidates parses; the equivalent bracket form parses as an array
+    ///   expression. The outer delimiter is normalised to brackets first.
     fn reparse_macro_calls(
         token_tree: &tree_sitter::Node<'_>,
         source: &[u8],
         calls: &mut Vec<String>,
         depth: usize,
+        macro_name: &str,
     ) {
         if depth == 0 {
+            return;
+        }
+        if MACROS_WHOSE_ARGUMENTS_ARE_NOT_EVALUATED.contains(&macro_name) {
             return;
         }
         let Ok(text) = token_tree.utf8_text(source) else {
             return;
         };
+        let text = if macro_name == "vec" {
+            normalise_outer_delimiter_to_brackets(text)
+        } else {
+            text.to_string()
+        };
         let candidates = [
             format!("fn __leindex_macro_body() {{ {text} }}"),
             format!("({text})"),
-            text.to_string(),
+            text.clone(),
         ];
         for (idx, candidate) in candidates.iter().enumerate() {
             let mut parser = Parser::new();
@@ -1031,6 +1099,7 @@ fn extract_rust_calls_depth(
                 }
             }
             "macro_invocation" => {
+                let mut macro_name = String::new();
                 if let Some(name_node) = current
                     .child_by_field_name("macro")
                     .or_else(|| current.child_by_field_name("name"))
@@ -1038,6 +1107,14 @@ fn extract_rust_calls_depth(
                 {
                     let name = clean_call_text(text);
                     if !name.is_empty() {
+                        // Keep only the final path segment: `std::stringify!`
+                        // and `stringify!` are the same textual macro.
+                        macro_name = name
+                            .rsplit("::")
+                            .next()
+                            .unwrap_or(&name)
+                            .trim_end_matches('!')
+                            .to_string();
                         calls.push(name);
                     }
                 }
@@ -1045,7 +1122,7 @@ fn extract_rust_calls_depth(
                     .children(&mut current.walk())
                     .find(|child| child.kind() == "token_tree")
                 {
-                    reparse_macro_calls(&token_tree, source, &mut calls, depth);
+                    reparse_macro_calls(&token_tree, source, &mut calls, depth, &macro_name);
                 }
             }
             "struct_expression" => {
@@ -1467,6 +1544,96 @@ fn real_call() {}\n";
             dsl_user.calls
         );
         assert!(dsl_user.calls.iter().any(|call| call == "real_call"));
+    }
+
+    /// `stringify!(leaf())` produces text; it does not call `leaf`. Recording
+    /// `leaf` from the macro body gave a same-named project function a false
+    /// `Call` edge, which then leaked into caller lists and test lookups.
+    /// Macros that DO evaluate their arguments (`format!`, `assert!`) keep
+    /// recording theirs.
+    #[test]
+    fn test_stringify_body_is_not_recorded_as_calls() {
+        let source = b"fn leaf() -> u32 { 1 }\n\
+fn quoted() -> &'static str {\n\
+    std::stringify!(leaf())\n\
+}\n\
+fn evaluated() -> String {\n\
+    format!(\"{}\", leaf())\n\
+}\n";
+
+        let parser = RustParser::new();
+        let signatures = parser.get_signatures(source).unwrap();
+
+        let quoted = signatures
+            .iter()
+            .find(|sig| sig.name == "quoted")
+            .expect("quoted fn extracted");
+        assert!(
+            !quoted.calls.iter().any(|call| call == "leaf"),
+            "stringify! does not evaluate its body, calls: {:?}",
+            quoted.calls
+        );
+        assert!(
+            quoted.calls.iter().any(|call| call.contains("stringify")),
+            "the macro itself is still a call: {:?}",
+            quoted.calls
+        );
+        let evaluated = signatures
+            .iter()
+            .find(|sig| sig.name == "evaluated")
+            .expect("evaluated fn extracted");
+        assert!(
+            evaluated.calls.iter().any(|call| call == "leaf"),
+            "format! evaluates its arguments, calls: {:?}",
+            evaluated.calls
+        );
+    }
+
+    /// The repeat form `vec![make_value(); len()]` is valid Rust, but the
+    /// extracted token tree keeps its own delimiter (`(...)`, `vec!(…)` is
+    /// equally valid), and every reparse wrapper then leaves the `;` inside
+    /// parentheses, so no candidate parsed and `make_value`/`len` vanished.
+    /// Normalising the outer delimiter to brackets makes it an array
+    /// expression. The invalid-DSL control still records nothing.
+    #[test]
+    fn test_vec_repeat_form_calls_are_recovered_regardless_of_delimiter() {
+        for (delimiter_open, delimiter_close) in [("[", "]"), ("(", ")")] {
+            let source = format!(
+                "fn make_value() -> u32 {{ 1 }}\n\
+                 fn len() -> usize {{ 1 }}\n\
+                 fn build() {{\n\
+                     let _ = vec{open}make_value(); len(){close};\n\
+                     sql_query!(SELECT name FROM users);\n\
+                 }}\n",
+                open = delimiter_open,
+                close = delimiter_close
+            );
+
+            let parser = RustParser::new();
+            let signatures = parser.get_signatures(source.as_bytes()).unwrap();
+            let build = signatures
+                .iter()
+                .find(|sig| sig.name == "build")
+                .expect("build fn extracted");
+            assert!(
+                build.calls.iter().any(|call| call == "make_value"),
+                "vec! repeat element call missing ({delimiter_open}{delimiter_close}): {:?}",
+                build.calls
+            );
+            assert!(
+                build.calls.iter().any(|call| call == "len"),
+                "vec! repeat length call missing ({delimiter_open}{delimiter_close}): {:?}",
+                build.calls
+            );
+            assert!(
+                !build
+                    .calls
+                    .iter()
+                    .any(|call| call.contains("SELECT") || call == "name" || call == "users"),
+                "DSL macro leaked pseudo-calls: {:?}",
+                build.calls
+            );
+        }
     }
 
     #[test]

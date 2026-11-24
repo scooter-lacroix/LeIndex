@@ -7,7 +7,27 @@ pub(super) fn render_project_map(data: &Value, color: bool) -> String {
     out.push_str(&project_map_stats(data, color));
     out.push_str(&project_map_scope_line(data, color));
     out.push_str(&project_map_legend(data, color));
+    out.push_str(&project_map_continuation(data));
     out
+}
+
+/// The advertised continuation, so a client on the default (text) tier can
+/// resume exactly as the JSON tier would. Without this line the payload's
+/// `next`/`next_offset` existed but never reached the model, and the client
+/// could not continue past the first page.
+fn project_map_continuation(data: &Value) -> String {
+    if data.get("has_more").and_then(Value::as_bool) != Some(true) {
+        return String::new();
+    }
+    let offset = data
+        .get("next_offset")
+        .and_then(Value::as_u64)
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    match data.get("next").and_then(Value::as_str) {
+        Some(token) if !token.is_empty() => format!("… more files: offset={offset} next={token}\n"),
+        _ => format!("… more files: offset={offset}\n"),
+    }
 }
 
 /// Render the structure body: community groups, the handler's tree, a

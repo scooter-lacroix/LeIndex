@@ -183,6 +183,9 @@ scoping to subdirectories, sorting, and pagination."
             include_symbols || focus.is_some(),
         );
 
+        // Size of the first file this page would show, kept for the budget
+        // error below (the truncation drops it, so it cannot be read after).
+        let first_page_file_chars = files.get(offset).map(|file| file.to_string().len());
         let (total_before_pagination, truncated_files) =
             Self::paginate_and_truncate(files, offset, limit, token_budget);
 
@@ -212,6 +215,22 @@ scoping to subdirectories, sorting, and pagination."
         });
         if has_more {
             let next_offset = offset + payload["count"].as_u64().unwrap_or(0) as usize;
+            if next_offset == offset {
+                // Nothing fit the budget, so a token would restore this very
+                // offset and replay the same empty page forever. Say what to
+                // change instead of handing the caller a loop.
+                let needed = first_page_file_chars.unwrap_or(0).div_ceil(4);
+                return Err(JsonRpcError::invalid_params_with_suggestion(
+                    format!(
+                        "token_budget {token_budget} is too small to show any file \
+                         (offset {offset} of {total_before_pagination}; the next file \
+                         needs about {needed} tokens)"
+                    ),
+                    "Raise token_budget, or raise it past the next file's size and continue; \
+                     a continuation cannot advance here"
+                        .to_string(),
+                ));
+            }
             let token =
                 crate::cli::mcp::find_paging::issue("leindex_project_map", &args, next_offset);
             payload["next_offset"] = serde_json::json!(next_offset);
@@ -631,6 +650,27 @@ mod tests {
         );
 
         assert!(files.is_empty());
+    }
+
+    /// When the budget excludes every file, `count` is 0 while `has_more`
+    /// is true. A token would restore the same offset and replay the empty
+    /// page forever, so the handler must refuse with a budget error instead
+    /// of issuing one. This pins the arithmetic the error path relies on.
+    /// (`execute` needs an indexed project; the full path is covered by the
+    /// integration suite.)
+    #[test]
+    fn test_project_map_budget_that_fits_nothing_yields_no_advance() {
+        let files = vec![
+            serde_json::json!({"relative_path": "big.rs", "padding": "x".repeat(400)}),
+            serde_json::json!({"relative_path": "small.rs"}),
+        ];
+        let (total, page) = ProjectMapHandler::paginate_and_truncate(files, 0, None, 1);
+        assert_eq!(total, 2);
+        assert!(page.is_empty(), "nothing fits a 1-token budget");
+        let next_offset = page.len();
+        assert!(next_offset < total, "the page is partial (has_more)");
+        assert_eq!(next_offset, 0, "a token here would repeat the same offset");
+        assert_eq!(next_offset, 0, "a token here would repeat the same offset");
     }
 
     #[test]

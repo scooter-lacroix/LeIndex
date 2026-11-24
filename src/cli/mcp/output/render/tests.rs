@@ -484,6 +484,47 @@ fn test_render_edit_metadata_plain_output() {
 }
 
 #[test]
+fn test_render_edit_preview_renders_requested_validation() {
+    // §3.6/§6.x: when the handler includes a validation artifact, the
+    // renderer surfaces it — a "valid" summary or the concrete failures.
+    let valid = v(r#"{
+            "preview_token": "tok123",
+            "affected_files": ["src/lib.rs"],
+            "validation": {
+                "is_valid": true,
+                "syntax_errors": [],
+                "reference_issues": [],
+                "semantic_drift": []
+            }
+        }"#);
+    let s = render_edit_preview(&valid, false);
+    assert!(
+        s.contains("  Validation: valid"),
+        "valid validation must render: {s}"
+    );
+
+    let invalid = v(r#"{
+            "preview_token": "tok123",
+            "affected_files": ["src/lib.rs"],
+            "validation": {
+                "is_valid": false,
+                "syntax_errors": [{"line": 3, "column": 1, "message": "expected `;`"}],
+                "reference_issues": [{"message": "undefined symbol `foo`"}],
+                "semantic_drift": []
+            }
+        }"#);
+    let s = render_edit_preview(&invalid, false);
+    assert!(
+        s.contains("Validation: syntax: expected `;`"),
+        "syntax failure must render: {s}"
+    );
+    assert!(
+        s.contains("Validation: reference: undefined symbol `foo`"),
+        "reference failure must render: {s}"
+    );
+}
+
+#[test]
 fn test_render_file_summary_plain_output() {
     let payload = v(r#"{
                 "file_path": "src/lib.rs",
@@ -1046,4 +1087,37 @@ fn test_render_read_file_emits_nothing_without_diagnostics() {
     }"#);
     let s = render_tool_output("leindex.read_file", &data, &serde_json::json!({}));
     assert!(!s.contains("Diagnostics"), "{s}");
+}
+
+/// A paged project map must show its continuation on the default (text)
+/// tier too: the payload carries `next`/`next_offset`, and a client that
+/// renders text could otherwise never resume past the first page.
+#[test]
+fn test_render_project_map_shows_the_continuation_token() {
+    let data = v(r#"{
+        "project_root": "/p",
+        "scope": "/p",
+        "total_files_in_scope": 12,
+        "offset": 0,
+        "count": 2,
+        "has_more": true,
+        "next_offset": 2,
+        "next": "tok-123",
+        "files": [{"relative_path": "a.rs", "symbol_count": 1}]
+    }"#);
+    let s = render_tool_output("leindex.project_map", &data, &Value::Null);
+    assert!(s.contains("… more files: offset=2 next=tok-123"), "{s}");
+
+    // No continuation line when the page is complete.
+    let complete = v(r#"{
+        "project_root": "/p",
+        "scope": "/p",
+        "total_files_in_scope": 1,
+        "offset": 0,
+        "count": 1,
+        "has_more": false,
+        "files": [{"relative_path": "a.rs", "symbol_count": 1}]
+    }"#);
+    let s = render_tool_output("leindex.project_map", &complete, &Value::Null);
+    assert!(!s.contains("more files"), "{s}");
 }
