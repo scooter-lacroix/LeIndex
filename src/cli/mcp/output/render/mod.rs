@@ -12,7 +12,7 @@
 
 use serde_json::Value;
 
-use super::diff::{render_default, render_diff_value};
+use super::diff::render_default;
 use super::{
     BOLD, DIM, LIGHT_BLUE, LIGHT_CYAN, LIGHT_GREEN, LIGHT_GREY, LIGHT_MAGENTA, LIGHT_RED,
     LIGHT_YELLOW, RESET, WHITE, normalize_tool_name, truncate_chars,
@@ -30,6 +30,9 @@ use map_impact::*;
 #[path = "tests.rs"]
 mod tests;
 
+mod edit;
+use edit::{render_edit_apply, render_edit_preview, render_rename_symbol};
+
 // =============================================================================
 // Shared formatters — small helpers used by multiple render_* fns
 // =============================================================================
@@ -42,7 +45,7 @@ pub(super) fn header(title: &str, color: bool) -> String {
     }
 }
 
-fn field(name: &str, value: &str, color: bool) -> String {
+pub(super) fn field(name: &str, value: &str, color: bool) -> String {
     if color {
         format!(
             "  {}{}:{} {}{}{}\n",
@@ -983,289 +986,6 @@ fn render_write(data: &Value, color: bool) -> String {
     }
     out.push_str(&render_write_symbols(data, color));
     out
-}
-
-fn render_meta_line(label: &str, value: &str, color: bool) -> String {
-    format!(
-        "  {}{}:{} {}",
-        if color { BOLD } else { "" },
-        label,
-        if color { RESET } else { "" },
-        value,
-    )
-}
-
-fn append_meta_lines(mut out: String, meta_lines: &[String]) -> String {
-    if meta_lines.is_empty() {
-        return out;
-    }
-    if !out.is_empty() {
-        out.push('\n');
-    }
-    out.push_str(&meta_lines.join("\n"));
-    out.push('\n');
-    out
-}
-
-/// Render edit-preview output: `preview_token` on the FIRST line (§3.4 —
-/// the apply-by-token path starts from the text surface), then the unified
-/// diff, then metadata. §3.6: the no-information `Risk level: low` /
-/// `Change count: N` lines are gone; a `risk` line appears only when the
-/// handler computed a real finding, carrying its reason.
-fn render_edit_preview(data: &Value, color: bool) -> String {
-    let mut out = String::new();
-    if let Some(token) = data.get("preview_token").and_then(|v| v.as_str()) {
-        out.push_str(&format!(
-            "{}preview_token: {token}{} — apply with preview_token + project_path\n",
-            if color { LIGHT_GREEN } else { "" },
-            if color { RESET } else { "" },
-        ));
-    }
-
-    let mut meta_lines = Vec::new();
-    if let Some(symbols) = data.get("affected_symbols").and_then(|v| v.as_array())
-        && !symbols.is_empty()
-    {
-        let names: Vec<&str> = symbols.iter().filter_map(|v| v.as_str()).collect();
-        meta_lines.push(render_meta_line(
-            "Affected symbols",
-            &names.join(", "),
-            color,
-        ));
-    }
-    if let Some(files) = data.get("affected_files").and_then(|v| v.as_array())
-        && !files.is_empty()
-    {
-        let names: Vec<&str> = files.iter().filter_map(|v| v.as_str()).collect();
-        meta_lines.push(render_meta_line("Affected files", &names.join(", "), color));
-    }
-    // §3.6: real-signal risk only — the handler emits `risk` solely when a
-    // finding exists, and its reason already names the file.
-    if let Some(risk) = data.get("risk") {
-        let level = risk.get("level").and_then(|v| v.as_str()).unwrap_or("?");
-        let reason = risk.get("reason").and_then(|v| v.as_str()).unwrap_or("");
-        meta_lines.push(render_meta_line(
-            "risk",
-            &format!("{level} — {reason}"),
-            color,
-        ));
-    }
-    if let Some(breaks) = data.get("breaking_changes").and_then(|v| v.as_array()) {
-        for description in breaks.iter().filter_map(|value| value.as_str()) {
-            // The literal "none" entry is a no-information line (§3.6).
-            if description == "none" {
-                continue;
-            }
-            meta_lines.push(render_meta_line("Breaking", description, color));
-        }
-    }
-
-    out.push_str(&append_meta_lines(
-        render_diff_value(data, color),
-        &meta_lines,
-    ));
-    out
-}
-
-/// Render rename-symbol output: multi-file diffs followed by metadata
-/// (old_name, new_name, files_affected, preview_only).
-fn render_rename_symbol(data: &Value, color: bool) -> String {
-    let mut meta_lines = Vec::new();
-
-    if let (Some(old), Some(new)) = (
-        data.get("old_name").and_then(|v| v.as_str()),
-        data.get("new_name").and_then(|v| v.as_str()),
-    ) {
-        meta_lines.push(render_meta_line("Rename", &format!("{old} → {new}"), color));
-    }
-    if let Some(count) = data.get("files_affected").and_then(|v| v.as_u64()) {
-        meta_lines.push(render_meta_line(
-            "Files affected",
-            &count.to_string(),
-            color,
-        ));
-    }
-    if let Some(diffs_more) = data
-        .get("diffs_more")
-        .and_then(|v| v.as_u64())
-        .filter(|count| *count > 0)
-    {
-        meta_lines.push(render_meta_line(
-            "Additional diffs",
-            &format!("{diffs_more} more (not shown)"),
-            color,
-        ));
-    }
-    if data
-        .get("preview_only")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        meta_lines.push(render_meta_line(
-            "Preview only",
-            "changes not applied",
-            color,
-        ));
-    }
-
-    append_meta_lines(render_diff_value(data, color), &meta_lines)
-}
-
-fn render_edit_region(region_value: &Value, color: bool) -> String {
-    // `edit_region` may be a source excerpt or a byte-range object retained by `trim_edit`.
-    let region_text = if let Some(s) = region_value.as_str() {
-        if s.is_empty() {
-            None
-        } else {
-            Some(s.to_string())
-        }
-    } else if let Some(obj) = region_value.as_object() {
-        let start = obj.get("start").and_then(|v| v.as_u64());
-        let end = obj.get("end").and_then(|v| v.as_u64());
-        match (start, end) {
-            (Some(s), Some(e)) => Some(format!("bytes {s}..{e}")),
-            (Some(s), None) => Some(format!("bytes {s}..")),
-            (None, Some(e)) => Some(format!("bytes ..{e}")),
-            (None, None) => Some("bytes ?".to_string()),
-        }
-    } else {
-        None
-    };
-    let Some(text) = region_text else {
-        return String::new();
-    };
-
-    let mut out = String::from("\n");
-    if region_value.is_string() {
-        out.push_str(&format!(
-            "  {}Surrounding region:{}\n",
-            if color { DIM } else { "" },
-            if color { RESET } else { "" },
-        ));
-        for line in text.lines() {
-            out.push_str(&format!(
-                "      {}{}{}\n",
-                if color { DIM } else { "" },
-                truncate_chars(line, 160),
-                if color { RESET } else { "" },
-            ));
-        }
-    } else {
-        out.push_str(&format!(
-            "  {}Surrounding region:{} {}\n",
-            if color { DIM } else { "" },
-            if color { RESET } else { "" },
-            text,
-        ));
-    }
-    out
-}
-
-fn render_edit_apply(data: &Value, color: bool) -> String {
-    // `EditApplyHandler` returns a confirmation payload with shape
-    // (see `src/cli/mcp/edit_apply_handler.rs::EditApplyHandler::
-    // execute`):
-    //   { success, changes_applied, file_path, edit_region,
-    //     affected_symbols, affected_files, breaking_changes,
-    //     [validation], [message] (no-op only) }
-    // The handler never emits `diff` / `diffs` / `diff_text`, so
-    // `render_diff_value` returns an empty string for the apply
-    // response and the CLI prints nothing for a successful (or
-    // no-op) apply. Surface the success status, the change count,
-    // the file path, the affected-symbol/file summary, breaking
-    // changes, and the surrounding-region excerpt.
-    let mut out = String::new();
-    let success = data
-        .get("success")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let is_noop = data
-        .get("changes_applied")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0)
-        == 0;
-    // With `applied_lines` present the one-line echo already says
-    // "Applied: …" — a separate status label would only duplicate it. The
-    // label remains for failure / dry-run / no-op shapes without the echo.
-    let has_echo = data.get("applied_lines").is_some();
-    if !has_echo || !success || is_noop {
-        let (status_label, status_color) = edit_apply_status(success, data, color);
-        out.push_str(&format!(
-            "{}{}{}\n",
-            status_color,
-            status_label,
-            if color { RESET } else { "" },
-        ));
-    }
-    // §4.3: the apply result is ONE line per file —
-    // `Applied: path:L802-828 (+27/-0) in fn name`. The handler computes
-    // it (`applied_lines`); the field block below remains only for shapes
-    // without it (legacy payloads, no-op confirmations).
-    if let Some(lines) = data.get("applied_lines").and_then(|v| v.as_array()) {
-        for line in lines.iter().filter_map(|v| v.as_str()) {
-            out.push_str(&format!(
-                "  {}{}{}\n",
-                if color { LIGHT_GREEN } else { "" },
-                line,
-                if color { RESET } else { "" },
-            ));
-        }
-        return out;
-    }
-    if let Some(path) = data.get("file_path").and_then(|v| v.as_str()) {
-        out.push_str(&field("File", path, color));
-    }
-    if let Some(msg) = data.get("message").and_then(|v| v.as_str()) {
-        out.push_str(&field("Message", msg, color));
-    }
-    if let Some(arr) = data.get("affected_symbols").and_then(|v| v.as_array())
-        && !arr.is_empty()
-    {
-        out.push_str(&field("Affected symbols", &arr.len().to_string(), color));
-    }
-    if let Some(arr) = data.get("affected_files").and_then(|v| v.as_array())
-        && !arr.is_empty()
-    {
-        out.push_str(&field("Affected files", &arr.len().to_string(), color));
-    }
-    if let Some(bc) = data.get("breaking_changes").and_then(|v| v.as_array())
-        && !bc.is_empty()
-    {
-        out.push_str(&field("Breaking changes", &bc.len().to_string(), color));
-    }
-    out.push_str(
-        &data
-            .get("edit_region")
-            .map_or_else(String::new, |region| render_edit_region(region, color)),
-    );
-    out
-}
-
-/// Pick the first status line of the edit-apply render: failure, dry-run
-/// preview, no-op, or successful apply. A dry run always reports zero
-/// applied changes by design; labeling it "No-op (content identical)"
-/// misdescribes a real preview.
-fn edit_apply_status(success: bool, data: &Value, color: bool) -> (&'static str, &'static str) {
-    if !success {
-        ("Edit apply failed", if color { LIGHT_RED } else { "" })
-    } else if data.get("dry_run").and_then(|v| v.as_bool()) == Some(true) {
-        (
-            "Dry run (no changes written)",
-            if color { LIGHT_YELLOW } else { "" },
-        )
-    } else if data
-        .get("changes_applied")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0)
-        == 0
-    {
-        (
-            "No-op (content identical)",
-            if color { LIGHT_YELLOW } else { "" },
-        )
-    } else {
-        ("Applied", if color { LIGHT_GREEN } else { "" })
-    }
 }
 
 // =============================================================================

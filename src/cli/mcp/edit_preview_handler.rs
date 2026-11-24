@@ -11,6 +11,12 @@ use crate::edit::ResolvedEditChange;
 use crate::validation::validation_to_json;
 use serde_json::Value;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Monotonic nonce for preview tokens. Timestamps + pid alone can repeat on
+/// fast multi-threaded calls (same millisecond, same process), and a reused
+/// token would let an apply replay the WRONG cached preview.
+static PREVIEW_TOKEN_NONCE: AtomicU64 = AtomicU64::new(0);
 
 /// Handler for LeIndex [edit_preview — dry-run for code changes.
 #[derive(Clone)]
@@ -124,11 +130,8 @@ their own file_path (atomic across files, one token for the whole batch)."
             )
         };
 
-        let preview_token = blake3::hash(
-            format!("{}{}", chrono::Utc::now().to_rfc3339(), std::process::id()).as_bytes(),
-        )
-        .to_hex()
-        .to_string();
+        let nonce = PREVIEW_TOKEN_NONCE.fetch_add(1, Ordering::Relaxed);
+        let preview_token = build_preview_token(nonce);
 
         // 2. Build the per-file edit plan (batch or single) — all in-memory.
         let (plan, primary_display) = if batch_mode {
@@ -196,14 +199,14 @@ their own file_path (atomic across files, one token for the whole batch)."
                 original_hashes: hashes,
             }
         };
-        store_preview_in_cache(&storage_path, cache_entry).await;
+        store_preview_in_cache(&storage_path, cache_entry).await?;
 
         // 4. Diffs, impact, risk.
         let mut affected_files: Vec<String> = Vec::new();
         let mut affected_nodes: Vec<String> = Vec::new();
         let mut breaking_changes: Vec<String> = Vec::new();
         let mut risk_findings: Vec<String> = Vec::new();
-        let mut risk_level = "";
+        let mut risk_level = String::new();
         let mut files_json: Vec<Value> = Vec::new();
         let mut diffs_json: Vec<Value> = Vec::new();
         let mut diff_text = String::new();
@@ -241,7 +244,10 @@ their own file_path (atomic across files, one token for the whole batch)."
                 affected_files.push(file.canonical_path.to_string_lossy().to_string());
             }
 
-            // Real-signal risk (§3.6). Low risk contributes nothing.
+            // Real-signal risk (§3.6). Low risk contributes nothing. When a
+            // batch touches several files, the response reports the HIGHEST
+            // risk (a later low-risk file must not downgrade an earlier
+            // high-risk finding).
             let signals = edit_risk::compute_signals(
                 pdg_snapshot.as_ref(),
                 &file.canonical_path,
@@ -249,7 +255,7 @@ their own file_path (atomic across files, one token for the whole batch)."
                 &edit_ranges,
             );
             if let Some(finding) = edit_risk::assess(&signals) {
-                risk_level = finding.level;
+                risk_level = pick_higher_risk(&risk_level, finding.level).to_string();
                 risk_findings.push(format!(
                     "{}: {} — {}",
                     file.display_path, finding.level, finding.reason
@@ -322,6 +328,40 @@ fn dedup_keep_order(items: &mut Vec<String>) {
     items.retain(|item| seen.insert(item.clone()));
 }
 
+/// Numeric rank used to keep the HIGHEST risk across a multi-file batch (a
+/// later low-risk file must not downgrade an earlier high-risk finding).
+fn risk_rank(level: &str) -> u8 {
+    match level {
+        "high" => 3,
+        "medium" => 2,
+        "low" => 1,
+        _ => 0,
+    }
+}
+
+/// Keep the higher-risk level; ties keep the current (first-seen) level.
+fn pick_higher_risk<'a>(current: &'a str, candidate: &'a str) -> &'a str {
+    if risk_rank(candidate) > risk_rank(current) {
+        candidate
+    } else {
+        current
+    }
+}
+
+/// Mint a preview token: a hash of (now + pid) with a process-local monotonic
+/// nonce suffix. The nonce is what guarantees uniqueness across rapid calls —
+/// timestamps + pid alone can repeat within the same millisecond.
+fn build_preview_token(nonce: u64) -> String {
+    format!(
+        "{}-{}",
+        blake3::hash(
+            format!("{}{}", chrono::Utc::now().to_rfc3339(), std::process::id()).as_bytes(),
+        )
+        .to_hex(),
+        nonce
+    )
+}
+
 /// Build the `changes` JSON value from explicit `changes` or the simple-mode
 /// `old_text`/`new_text` (and `old_str`/`new_str`) aliases.
 fn resolve_changes_from_args(args: &Value) -> Value {
@@ -346,15 +386,20 @@ fn resolve_changes_from_args(args: &Value) -> Value {
     }
 }
 
-/// Store a prepared preview in the global cache; failures are non-fatal (warn only).
-async fn store_preview_in_cache(storage_path: &std::path::Path, cache_entry: EditCacheEntry) {
+/// Store a prepared preview in the global cache. The primary file-path entry
+/// must be durable for the advertised `preview_token` apply flow — a storage
+/// or size-limit failure is surfaced, not swallowed.
+async fn store_preview_in_cache(
+    storage_path: &std::path::Path,
+    cache_entry: EditCacheEntry,
+) -> Result<(), JsonRpcError> {
     match GLOBAL_EDIT_CACHE
         .set_with_token_alias(storage_path, cache_entry)
         .await
     {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!("Edit preview too large for cache: {}", e),
-        Err(e) => tracing::warn!("Failed to store edit in cache: {}", e),
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(JsonRpcError::invalid_params(e.to_string())),
+        Err(e) => Err(e),
     }
 }
 
@@ -504,4 +549,41 @@ fn collect_text_overlap_symbols(
         }
     }
     nodes
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_preview_tokens_differ_across_nonces() {
+        // Regression (§3.4): tokens must be unique even when two previews run
+        // within the same millisecond — the monotonic nonce suffix is the
+        // guarantee, so two nonces never collide.
+        let a = build_preview_token(0);
+        let b = build_preview_token(1);
+        assert_ne!(a, b, "nonce suffix must make tokens unique");
+        assert!(a.ends_with("-0"), "token must carry the nonce: {a}");
+        assert!(b.ends_with("-1"), "token must carry the nonce: {b}");
+    }
+
+    #[test]
+    fn test_risk_rank_orders_levels() {
+        assert!(risk_rank("high") > risk_rank("medium"));
+        assert!(risk_rank("medium") > risk_rank("low"));
+        assert!(risk_rank("low") > risk_rank("unknown"));
+        assert_eq!(risk_rank("unknown"), 0);
+    }
+
+    #[test]
+    fn test_pick_higher_risk_keeps_highest_and_first_tie() {
+        // Regression (§3.6): a later low-risk file must not downgrade an
+        // earlier high-risk finding; ties keep the first-seen level.
+        assert_eq!(pick_higher_risk("", "high"), "high");
+        assert_eq!(pick_higher_risk("high", "low"), "high");
+        assert_eq!(pick_higher_risk("high", "medium"), "high");
+        assert_eq!(pick_higher_risk("medium", "high"), "high");
+        assert_eq!(pick_higher_risk("medium", "medium"), "medium");
+        assert_eq!(pick_higher_risk("low", ""), "low");
+    }
 }

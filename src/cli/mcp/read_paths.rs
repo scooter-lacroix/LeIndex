@@ -267,10 +267,19 @@ pub(crate) fn top_level_spans(spans: &[SymbolSpan]) -> Vec<SymbolSpan> {
 /// handles name the bare item, parses may carry a qualifier like
 /// `Impl::build_x`).
 pub(crate) fn find_span<'a>(spans: &'a [SymbolSpan], focus: &str) -> Option<&'a SymbolSpan> {
+    // The fallback is for a qualified name (`Impl::build_x` named bare as
+    // `build_x`), so it only matches when `focus` is the final `::` segment.
+    // A bare `ends_with` would also match an unrelated item whose name merely
+    // ends with the same characters (`build` -> `rebuild`, `test` -> `greatest`)
+    // and return the wrong symbol.
+    let is_last_segment = |name: &str| {
+        name.strip_suffix(focus)
+            .is_some_and(|head| head.ends_with("::"))
+    };
     spans
         .iter()
         .find(|span| span.name == focus)
-        .or_else(|| spans.iter().find(|span| span.name.ends_with(focus)))
+        .or_else(|| spans.iter().find(|span| is_last_segment(&span.name)))
 }
 
 /// Build the elided read: focus span verbatim, every other top-level span
@@ -447,6 +456,9 @@ struct FileRecord {
 #[derive(Debug, Default)]
 struct SessionState {
     files: HashMap<PathBuf, FileRecord>,
+    /// File paths in first-insertion order (eviction order). Mirrors the
+    /// keys of `files`; keeps eviction independent of HashMap iteration.
+    file_order: VecDeque<PathBuf>,
     /// Session-wide monotonically increasing read ordinal.
     next_ordinal: u64,
     /// (ordinal, path) edit events, oldest first, bounded.
@@ -457,10 +469,18 @@ struct SessionState {
 ///
 /// Keys are MCP session ids. When `max_sessions` distinct sessions are
 /// resident, the oldest-inserted session is evicted to admit a new one; each
-/// file remembers at most `max_reads_per_file` reads / edits. No structure
-/// here grows with the number of tool calls.
+/// file remembers at most `max_reads_per_file` reads / edits, and each
+/// session keeps at most [`SessionLedger::MAX_FILES_PER_SESSION`] file
+/// records (the oldest-inserted file is evicted first and is treated as New
+/// on its next read). No structure here grows with the number of tool calls.
 pub(crate) struct SessionLedger {
     inner: Mutex<LedgerInner>,
+}
+
+impl SessionLedger {
+    /// Upper bound on file records kept per session, whichever code path
+    /// (file reads or edits) inserted them.
+    pub(crate) const MAX_FILES_PER_SESSION: usize = 4_096;
 }
 
 struct LedgerInner {
@@ -469,6 +489,37 @@ struct LedgerInner {
     order: VecDeque<Arc<str>>,
     max_sessions: usize,
     max_reads_per_file: usize,
+}
+
+/// Fetch (or insert) the file record for `path` in `state`, keeping the
+/// session's file count at or under [`SessionLedger::MAX_FILES_PER_SESSION`].
+///
+/// When a new file would exceed the cap, the oldest-inserted file record is
+/// evicted first; that file is then treated as New on its next read. An
+/// already-resident file never evicts anything.
+fn ledger_file_entry<'a>(
+    state: &'a mut SessionState,
+    path: &Path,
+    initial_hash: &str,
+) -> &'a mut FileRecord {
+    if !state.files.contains_key(path) {
+        while state.files.len() >= SessionLedger::MAX_FILES_PER_SESSION {
+            // `path` is not resident yet, so the evicted file can never be
+            // the one being inserted.
+            match state.file_order.pop_front() {
+                Some(oldest) => {
+                    state.files.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+        state.file_order.push_back(path.to_path_buf());
+    }
+    state.files.entry(path.to_path_buf()).or_insert(FileRecord {
+        content_hash: initial_hash.to_string(),
+        reads: Vec::new(),
+        invalidated: false,
+    })
 }
 
 impl Default for SessionLedger {
@@ -540,14 +591,20 @@ impl SessionLedger {
                 break;
             }
         }
-        if let Some(ordinal) = covering {
+        // `Unchanged` is only honest when *every* requested line was already
+        // served. A recorded read can fully cover one part of the request while
+        // a later read leaves another part unserved; taking the `Unchanged`
+        // branch there silently drops the unserved tail.
+        if unseen.is_empty()
+            && let Some(ordinal) = covering
+        {
             return ConsultVerdict::Unchanged {
                 since_ordinal: ordinal,
                 start_line,
                 end_line,
             };
         }
-        if let Some(ordinal) = overlap_ordinal {
+        if let Some(ordinal) = overlap_ordinal.or(covering) {
             return ConsultVerdict::PartialOverlap {
                 unseen,
                 since_ordinal: ordinal,
@@ -589,11 +646,7 @@ impl SessionLedger {
         let state = inner.sessions.entry(key).or_default();
         state.next_ordinal += 1;
         let ordinal = state.next_ordinal;
-        let entry = state.files.entry(path.to_path_buf()).or_insert(FileRecord {
-            content_hash: content_hash.to_string(),
-            reads: Vec::new(),
-            invalidated: false,
-        });
+        let entry = ledger_file_entry(state, path, content_hash);
         if entry.content_hash != content_hash || entry.invalidated {
             entry.content_hash = content_hash.to_string();
             entry.reads.clear();
@@ -620,11 +673,7 @@ impl SessionLedger {
         };
         state.next_ordinal += 1;
         let ordinal = state.next_ordinal;
-        let entry = state.files.entry(path.to_path_buf()).or_insert(FileRecord {
-            content_hash: String::new(),
-            reads: Vec::new(),
-            invalidated: false,
-        });
+        let entry = ledger_file_entry(state, path, "");
         entry.invalidated = true;
         state.edits.push((ordinal, path.to_path_buf()));
         if state.edits.len() > cap {

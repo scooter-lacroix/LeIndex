@@ -13,6 +13,13 @@ use crate::validation::validation_to_json;
 use serde_json::Value;
 use std::sync::Arc;
 
+/// Applied-line echo math (§4.3): original→final offset translation so the
+/// `Applied: path:Lx-Ly` echo never slices `modified` text at stale original
+/// byte offsets (multi-byte UTF-8 panic, wrong ranges).
+#[path = "edit_apply_applied.rs"]
+mod edit_apply_applied;
+use edit_apply_applied::applied_lines;
+
 type EditImpact = (Vec<String>, std::collections::HashSet<String>, Vec<String>);
 
 /// What the caller asked `apply` to do. Token mode (preview_token, with or
@@ -226,11 +233,10 @@ fn validate_edit(
 fn edit_impact(
     pdg: Option<&crate::graph::pdg::ProgramDependenceGraph>,
     changes: &[crate::edit::EditChange],
-    path: &std::path::Path,
+    files: std::collections::HashSet<String>,
 ) -> EditImpact {
     let mut nodes = Vec::new();
-    let mut files = std::collections::HashSet::new();
-    files.insert(path.to_string_lossy().to_string());
+    let mut files = files;
     let mut breaking = Vec::new();
     let Some(pdg) = pdg else {
         return (nodes, files, breaking);
@@ -242,7 +248,7 @@ fn edit_impact(
         let node_id = pdg
             .find_by_symbol(old_name)
             .or_else(|| pdg.find_by_name(old_name))
-            .or_else(|| pdg.find_by_name_in_file(old_name, Some(&path.to_string_lossy())));
+            .or_else(|| pdg.find_by_name_in_file(old_name, None));
         let Some(node_id) = node_id else {
             continue;
         };
@@ -287,71 +293,6 @@ fn edit_region(original: &str, modified: &str) -> String {
         .map(|(index, line)| format!("{}: {}", start + index + 1, line))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// The §4.3 one-line echo: `Applied: path:L802-828 (+27/-0) in fn name`.
-/// The enclosing-function suffix appears only when the PDG can name one.
-fn applied_lines(
-    files: &[edit_batch::BatchFileEdit],
-    pdg: Option<&crate::graph::pdg::ProgramDependenceGraph>,
-) -> Vec<String> {
-    files
-        .iter()
-        .filter(|f| f.modified != f.original)
-        .map(|file| {
-            let mut first_line = usize::MAX;
-            let mut last_line = 0usize;
-            for change in &file.changes {
-                let crate::edit::EditChange::ReplaceText {
-                    start, new_text, ..
-                } = change
-                else {
-                    continue;
-                };
-                let prefix = &file.modified[..(*start).min(file.modified.len())];
-                let line = prefix.matches('\n').count() + 1;
-                let end = (prefix.len() + new_text.len()).min(file.modified.len());
-                let end_line = file.modified[..end].matches('\n').count() + 1;
-                first_line = first_line.min(line);
-                last_line = last_line.max(end_line);
-            }
-            if first_line == usize::MAX {
-                first_line = 1;
-                last_line = 1;
-            }
-            let diff = crate::cli::mcp::output::compute_diff(
-                &file.original,
-                &file.modified,
-                &file.display_path,
-            );
-            let enclosing = pdg.and_then(|graph| {
-                let first_byte = file
-                    .changes
-                    .iter()
-                    .filter_map(|c| match c {
-                        crate::edit::EditChange::ReplaceText { start, .. } => Some(*start),
-                        _ => None,
-                    })
-                    .min()?;
-                graph
-                    .nodes_in_file(&file.canonical_path.to_string_lossy())
-                    .into_iter()
-                    .filter_map(|nid| graph.get_node(nid))
-                    .find(|node| node.byte_range.0 <= first_byte && first_byte < node.byte_range.1)
-                    .map(|node| node.name.clone())
-            });
-            match enclosing {
-                Some(name) => format!(
-                    "Applied: {}:{}-{} (+{}/-{}) in fn {name}",
-                    file.display_path, first_line, last_line, diff.additions, diff.deletions
-                ),
-                None => format!(
-                    "Applied: {}:{}-{} (+{}/-{})",
-                    file.display_path, first_line, last_line, diff.additions, diff.deletions
-                ),
-            }
-        })
-        .collect()
 }
 
 /// Handler for LeIndex [edit_apply — atomic code modifications.
@@ -454,6 +395,18 @@ tree-sitter parse of every edited file after the write."
         let validate_request = edit_validate::resolve_validate_arg(&args)?;
         let had_validate_arg = args.get("validate").is_some();
 
+        // The `tier` argument is declared as an enum in the schema; validate
+        // it explicitly so an unknown value errors instead of silently
+        // downgrading to l1 (region echo skipped) with no signal to the caller.
+        if let Some(tier) = args.get("tier").and_then(Value::as_str)
+            && !tier.eq_ignore_ascii_case("l1")
+            && !tier.eq_ignore_ascii_case("l2")
+        {
+            return Err(JsonRpcError::invalid_params(format!(
+                "tier must be \"l1\" or \"l2\", got: {tier:?}"
+            )));
+        }
+
         let request = apply_request_args(&args)?;
         let project_path_arg = args.get("project_path").and_then(Value::as_str);
         let handle = registry.get_or_create(project_path_arg).await?;
@@ -502,6 +455,13 @@ tree-sitter parse of every edited file after the write."
                         )
                     })?;
                     if entry.preview_token != token {
+                        // The cached preview under this path belongs to a
+                        // different token — discard BOTH lookup entries so
+                        // the stale primary can never be replayed through a
+                        // mismatched token.
+                        GLOBAL_EDIT_CACHE
+                            .clear_with_token_alias(&storage_path, &canonical, &token)
+                            .await;
                         return Err(JsonRpcError::invalid_params(
                             "preview token mismatch — the token does not match the cached \
                              preview for this file. Request a new LeIndex [Edit Preview] \
@@ -524,8 +484,19 @@ tree-sitter parse of every edited file after the write."
                             )
                         })?
                 };
-                // §3.4: re-validate the file is unchanged since preview.
-                if !entry.files_unchanged_since_preview() {
+                // §3.4: re-validate the file is unchanged since preview. The
+                // hash check reads and hashes every touched file — run it on
+                // the blocking pool so the async executor is never parked
+                // behind disk I/O (the cache itself is tokio-based).
+                let entry_for_check = entry.clone();
+                let unchanged = tokio::task::spawn_blocking(move || {
+                    entry_for_check.files_unchanged_since_preview()
+                })
+                .await
+                .map_err(|e| {
+                    JsonRpcError::internal_error(format!("Staleness check task failed: {e}"))
+                })?;
+                if !unchanged {
                     GLOBAL_EDIT_CACHE
                         .clear_with_token_alias(&storage_path, &entry.file_path, &token)
                         .await;
@@ -545,9 +516,12 @@ tree-sitter parse of every edited file after the write."
                     )
                 });
                 if multi_file {
-                    let plan =
-                        edit_batch::resolve_batch_from_changes(&entry.changes, &project_root)
-                            .await?;
+                    let plan = edit_batch::resolve_batch_from_changes(
+                        &entry.changes,
+                        &entry.original_hashes,
+                        &project_root,
+                    )
+                    .await?;
                     Acquired::Batch(plan, Some(token))
                 } else {
                     let canonical = validate_file_within_project(
@@ -651,6 +625,32 @@ tree-sitter parse of every edited file after the write."
                 )
             }
             Acquired::Batch(plan, token) => {
+                // A batch whose every file is already identical needs no write
+                // and must not report the parsed change count as applied.
+                if plan.files.iter().all(|f| f.modified == f.original) {
+                    if let Some(token) = token.as_ref() {
+                        let primary = plan
+                            .files
+                            .first()
+                            .map(|f| f.canonical_path.clone())
+                            .unwrap_or_else(|| std::path::PathBuf::from(""));
+                        GLOBAL_EDIT_CACHE
+                            .clear_with_token_alias(&storage_path, &primary, token)
+                            .await;
+                    }
+                    let noop_path = plan
+                        .files
+                        .first()
+                        .map(|f| f.canonical_path.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let response = serde_json::json!({
+                        "success": true,
+                        "changes_applied": 0,
+                        "file_path": noop_path,
+                        "message": "No changes to apply (content identical)"
+                    });
+                    return Ok(wrap_with_current_meta(&handle, response).await);
+                }
                 let changes_len = plan.change_count();
                 edit_batch::apply_batch_atomic(&plan).await?;
                 if let Some(token) = token.as_ref() {
@@ -680,6 +680,10 @@ tree-sitter parse of every edited file after the write."
         };
         let impact = {
             let guard = handle.read().await;
+            let mut files = std::collections::HashSet::new();
+            for file in &plan.files {
+                files.insert(file.canonical_path.to_string_lossy().to_string());
+            }
             edit_impact(
                 guard.pdg(),
                 &plan
@@ -687,10 +691,7 @@ tree-sitter parse of every edited file after the write."
                     .iter()
                     .flat_map(|f| f.changes.clone())
                     .collect::<Vec<_>>(),
-                plan.files
-                    .first()
-                    .map(|f| f.canonical_path.as_path())
-                    .unwrap_or_else(|| std::path::Path::new("")),
+                files,
             )
         };
 
@@ -801,15 +802,14 @@ tree-sitter parse of every edited file after the write."
         }
 
         // §4.1/§6.9 (lane E): a durable edit invalidates this session's
-        // cached reads for the file and is listed by the session-reads
-        // resource. Fire-and-forget: ledger failures can never fail an edit.
-        let edited_primary = plan
-            .files
-            .first()
-            .map(|f| f.canonical_path.clone())
-            .unwrap_or_default();
-        crate::cli::mcp::read_paths::session_ledger()
-            .record_edit(session_id_for_ledger(&args), &edited_primary);
+        // cached reads for every touched file and lists each of them in the
+        // session-reads resource. Fire-and-forget: ledger failures can never
+        // fail an edit.
+        let session = session_id_for_ledger(&args);
+        for file in plan.files.iter().filter(|f| f.modified != f.original) {
+            crate::cli::mcp::read_paths::session_ledger()
+                .record_edit(session, &file.canonical_path);
+        }
 
         if !pdg_loaded {
             annotate_degraded_pdg(&mut response);

@@ -514,6 +514,86 @@ struct MutationOutput {
     truncated_chars: usize,
 }
 
+/// Read a child's pipe to EOF, keeping at most [`MAX_MUTATION_OUTPUT_BYTES`]
+/// bytes and DISCARDING the rest.
+///
+/// Draining does not stop at the cap: a child whose output exceeds it must
+/// still be able to finish writing, or it blocks on a full pipe forever.
+/// Returns the kept text (lossy UTF-8) and the number of characters in the
+/// discarded tail. The tail is decoded chunk by chunk with a carry for a
+/// multibyte character split across two reads, so the count is exact and the
+/// discarded text is never held in memory.
+async fn drain_capped<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>) -> (String, usize) {
+    use tokio::io::AsyncReadExt;
+    let Some(mut pipe) = pipe else {
+        return (String::new(), 0);
+    };
+    let mut buffer = Vec::new();
+    let mut dropped_chars = 0usize;
+    let mut carry: Vec<u8> = Vec::new();
+    let mut chunk = vec![0u8; 8192];
+    loop {
+        let read = match pipe.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
+        let room = MAX_MUTATION_OUTPUT_BYTES.saturating_sub(buffer.len());
+        let keep = room.min(read);
+        buffer.extend_from_slice(&chunk[..keep]);
+        if keep < read {
+            // Only `[keep..read]` is real data; the rest of `chunk` is stale
+            // bytes from earlier reads and must not be counted.
+            dropped_chars += count_chars_streaming(&mut carry, &chunk[keep..read]);
+        }
+    }
+    // A trailing unfinished sequence is one replacement character in the
+    // text the caller would have seen.
+    dropped_chars += usize::from(!carry.is_empty());
+    let text = String::from_utf8_lossy(&buffer).into_owned();
+    (text, dropped_chars)
+}
+
+/// Count the characters in one piece of a UTF-8 stream, carrying an
+/// unfinished multibyte sequence (up to 3 bytes) into the next call so a
+/// character split across two reads is counted once.
+fn count_chars_streaming(carry: &mut Vec<u8>, piece: &[u8]) -> usize {
+    let mut stream = std::mem::take(carry);
+    stream.extend_from_slice(piece);
+    let mut rest = stream.as_slice();
+    let mut count = 0usize;
+    // Decode the whole piece: `from_utf8` reports only the first error, so a
+    // single call would defer every later invalid byte to the next read and
+    // lose them if the stream ends first. An invalid byte is one replacement
+    // character and is consumed; an unfinished sequence (error_len() ==
+    // None) is the tail, and is carried.
+    while !rest.is_empty() {
+        match std::str::from_utf8(rest) {
+            Ok(text) => {
+                count += text.chars().count();
+                rest = &[];
+            }
+            Err(error) => {
+                let valid = &rest[..error.valid_up_to()];
+                count += std::str::from_utf8(valid).unwrap_or("").chars().count();
+                match error.error_len() {
+                    Some(bad) => {
+                        count += 1;
+                        rest = &rest[error.valid_up_to() + bad..];
+                    }
+                    // Truncated tail: carry exactly the unfinished bytes, not
+                    // everything before the error (those were counted above).
+                    None => {
+                        rest = &rest[error.valid_up_to()..];
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    *carry = rest.to_vec();
+    count
+}
+
 /// Run one mutating git command under the hardened environment.
 ///
 /// stdin is closed so hooks cannot block on input; credential prompts are
@@ -521,7 +601,6 @@ struct MutationOutput {
 /// latch); `GIT_EDITOR=true` keeps `merge --no-edit`-class operations from
 /// opening an editor even where a hook or git path tries.
 async fn run_mutation(root: &Path, argv: &[String]) -> Result<MutationOutput, JsonRpcError> {
-    use tokio::io::AsyncReadExt;
     let mut command = tokio::process::Command::new("git");
     command
         .args(argv)
@@ -539,50 +618,26 @@ async fn run_mutation(root: &Path, argv: &[String]) -> Result<MutationOutput, Js
     let mut child = command
         .spawn()
         .map_err(|error| JsonRpcError::internal_error(format!("failed to spawn git: {error}")))?;
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
 
-    let read_capped = async |pipe: &mut Option<tokio::process::ChildStdout>| {
-        let Some(pipe) = pipe else {
-            return (String::new(), 0usize);
-        };
-        let mut buffer = Vec::new();
-        let mut limited = pipe.take(MAX_MUTATION_OUTPUT_BYTES as u64 + 1);
-        let read = limited.read_to_end(&mut buffer).await.unwrap_or(0);
-        let over = read as usize > MAX_MUTATION_OUTPUT_BYTES;
-        if over {
-            buffer.truncate(MAX_MUTATION_OUTPUT_BYTES);
-        }
-        let text = String::from_utf8_lossy(&buffer).into_owned();
-        let dropped: usize = if over { text.chars().count() } else { 0 };
-        (text, dropped)
-    };
+    // Output collection and process execution share ONE deadline. Reading
+    // one pipe to EOF before touching the other deadlocks when a hook fills
+    // the other pipe: git blocks on the write, the read never sees EOF, and
+    // the timeout below would never be reached. So drain both concurrently,
+    // and keep draining past the capture cap so git can always make progress.
+    let collect = tokio::time::timeout(MUTATION_TIMEOUT, async {
+        let stdout = drain_capped(stdout_pipe);
+        let stderr = drain_capped(stderr_pipe);
+        let (stdout, stderr) = tokio::join!(stdout, stderr);
+        let status = child.wait().await;
+        (stdout, stderr, status)
+    })
+    .await;
 
-    let (stdout, stdout_dropped) = read_capped(&mut stdout_pipe).await;
-    // The closures borrow distinct halves of the tuple; stderr is a different
-    // type (ChildStderr), so a small inline duplicate keeps the generics away.
-    let (stderr, stderr_dropped) = match stderr_pipe.as_mut() {
-        Some(pipe) => {
-            let mut buffer = Vec::new();
-            let mut limited = pipe.take(MAX_MUTATION_OUTPUT_BYTES as u64 + 1);
-            let read = limited.read_to_end(&mut buffer).await.unwrap_or(0);
-            let over = read as usize > MAX_MUTATION_OUTPUT_BYTES;
-            if over {
-                buffer.truncate(MAX_MUTATION_OUTPUT_BYTES);
-            }
-            let text = String::from_utf8_lossy(&buffer).into_owned();
-            let dropped = if over { text.chars().count() } else { 0 };
-            (text, dropped)
-        }
-        None => (String::new(), 0),
-    };
-    let _ = &mut stdout_pipe;
-    let _ = &mut stderr_pipe;
-
-    let status = tokio::time::timeout(MUTATION_TIMEOUT, child.wait()).await;
-    let status = match status {
-        Ok(Ok(status)) => status,
-        Ok(Err(error)) => {
+    let ((stdout, stdout_dropped), (stderr, stderr_dropped), status) = match collect {
+        Ok((stdout, stderr, Ok(status))) => (stdout, stderr, status),
+        Ok((_, _, Err(error))) => {
             return Err(JsonRpcError::internal_error(format!(
                 "git wait failed: {error}"
             )));
@@ -873,6 +928,108 @@ mod test {
         git(dir.path(), &["add", "."]);
         git(dir.path(), &["commit", "-q", "-m", "one"]);
         dir
+    }
+
+    /// A hook that floods stderr well past the OS pipe buffer (64 KiB on
+    /// Linux). Before the fix, `run_mutation` read stdout to EOF first and
+    /// only then stderr, so git blocked on the full stderr pipe, stdout never
+    /// reached EOF, and the call hung until the 300s timeout.
+    #[tokio::test]
+    async fn test_run_mutation_drains_both_pipes_when_a_hook_floods_stderr() {
+        let repo = scratch();
+        let hooks = repo.path().join(".git/hooks");
+        std::fs::write(
+            hooks.join("pre-commit"),
+            "#!/bin/sh\nhead -c 300000 /dev/zero | tr '\\0' 'x' >&2\necho hook-stderr >&2\nexit 0\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            hooks.join("pre-commit"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::write(repo.path().join("f.txt"), "b\n").unwrap();
+        // `git commit` refuses an empty commit (nothing staged), which is
+        // what the hook-flood commit would be without this. Stage through the
+        // executor under test so the setup is itself exercised end-to-end.
+        run_mutation(repo.path(), &["add".to_string(), "f.txt".to_string()])
+            .await
+            .expect("staging the fixture must succeed");
+
+        // Well under MUTATION_TIMEOUT: a regression hangs here, and the
+        // assertion fails the test instead of stalling the suite for 300s.
+        let started = std::time::Instant::now();
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_mutation(
+                repo.path(),
+                &[
+                    "commit".to_string(),
+                    "-q".to_string(),
+                    "-m".to_string(),
+                    "two".to_string(),
+                ],
+            ),
+        )
+        .await
+        .expect("run_mutation must not deadlock on a hook that floods stderr")
+        .expect("commit with a passing hook succeeds");
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        // git routes hook output to ITS stderr, so the marker never reaches
+        // stdout; what the success path proves is that the 300 KB flood was
+        // drained concurrently (no deadlock) and that the overflow past the
+        // per-stream cap was counted rather than lost.
+        assert!(output.stdout.trim().is_empty(), "{}", output.stdout);
+        // 300,000 bytes in, 262,144 kept: the difference is the drop.
+        assert!(
+            output.truncated_chars >= 300_000 - MAX_MUTATION_OUTPUT_BYTES,
+            "stderr past the cap must be reported as dropped, got {}",
+            output.truncated_chars
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drain_capped_keeps_the_cap_and_reports_dropped_characters() {
+        // A 64-byte duplex forces many small reads, so the cap is crossed
+        // mid-stream rather than in one shot.
+        let (mut tx, rx) = tokio::io::duplex(64);
+        let payload: Vec<u8> =
+            std::iter::repeat_n(b'x', MAX_MUTATION_OUTPUT_BYTES + 1000).collect();
+        let write = async move {
+            use tokio::io::AsyncWriteExt;
+            tx.write_all(&payload).await.unwrap();
+            tx.shutdown().await.unwrap();
+        };
+        let ((text, dropped), ()) = tokio::join!(drain_capped(Some(rx)), write);
+        assert_eq!(text.len(), MAX_MUTATION_OUTPUT_BYTES, "kept text is capped");
+        assert_eq!(
+            dropped, 1000,
+            "exactly the characters past the cap are counted"
+        );
+    }
+
+    #[test]
+    fn test_count_chars_streaming_is_exact_for_multibyte_split_across_reads() {
+        // 2-byte characters ("é" is U+00E9 = 0xC3 0xA9), so a split can land
+        // in the middle of one.
+        let bytes = "éééééééééé".as_bytes();
+        for cut in 1..bytes.len() {
+            let (a, b) = bytes.split_at(cut);
+            let mut carry = Vec::new();
+            let counted = count_chars_streaming(&mut carry, a)
+                + count_chars_streaming(&mut carry, b)
+                + usize::from(!carry.is_empty());
+            assert_eq!(
+                counted, 10,
+                "split at byte {cut} must still count 10 characters"
+            );
+        }
+        // An invalid byte is one replacement character and is consumed, so
+        // the following valid byte is counted on its own.
+        let mut carry = Vec::new();
+        assert_eq!(count_chars_streaming(&mut carry, &[0xFF, b'a']), 2);
+        assert!(carry.is_empty());
     }
 
     #[test]

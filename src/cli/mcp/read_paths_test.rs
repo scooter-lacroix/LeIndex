@@ -418,3 +418,79 @@ fn test_session_reads_resource_empty_state() {
     let body = render_session_reads(&[], &[]);
     assert!(body.contains("no recorded reads or edits"), "{body}");
 }
+
+#[test]
+fn test_consult_does_not_report_unchanged_when_a_range_remains_unserved() {
+    // Regression: `covering` could be set by one recorded read while a later
+    // read left part of the request in `unseen`. The verdict then took the
+    // `Unchanged` branch and silently dropped the unserved tail.
+    let ledger = SessionLedger::new(8, 64);
+    let path = Path::new("/proj/src/lib.rs");
+    // Read 1 serves only line 2; read 2 serves only line 1.
+    ledger.record("s1", path, "hash-a", 2, 2);
+    ledger.record("s1", path, "hash-a", 1, 1);
+    // Lines 3..=4 were never served by either read.
+    let verdict = ledger.consult("s1", path, "hash-a", 1, 4);
+    assert_ne!(
+        verdict,
+        ConsultVerdict::Unchanged {
+            since_ordinal: 1,
+            start_line: 1,
+            end_line: 4
+        },
+        "reported Unchanged while lines 3-4 were never served"
+    );
+    match verdict {
+        ConsultVerdict::PartialOverlap { unseen, .. } => assert_eq!(unseen, vec![(3, 4)]),
+        other => panic!("expected PartialOverlap naming the unserved range, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_find_span_does_not_match_an_unrelated_name_with_the_same_suffix() {
+    // Regression (#119): the fallback used a bare `ends_with`, so a request for
+    // `build` matched a file's only `rebuild`, and `test` matched `greatest`.
+    let rebuild = SymbolSpan {
+        name: "rebuild".into(),
+        start_byte: 0,
+        end_byte: 10,
+        start_line: 1,
+        end_line: 5,
+    };
+    assert_eq!(
+        find_span(std::slice::from_ref(&rebuild), "build"),
+        None,
+        "must not return `rebuild` for a request of `build`"
+    );
+
+    let greatest = SymbolSpan {
+        name: "greatest".into(),
+        start_byte: 0,
+        end_byte: 10,
+        start_line: 1,
+        end_line: 5,
+    };
+    assert_eq!(
+        find_span(std::slice::from_ref(&greatest), "test"),
+        None,
+        "must not return `greatest` for a request of `test`"
+    );
+}
+
+#[test]
+fn test_ledger_file_records_per_session_are_bounded() {
+    // Regression (#28): `SessionState::files` had no bound, so a session that
+    // read many distinct files grew the map without limit — contradicting the
+    // struct doc ("No structure here grows with the number of tool calls").
+    let ledger = SessionLedger::new(8, 64);
+    for i in 0..10_000 {
+        let path = PathBuf::from(format!("/proj/src/file_{i}.rs"));
+        ledger.record("s1", &path, "h", 1, 2);
+    }
+    let (files, _) = ledger.summarize_session("s1");
+    assert!(
+        files.len() <= SessionLedger::MAX_FILES_PER_SESSION,
+        "file records grew to {} — must be bounded",
+        files.len()
+    );
+}

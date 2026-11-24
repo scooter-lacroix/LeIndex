@@ -309,8 +309,12 @@ impl EditCache {
 
     /// Store a preview under its file path AND a token alias so
     /// `apply` can resolve `preview_token` alone (§3.4 advertised
-    /// path). The alias write is best-effort: the path-keyed entry is
-    /// the primary record.
+    /// path). The alias key is scoped to `project_storage` so a token
+    /// can never resolve a preview belonging to a different project,
+    /// and the alias shares the primary entry's payload — its bytes are
+    /// NOT counted twice in the hot-cache budget (the payload is the same).
+    /// An alias storage failure propagates; the primary entry is durable
+    /// regardless.
     pub async fn set_with_token_alias(
         &self,
         project_storage: &Path,
@@ -318,39 +322,96 @@ impl EditCache {
     ) -> Result<Result<(), EntryTooLargeError>, JsonRpcError> {
         let primary = self.set(project_storage, entry.clone()).await?;
         let alias = EditCacheEntry {
-            file_path: token_alias_path(&entry.preview_token),
+            file_path: token_alias_path(project_storage, &entry.preview_token),
             ..entry
         };
-        let _ = self.set(project_storage, alias).await;
+        self.set_alias(project_storage, alias).await?;
         Ok(primary)
     }
 
-    /// Resolve a preview by its token alone (no file_path needed).
+    /// Store a token-alias entry without charging its bytes against the
+    /// hot-cache budget (the primary entry already paid for this payload).
+    async fn set_alias(
+        &self,
+        project_storage: &Path,
+        entry: EditCacheEntry,
+    ) -> Result<(), JsonRpcError> {
+        let entry_size = entry.estimated_size();
+        if entry_size > EDIT_CACHE_MAX_ENTRY_BYTES {
+            return Ok(());
+        }
+
+        let (abs_path, cache_file) = self
+            .get_abs_path_and_cache_file(project_storage, &entry.file_path)
+            .await;
+
+        let cache_dir = cache_file.parent().unwrap();
+        if tokio::fs::metadata(cache_dir).await.is_err() {
+            tokio::fs::create_dir_all(cache_dir).await.map_err(|e| {
+                JsonRpcError::internal_error(format!("Failed to create edit cache directory: {e}"))
+            })?;
+        }
+        let json = serde_json::to_string_pretty(&entry).map_err(|e| {
+            JsonRpcError::internal_error(format!("Failed to serialize edit cache: {e}"))
+        })?;
+        tokio::fs::write(&cache_file, json).await.map_err(|e| {
+            JsonRpcError::internal_error(format!("Failed to write edit cache to disk: {e}"))
+        })?;
+
+        {
+            let mut guard = self.entries.lock().await;
+            let (ref mut entries, ref mut total_bytes) = *guard;
+            // A stale alias for the same token (e.g. stored before this
+            // change) may still hold budget bytes — release them, then
+            // insert without re-charging.
+            if let Some(existing) = entries.pop(&abs_path) {
+                *total_bytes = total_bytes.saturating_sub(existing.estimated_size());
+            }
+            entries.put(abs_path, entry);
+        }
+        Ok(())
+    }
+
+    /// Resolve a preview by its token alone (no file_path needed). The
+    /// alias key is scoped to `project_storage` — a token can never
+    /// resolve a preview cached under a different project.
     pub async fn get_by_token(
         &self,
         project_storage: &Path,
         token: &str,
     ) -> Option<EditCacheEntry> {
-        self.get(project_storage, &token_alias_path(token)).await
+        self.get(project_storage, &token_alias_path(project_storage, token))
+            .await
     }
 
-    /// Clear both the file-path entry and the token alias after an apply.
+    /// Clear both the file-path entry and the token alias after an apply —
+    /// but ONLY when the cached entry under `file_path` still belongs to
+    /// `token`. A newer preview for the same file (different token) must
+    /// not be destroyed by the apply of an older one.
     pub async fn clear_with_token_alias(
         &self,
         project_storage: &Path,
         file_path: &Path,
         token: &str,
     ) {
+        if let Some(existing) = self.get(project_storage, file_path).await
+            && existing.preview_token != token
+        {
+            return;
+        }
         self.clear(project_storage, file_path).await;
-        self.clear(project_storage, &token_alias_path(token)).await;
+        self.clear(project_storage, &token_alias_path(project_storage, token))
+            .await;
     }
 }
 
-/// Synthetic cache key for a token alias. Never collides with a real
-/// file path (real paths cannot contain the NUL-free `__token__:`
-/// prefix in normal use, and the value is hashed for cold storage).
-fn token_alias_path(token: &str) -> PathBuf {
-    PathBuf::from(format!("__token__:{token}"))
+/// Synthetic cache key for a token alias, scoped to the project storage so
+/// the same token can never collide across projects. Real paths cannot
+/// contain the NUL-free `__token__:` prefix in normal use, and the value is
+/// hashed for cold storage.
+fn token_alias_path(project_storage: &Path, token: &str) -> PathBuf {
+    let storage_fp = blake3::hash(project_storage.to_string_lossy().as_bytes()).to_hex();
+    PathBuf::from(format!("__token__:{storage_fp}:{token}"))
 }
 
 /// Global singleton for edit caching.
@@ -537,5 +598,92 @@ mod tests {
             resolved.real_file_path().display()
         );
         assert_eq!(resolved.original_text, "fn aliased() {}\n");
+    }
+
+    /// §3.4: the token alias is scoped to its project storage — the same
+    /// token under a different storage must NOT resolve the preview.
+    #[tokio::test]
+    async fn test_token_alias_is_scoped_to_project_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage_a = dir.path().join(".leindex-a");
+        let storage_b = dir.path().join(".leindex-b");
+        let file = dir.path().join("aliased.rs");
+        std::fs::write(&file, "fn aliased() {}\n").unwrap();
+        let cache = EditCache::new();
+        let entry = EditCacheEntry::single_file(
+            file,
+            "tok-scoped-1".to_string(),
+            "fn aliased() {}\n".to_string(),
+            "fn renamed() {}\n".to_string(),
+            vec![],
+        );
+        cache
+            .set_with_token_alias(&storage_a, entry)
+            .await
+            .expect("no IO error")
+            .expect("within size limit");
+
+        assert!(
+            cache
+                .get_by_token(&storage_a, "tok-scoped-1")
+                .await
+                .is_some(),
+            "token must resolve within its own storage"
+        );
+        assert!(
+            cache
+                .get_by_token(&storage_b, "tok-scoped-1")
+                .await
+                .is_none(),
+            "same token must NOT resolve from a different storage"
+        );
+    }
+
+    /// §3.4: clear_with_token_alias must NOT destroy a newer preview under
+    /// the same file when its token differs.
+    #[tokio::test]
+    async fn test_clear_with_token_alias_keeps_newer_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join(".leindex");
+        let file = dir.path().join("aliased.rs");
+        std::fs::write(&file, "fn aliased() {}\n").unwrap();
+        let cache = EditCache::new();
+
+        let newer = EditCacheEntry::single_file(
+            file.clone(),
+            "tok-newer".to_string(),
+            "fn aliased() {}\n".to_string(),
+            "fn newer_edit() {}\n".to_string(),
+            vec![],
+        );
+        cache
+            .set_with_token_alias(&storage, newer)
+            .await
+            .expect("no IO error")
+            .expect("within size limit");
+
+        // Applying an OLDER token (already not in the cache) must not
+        // clear the newer preview.
+        cache
+            .clear_with_token_alias(&storage, &file, "tok-older")
+            .await;
+        let after = cache.get(&storage, &file).await;
+        assert!(
+            after.is_some() && after.unwrap().preview_token == "tok-newer",
+            "newer preview must survive a different token's clear"
+        );
+
+        // But the owning token's clear removes both the primary and alias.
+        cache
+            .clear_with_token_alias(&storage, &file, "tok-newer")
+            .await;
+        assert!(
+            cache.get(&storage, &file).await.is_none(),
+            "primary must clear"
+        );
+        assert!(
+            cache.get_by_token(&storage, "tok-newer").await.is_none(),
+            "alias must clear"
+        );
     }
 }

@@ -211,8 +211,9 @@ fn test_trim_edit_keeps_structured_diff() {
     assert_eq!(t["affected_symbols"][0], "main");
     // diff_text is now preserved so the LLM can see the unified diff
     assert!(t.get("diff_text").is_some());
-    // validation subtree is dropped (internal detail)
-    assert!(t.get("validation").is_none());
+    // §3.6: the validation artifact survives trimming (lane E — the model
+    // needs it to judge whether the edit is safe to apply).
+    assert_eq!(t["validation"]["x"], 1);
 }
 
 #[test]
@@ -393,7 +394,9 @@ fn test_trim_llm_payload_dispatches() {
     let out = trim_llm_payload("leindex.edit_preview", &edit_data);
     assert!(out.get("diff").is_some());
     assert!(out.get("diff_text").is_some());
-    assert!(out.get("validation").is_none());
+    // §3.6: the validation artifact survives trimming — the model needs it
+    // to judge whether the previewed edit is safe to apply.
+    assert_eq!(out["validation"], serde_json::json!({}));
 
     // Unknown tool passes through unchanged
     let raw = v(r#"{"any": "value", "x": 1}"#);
@@ -1205,4 +1208,29 @@ fn test_trim_git_status_preserves_the_pdg_status_the_handlers_emit() {
     let t = trim_git_status(&failed);
     assert_eq!(t["pdg_status"], "failed");
     assert_eq!(t["pdg_error"], "no nodes");
+}
+
+/// Regression (lane E): `trim_edit` must keep the validation artifact —
+/// `validation` plus the syntax/check surfaces — so the LLM can judge
+/// whether a previewed edit is safe before applying it.
+#[test]
+fn test_trim_edit_keeps_validation_artifact() {
+    let input = v(r#"{
+            "preview_token": "tok1",
+            "diff": {"file_path": "src/foo.rs"},
+            "validation": {
+                "is_valid": false,
+                "syntax_errors": [{"line": 3, "message": "expected `;`"}]
+            },
+            "syntax": "ok",
+            "check": "passed"
+        }"#);
+    let t = trim_edit(&input);
+    assert_eq!(t["validation"]["is_valid"], false);
+    assert_eq!(
+        t["validation"]["syntax_errors"][0]["message"],
+        "expected `;`"
+    );
+    assert_eq!(t["syntax"], "ok");
+    assert_eq!(t["check"], "passed");
 }

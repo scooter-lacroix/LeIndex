@@ -870,6 +870,11 @@ fn trim_edit(data: &Value) -> Value {
         "breaking_changes",
         // §3.6 real-signal risk object (absent entirely for low risk)
         "risk",
+        // §3.6 validation artifact — syntax + semantic check outcomes the
+        // model needs to judge whether the edit is safe to apply.
+        "validation",
+        "syntax",
+        "check",
         // apply-shaped
         "success",
         "changes_applied",

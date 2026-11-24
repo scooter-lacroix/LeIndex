@@ -139,8 +139,16 @@ fn names_target(candidate: &str, query: &UsageQuery) -> bool {
         match &full {
             Some(full) => {
                 let full_seg: Vec<&str> = full.iter().map(String::as_str).collect();
-                (segments == full_seg[..] || full_seg.ends_with(&segments[..]))
-                    && segments.len() <= full.len()
+                // Whole segments in either qualification direction. The query
+                // may be MORE qualified than the source (`colors::Shade::Dark`
+                // must match a bare `Shade::Dark` site), so the candidate
+                // must be a complete suffix of the query; or the query may be
+                // LESS qualified than the source (`Shade::Dark` must match
+                // `crate::colors::Shade::Dark`), so the query must be a
+                // complete suffix of the candidate. Either way every segment
+                // the two paths share must agree, so `other::Shade::Dark` is
+                // still rejected for a `colors::Shade::Dark` query.
+                full_seg.ends_with(&segments[..]) || segments.ends_with(&full_seg[..])
             }
             None => true,
         }
@@ -168,8 +176,8 @@ fn enclosing_fns(
             && let Ok(name) = name_node.utf8_text(text.as_bytes())
         {
             table.push((node.start_byte(), node.end_byte(), name.to_string()));
-            // Nested functions are separate entries; do not descend.
-            continue;
+            // Keep descending: a nested function is its own entry, and
+            // `enclosing_fn_at` picks the innermost match (largest start).
         }
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {

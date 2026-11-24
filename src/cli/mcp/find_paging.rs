@@ -35,8 +35,12 @@ struct Store {
 struct Entry {
     tool: &'static str,
     args: Value,
-    /// Per-file resume cursors the token replays (`Null` when none).
-    cursors: Value,
+    /// Per-file resume cursors keyed by the token's `next_offset`: a page
+    /// issues several tokens for the same query (one per offset), and each
+    /// token must replay the cursor state that was current when IT was
+    /// issued — a later page for the same query must not overwrite the
+    /// cursors an earlier token still needs.
+    cursors: HashMap<usize, Value>,
     at: Instant,
 }
 
@@ -71,10 +75,15 @@ fn empty_store() -> Store {
 /// query hash must not churn with it.
 const PAGING_KEYS: &[&str] = &["offset", "next_offset", "next", "resume_cursors"];
 
-fn hash_args(args: &Value) -> u64 {
+fn hash_args(tool: &str, args: &Value) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
+    // The tool is part of the identity: the same query arguments issued by
+    // two different tools must occupy separate store entries, or one tool's
+    // token could resolve into the other tool's entry (and be rejected as
+    // wrong-tool — or, worse, overwrite the other tool's live continuation).
     let mut hasher = DefaultHasher::new();
+    tool.hash(&mut hasher);
     args.to_string().hash(&mut hasher);
     hasher.finish()
 }
@@ -126,7 +135,7 @@ fn issue_in(
     if stored.is_null() {
         return String::new();
     }
-    let hash = hash_args(&stored);
+    let hash = hash_args(tool, &stored);
     let Ok(mut guard) = store.lock() else {
         return String::new();
     };
@@ -144,12 +153,18 @@ fn issue_in(
         let recent = guard.order.remove(position);
         guard.order.push(recent);
     }
+    let mut cursors_by_offset = guard
+        .entries
+        .get(&hash)
+        .map(|entry| entry.cursors.clone())
+        .unwrap_or_default();
+    cursors_by_offset.insert(next_offset, cursors.clone());
     guard.entries.insert(
         hash,
         Entry {
             tool,
             args: stored,
-            cursors: cursors.clone(),
+            cursors: cursors_by_offset,
             at: Instant::now(),
         },
     );
@@ -207,27 +222,34 @@ fn resume_in(
     }
     if entry.at.elapsed() > STORE_TTL {
         guard.entries.remove(&hash);
+        // The eviction order must not keep a dead slot: a later reissue of
+        // the same query would push a fresh hash onto `order` again, and if
+        // the stale slot were still there, churn could evict the fresh entry
+        // through it.
+        if let Some(position) = guard.order.iter().position(|known| *known == hash) {
+            guard.order.remove(position);
+        }
         return Err("next token expired; re-send the query".to_string());
     }
+    let cursors = entry.cursors.get(&offset).cloned().unwrap_or(Value::Null);
     Ok(Continuation {
         args: entry.args.clone(),
         offset,
-        cursors: entry.cursors.clone(),
+        cursors,
     })
 }
 
 /// Merge a resumed continuation with the caller's arguments: the stored
-/// query wins; the caller's `project_path` (and any other keys they
-/// explicitly sent) overlay it; the position and the per-file resume
-/// cursors come from the token.
+/// query wins exactly as issued — only `project_path` (and the token-owned
+/// position/cursors) may overlay it, so a caller cannot silently change the
+/// result stream a token was issued for. Any other key the caller re-sends
+/// is ignored: the token is the authority on the query.
 pub fn merge(stored: &Value, caller: &Value, offset: usize, cursors: &Value) -> Value {
     let mut merged = stored.clone();
-    if let (Some(base), Some(over)) = (merged.as_object_mut(), caller.as_object()) {
-        for (key, value) in over {
-            if key != "offset" && key != "next" && key != "resume_cursors" {
-                base.insert(key.clone(), value.clone());
-            }
-        }
+    if let (Some(base), Some(over)) = (merged.as_object_mut(), caller.as_object())
+        && let Some(path) = over.get("project_path")
+    {
+        base.insert("project_path".to_string(), path.clone());
     }
     if let Some(base) = merged.as_object_mut() {
         base.insert("offset".to_string(), json!(offset));
@@ -378,6 +400,115 @@ mod tests {
         assert!(
             resume_in(&refreshed_store, "leindex_find", &token).is_ok(),
             "the refreshed entry moved to the back, so a full cap of later insertions cannot evict it"
+        );
+    }
+
+    /// #003: the same query arguments issued by two different tools must not
+    /// share a store entry — each tool's token resolves only into its own
+    /// continuation, and issuing one tool's token never corrupts the other's.
+    #[test]
+    fn test_same_query_arguments_stay_separate_across_tools() {
+        let args = json!({ "pattern": "needle", "per_file_cap": 20 });
+        let find_token = issue("leindex_find", &args, 10);
+        let search_token = issue("leindex_search", &args, 10);
+        assert_ne!(
+            find_token, search_token,
+            "different tools must get different token hashes for the same query"
+        );
+        let resumed = resume("leindex_find", &find_token).expect("find token resumes");
+        assert_eq!(resumed.args["pattern"], "needle");
+        assert!(resume("leindex_search", &find_token).is_err());
+        assert!(resume("leindex_search", &search_token).is_ok());
+        assert!(resume("leindex_find", &find_token).is_ok());
+    }
+
+    /// #002: cursor state is bound to the token that was issued, not to the
+    /// query entry. A later page for the same query must not change what an
+    /// earlier token replays.
+    #[test]
+    fn test_cursor_state_is_bound_to_the_issued_token() {
+        let args = json!({ "pattern": "needle" });
+        let cursors_a = json!({ "0:src/a.rs": 20 });
+        let token_a = issue_with_cursors("leindex_find", &args, 10, &cursors_a);
+        let cursors_b = json!({ "0:src/a.rs": 40, "0:src/b.rs": 5 });
+        let _token_b = issue_with_cursors("leindex_find", &args, 20, &cursors_b);
+        let resumed = resume("leindex_find", &token_a).expect("first token still resumes");
+        assert_eq!(
+            resumed.cursors, cursors_a,
+            "the first token replays the cursor state it was issued with"
+        );
+    }
+
+    /// #001: a caller cannot override the stored query when resuming — only
+    /// `project_path` may change; anything else would silently alter the
+    /// result stream the token was issued for.
+    #[test]
+    fn test_resume_rejects_overrides_that_change_the_query_stream() {
+        let stored = json!({ "pattern": "needle", "case": "smart" });
+        let caller = json!({
+            "project_path": "/elsewhere",
+            "pattern": "OTHER",
+            "case": "sensitive",
+        });
+        let merged = merge(&stored, &caller, 25, &Value::Null);
+        assert_eq!(
+            merged["pattern"], "needle",
+            "a resume must not change the query"
+        );
+        assert_eq!(merged["case"], "smart");
+        assert_eq!(merged["project_path"], "/elsewhere");
+        assert_eq!(merged["offset"], 25);
+    }
+
+    /// #096: expiry removes BOTH the entry and its eviction-order slot, so a
+    /// reissued query cannot leave a duplicate slot that later churn evicts
+    /// the fresh entry through.
+    #[test]
+    fn test_expired_entry_is_removed_from_the_eviction_order() {
+        let args = json!({ "pattern": "hot-query" });
+        let store = Mutex::new(empty_store());
+        let token = issue_in(&store, "leindex_find", &args, 10, &Value::Null);
+        let hash_part = token.split('.').next().unwrap();
+        let hash = u64::from_str_radix(hash_part, 16).unwrap();
+        {
+            let mut guard = store.lock().unwrap();
+            if let Some(entry) = guard.entries.get_mut(&hash) {
+                entry.at = Instant::now() - STORE_TTL - Duration::from_secs(1);
+            }
+        }
+        assert!(
+            resume_in(&store, "leindex_find", &token).is_err(),
+            "the aged token expires"
+        );
+        {
+            let guard = store.lock().unwrap();
+            assert!(!guard.entries.contains_key(&hash), "expired entry removed");
+            assert!(
+                !guard.order.contains(&hash),
+                "no stale eviction slot remains"
+            );
+        }
+        let fresh = issue_in(&store, "leindex_find", &args, 10, &Value::Null);
+        {
+            let guard = store.lock().unwrap();
+            assert_eq!(
+                guard.order.iter().filter(|known| **known == hash).count(),
+                1,
+                "reissuing after expiry must not duplicate the eviction slot"
+            );
+        }
+        for index in 0..STORE_CAP - 1 {
+            issue_in(
+                &store,
+                "leindex_find",
+                &json!({ "pattern": format!("filler-{index}") }),
+                10,
+                &Value::Null,
+            );
+        }
+        assert!(
+            resume_in(&store, "leindex_find", &fresh).is_ok(),
+            "the fresh entry survives churn"
         );
     }
 }
