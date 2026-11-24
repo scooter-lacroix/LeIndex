@@ -304,44 +304,60 @@ pub struct LogScrubber;
 impl LogScrubber {
     /// Redacts known sensitive patterns from a log message.
     ///
-    /// Patterns redacted:
+    /// Patterns redacted, at EVERY occurrence in the message:
     /// - Bearer tokens: `Bearer xxx` -> `Bearer [REDACTED]`
     /// - API keys: `key=xxx` or `api_key=xxx` -> `key=[REDACTED]`
     /// - Auth tokens: `token=xxx` or `auth_token=xxx` -> `token=[REDACTED]`
     /// - Passwords: `password=xxx` -> `password=[REDACTED]`
     /// - Connection strings: `://user:pass@` -> `://[REDACTED]:[REDACTED]@`
     /// - Long hex/base64 strings in auth contexts
+    ///
+    /// A value runs to the next whitespace, `&`, or quote, or to the end of
+    /// the message. Both call sites (the command sandbox and the Git mutation
+    /// failure path) rely on one pass redacting a whole line, so a line with
+    /// several secrets must come out fully scrubbed.
     pub fn redact(input: &str) -> String {
         let mut result = input.to_string();
 
-        // Redact Bearer tokens
-        if let Some(pos) = result.find("Bearer ") {
-            let start = pos + 7;
-            if let Some(end) = result[start..].find(' ') {
-                result.replace_range(start..start + end, "[REDACTED]");
-            } else {
-                result.truncate(start);
-                result.push_str("[REDACTED]");
+        // Redact every Bearer token. Each replacement contains no `Bearer `,
+        // so searching again from the end of the marker finds only later ones.
+        let mut from = 0;
+        while let Some(pos) = result[from..].find("Bearer ") {
+            let start = from + pos + 7;
+            let end = result[start..]
+                .find(char::is_whitespace)
+                .map(|e| start + e)
+                .unwrap_or(result.len());
+            if end > start {
+                result.replace_range(start..end, "[REDACTED]");
+            }
+            from = start + "[REDACTED]".len();
+            if from >= result.len() {
+                break;
             }
         }
 
-        // Redact key=value patterns for sensitive keys
+        // Redact key=value patterns for sensitive keys, every occurrence.
+        // Longer keys come first: `auth_token=` contains `token=`, and the
+        // shorter pattern would otherwise consume the tail of the longer one.
         for pattern in [
-            "api_key=",
-            "apikey=",
-            "API_KEY=",
-            "token=",
             "auth_token=",
             "AUTH_TOKEN=",
+            "TURSO_AUTH=",
+            "api_key=",
+            "API_KEY=",
+            "apikey=",
             "password=",
             "PASSWORD=",
             "passwd=",
             "secret=",
             "SECRET=",
-            "TURSO_AUTH=",
+            "token=",
+            "key=",
         ] {
-            if let Some(pos) = result.find(pattern) {
-                let start = pos + pattern.len();
+            let mut from = 0;
+            while let Some(pos) = result[from..].find(pattern) {
+                let start = from + pos + pattern.len();
                 let end = result[start..]
                     .find(|c: char| c.is_whitespace() || c == '&' || c == '"' || c == '\'')
                     .map(|e| start + e)
@@ -349,19 +365,36 @@ impl LogScrubber {
                 if end > start {
                     result.replace_range(start..end, "[REDACTED]");
                 }
+                from = start + "[REDACTED]".len();
+                if from >= result.len() {
+                    break;
+                }
             }
         }
 
-        // Redact credentials in URLs: scheme://user:pass@host
-        if let Some(at_pos) = result.find("://") {
-            let after_scheme = at_pos + 3;
-            if let Some(at_sign) = result[after_scheme..].find('@') {
-                let cred_start = after_scheme;
-                let cred_end = after_scheme + at_sign;
-                // Check there's a colon (user:pass) between scheme:// and @
-                if result[cred_start..cred_end].contains(':') {
-                    result.replace_range(cred_start..cred_end, "[REDACTED]:[REDACTED]");
-                }
+        // Redact credentials in URLs: scheme://user:pass@host, every URL.
+        // An `@` only ends credentials when it belongs to the same URL, so the
+        // search stops at the first whitespace; otherwise a bare URL followed
+        // by a credentialed one would have its host mistaken for credentials.
+        let mut from = 0;
+        while let Some(at_pos) = result[from..].find("://") {
+            let after_scheme = from + at_pos + 3;
+            let url_end = result[after_scheme..]
+                .find(char::is_whitespace)
+                .map(|e| after_scheme + e)
+                .unwrap_or(result.len());
+            let Some(at_sign) = result[after_scheme..url_end].find('@') else {
+                from = url_end;
+                continue;
+            };
+            let cred_end = after_scheme + at_sign;
+            // Only `user:pass` is a credential; `scheme://host/path@x` is not.
+            if result[after_scheme..cred_end].contains(':') {
+                result.replace_range(after_scheme..cred_end, "[REDACTED]:[REDACTED]");
+            }
+            from = (after_scheme + "[REDACTED]:[REDACTED]".len()).min(result.len());
+            if from >= result.len() {
+                break;
             }
         }
 
@@ -698,6 +731,59 @@ mod test {
         let result = LogScrubber::redact(input);
         assert!(result.contains("[REDACTED]"));
         assert!(!result.contains("eyJhbGciOi"));
+    }
+
+    #[test]
+    fn test_log_scrubber_redacts_every_occurrence_of_each_pattern() {
+        // A line with several secrets of the same kind must be fully scrubbed
+        // in one pass: both call sites scrub a whole line at once.
+        let input = "Bearer aaa Bearer bbb\ntoken=x token=y\npassword=p1 password=p2";
+        let result = LogScrubber::redact(input);
+        for secret in ["aaa", "bbb", "x", "y", "p1", "p2"] {
+            assert!(
+                !result.contains(&format!(" {secret}")) && !result.contains(&format!("{secret}\n")),
+                "secret {secret:?} survived: {result}"
+            );
+        }
+        assert_eq!(result.matches("[REDACTED]").count(), 6, "{result}");
+    }
+
+    #[test]
+    fn test_log_scrubber_redacts_bare_key() {
+        // The documented contract lists `key=xxx` alongside `api_key=xxx`.
+        let result = LogScrubber::redact("key=one key=two");
+        assert_eq!(result, "key=[REDACTED] key=[REDACTED]");
+    }
+
+    #[test]
+    fn test_log_scrubber_longer_key_wins_over_its_suffix() {
+        // `auth_token=` ends with `token=`. Matching the short pattern first
+        // would leave `auth_` in front of the marker; the key must survive intact.
+        let result = LogScrubber::redact("auth_token=abc token=def");
+        assert_eq!(result, "auth_token=[REDACTED] token=[REDACTED]");
+        assert!(!result.contains("abc"));
+        assert!(!result.contains("def"));
+    }
+
+    #[test]
+    fn test_log_scrubber_redacts_every_url_with_credentials() {
+        let input = "see https://example.com/a then https://admin:pw@db/x and https://u:p@h2/y";
+        let result = LogScrubber::redact(input);
+        assert!(result.contains("https://example.com/a"), "{result}");
+        assert!(!result.contains("admin"));
+        assert!(!result.contains(":pw@"));
+        assert!(!result.contains("u:p@"));
+        assert_eq!(
+            result.matches("[REDACTED]:[REDACTED]").count(),
+            2,
+            "{result}"
+        );
+    }
+
+    #[test]
+    fn test_log_scrubber_bearer_at_end_of_line_is_redacted() {
+        let result = LogScrubber::redact("first Bearer tail\nnext line");
+        assert_eq!(result, "first Bearer [REDACTED]\nnext line");
     }
 
     #[test]
