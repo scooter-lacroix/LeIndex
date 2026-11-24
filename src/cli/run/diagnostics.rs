@@ -165,7 +165,7 @@ fn find_scope(project_root: &Path, file: &Path) -> Result<Scope> {
                 return Ok(Scope::Cargo {
                     package: name.to_string(),
                     dir: current.clone(),
-                    workspace_root: cargo_workspace_root(&current),
+                    workspace_root: cargo_workspace_root(&current, project_root),
                 });
             }
         }
@@ -192,12 +192,12 @@ fn find_scope(project_root: &Path, file: &Path) -> Result<Scope> {
 /// `[workspace]` table inside the package itself (`members = []` or not
 /// listing itself) therefore makes the package its own root — which is why
 /// a stand-alone member prints `src/lib.rs` while a workspace member prints
-/// `member/src/lib.rs`. Stops at `project_root` so a stray parent manifest
-/// outside the project can never become the base.
+/// `member/src/lib.rs`. Stops at `project_root` (inclusive) so a stray
+/// parent manifest outside the project can never become the base.
 ///
 /// Everything is decided from the manifest text, not `cargo metadata`, so
 /// no second Cargo process is spawned for every scoped check.
-fn cargo_workspace_root(member_dir: &Path) -> PathBuf {
+fn cargo_workspace_root(member_dir: &Path, project_root: &Path) -> PathBuf {
     /// Does Cargo member pattern `pattern` list the project-relative path
     /// `rel`? Cargo accepts a literal path, `dir/*` (one level) and
     /// `dir/**` (any depth); the latter two are matched here without a glob
@@ -252,9 +252,14 @@ fn cargo_workspace_root(member_dir: &Path) -> PathBuf {
                 return dir;
             }
         }
+        // Never look above the project: a `[workspace]` in a stray parent
+        // manifest must not become the base for paths inside this project.
+        if dir == project_root {
+            break;
+        }
         current = dir.parent().map(Path::to_path_buf);
     }
-    // No workspace claims the package anywhere above it: Cargo still runs
+    // No workspace claims the package within the project: Cargo still runs
     // it as its own root, so its directory is the base.
     member_dir.to_path_buf()
 }

@@ -362,10 +362,18 @@ impl LogScrubber {
                     .find(|c: char| c.is_whitespace() || c == '&' || c == '"' || c == '\'')
                     .map(|e| start + e)
                     .unwrap_or(result.len());
+                // Advance only across text that actually changed (or across
+                // the ASCII pattern we just consumed, a known boundary). The
+                // old code jumped by the replacement marker's length even
+                // when nothing was replaced (empty value), which can land in
+                // the middle of a following multi-byte character and make
+                // the next `result[from..]` panic.
                 if end > start {
                     result.replace_range(start..end, "[REDACTED]");
+                    from = start + "[REDACTED]".len();
+                } else {
+                    from = start;
                 }
-                from = start + "[REDACTED]".len();
                 if from >= result.len() {
                     break;
                 }
@@ -389,10 +397,16 @@ impl LogScrubber {
             };
             let cred_end = after_scheme + at_sign;
             // Only `user:pass` is a credential; `scheme://host/path@x` is not.
+            // Advance across the replacement when one happened, otherwise
+            // past the `@` — never by an unrelated literal length, which
+            // could land inside a multi-byte character that follows.
             if result[after_scheme..cred_end].contains(':') {
                 result.replace_range(after_scheme..cred_end, "[REDACTED]:[REDACTED]");
+                from = after_scheme + "[REDACTED]:[REDACTED]".len();
+            } else {
+                // `@` is one byte; `cred_end` is its offset in the string.
+                from = cred_end + 1;
             }
-            from = (after_scheme + "[REDACTED]:[REDACTED]".len()).min(result.len());
             if from >= result.len() {
                 break;
             }
@@ -746,6 +760,37 @@ mod test {
             );
         }
         assert_eq!(result.matches("[REDACTED]").count(), 6, "{result}");
+    }
+
+    /// A matched field with an EMPTY value is not replaced, but the cursor
+    /// used to advance by the replacement marker's length anyway, which can
+    /// land inside a following multi-byte character and panic on the next
+    /// slice. The run sandbox scrubs every output line, so ordinary Unicode
+    /// command output could abort log persistence and the run response.
+    #[test]
+    fn test_log_scrubber_empty_value_followed_by_multibyte_does_not_panic() {
+        // The reported repro: `key=` with an empty value, then `é` runs.
+        let out =
+            LogScrubber::redact("key= \u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}");
+        assert_eq!(
+            out,
+            "key= \u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}"
+        );
+        // Empty value then a real one on the same line: the real one is
+        // still redacted, the text after the empty one untouched.
+        let out = LogScrubber::redact("key= \u{e9} token=s3cr3t \u{e9}");
+        assert_eq!(out, "key= \u{e9} token=[REDACTED] \u{e9}");
+        // Several empty values in a row followed by multibyte text.
+        let out = LogScrubber::redact("key= key= \u{e9}");
+        assert_eq!(out, "key= key= \u{e9}");
+        // A URL with `@` but no password credential is not rewritten; the
+        // cursor must still not land inside the multibyte host that follows.
+        let out = LogScrubber::redact("https://user@\u{e9}\u{e9}.example \u{e9}");
+        assert_eq!(out, "https://user@\u{e9}\u{e9}.example \u{e9}");
+        // A credentialed URL right before multibyte text is redacted and
+        // the rest is left intact.
+        let out = LogScrubber::redact("https://u:p@\u{e9}.example \u{e9}");
+        assert_eq!(out, "https://[REDACTED]:[REDACTED]@\u{e9}.example \u{e9}");
     }
 
     #[test]

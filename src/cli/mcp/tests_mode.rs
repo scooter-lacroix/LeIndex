@@ -171,7 +171,9 @@ fn unit_module_path(
         cursor = parent;
     }
     inline.reverse();
-    let mut modules = out_of_line_module_ancestry(&node.file_path).unwrap_or_default();
+    let mut modules = out_of_line_module_ancestry(&node.file_path)
+        .map(|(_, path)| path)
+        .unwrap_or_default();
     modules.extend(inline);
     modules.push(fn_name.to_string());
     Some(modules.join("::"))
@@ -186,10 +188,12 @@ fn unit_module_path(
 /// children live in `src/foo/`). An inline `mod a { mod b; }` makes `a` part
 /// of that directory. `#[path = "p"]` is relative to the same directory.
 ///
-/// Only the chain that actually reaches `file` is returned; an empty chain
+/// Only the chain that actually reaches `file` is returned, together with
+/// the crate ROOT file the chain starts from (which decides the Cargo
+/// target: `main.rs` is a binary, `lib.rs` the library); an empty chain
 /// means `file` IS the crate root. The walk is bounded (depth 32, 4,000
 /// declarations) so a pathological tree cannot spin.
-fn out_of_line_module_ancestry(file: &str) -> Option<Vec<String>> {
+fn out_of_line_module_ancestry(file: &str) -> Option<(std::path::PathBuf, Vec<String>)> {
     use std::path::{Path, PathBuf};
 
     fn parse(text: &str) -> Option<tree_sitter::Tree> {
@@ -270,19 +274,63 @@ fn out_of_line_module_ancestry(file: &str) -> Option<Vec<String>> {
             return None;
         }
     }
-    let root = ["lib.rs", "main.rs"]
+    // Every crate root the package has: the library, the default binary,
+    // `src/bin/*.rs`, and any `[[bin]]`/`[lib]` with an explicit `path`.
+    // A test in `main.rs` is reachable only from the `main.rs` root, so
+    // stopping at the first existing root (as this once did) silently
+    // classified binary tests as library tests.
+    let mut roots: Vec<PathBuf> = ["lib.rs", "main.rs"]
         .into_iter()
         .map(|r| package_dir.join("src").join(r))
-        .find(|p| p.is_file())?;
+        .filter(|p| p.is_file())
+        .collect();
+    if let Ok(entries) = std::fs::read_dir(package_dir.join("src").join("bin")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "rs") && path.is_file() {
+                roots.push(path);
+            }
+        }
+    }
+    if let Ok(manifest) = std::fs::read_to_string(package_dir.join("Cargo.toml")) {
+        let mut in_target = false;
+        for line in manifest.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("[[bin]]") || trimmed.starts_with("[lib]") {
+                in_target = true;
+                continue;
+            }
+            if trimmed.starts_with('[') {
+                in_target = false;
+                continue;
+            }
+            if in_target
+                && let Some(rel) = trimmed.strip_prefix("path")
+                && let Some(rel) = rel.trim().strip_prefix('=')
+            {
+                let rel = rel.trim().trim_matches('"');
+                let path = package_dir.join(rel);
+                if path.is_file() && !roots.contains(&path) {
+                    roots.push(path);
+                }
+            }
+        }
+    }
     let same = |p: &Path| p.canonicalize().ok() == Some(canonical_target.clone());
-    if same(&root) {
-        return Some(Vec::new());
+    for root in &roots {
+        if same(root) {
+            return Some((root.clone(), Vec::new()));
+        }
     }
 
-    // Files still to expand, with the module path that declares them.
-    let mut queue = vec![(root, true, Vec::<String>::new())];
+    // Files still to expand, with the module path that declares them and
+    // the crate root they descend from (which decides the Cargo target).
+    let mut queue: Vec<(PathBuf, bool, Vec<String>, PathBuf)> = roots
+        .iter()
+        .map(|root| (root.clone(), true, Vec::new(), root.clone()))
+        .collect();
     let mut visited = 0usize;
-    while let Some((file, is_mod_rs, prefix)) = queue.pop() {
+    while let Some((file, is_mod_rs, prefix, crate_root)) = queue.pop() {
         if prefix.len() > 32 {
             continue;
         }
@@ -332,15 +380,102 @@ fn out_of_line_module_ancestry(file: &str) -> Option<Vec<String>> {
                     continue;
                 };
                 if same(&resolved) {
-                    return Some(path);
+                    return Some((crate_root.clone(), path));
                 }
                 let child_is_mod_rs =
                     resolved.file_name().and_then(|n| n.to_str()) == Some("mod.rs");
-                queue.push((resolved, child_is_mod_rs, path));
+                queue.push((resolved, child_is_mod_rs, path, crate_root.clone()));
             }
         }
     }
     None
+}
+
+/// A single valid pytest node id for a test: `path::test` for a module-level
+/// function, `path::Class::test` for a method (nested classes joined by
+/// `::`). Class ancestry is read from the live Python tree around the
+/// function; without a tree it degrades to the function name alone.
+fn pytest_node_id(
+    file: &str,
+    name: &str,
+    source: Option<&crate::cli::mcp::call_sites::FileSource>,
+) -> String {
+    let Some(source) = source else {
+        return format!("{file}::{name}");
+    };
+    let Some(tree) = source.tree.as_ref() else {
+        return format!("{file}::{name}");
+    };
+    // Find the function by NAME in the live tree (the PDG byte range may be
+    // stale after an edit, so it is not used to locate it).
+    let mut fn_node = None;
+    let mut stack = vec![tree.root_node()];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "function_definition"
+            && n.child_by_field_name("name")
+                .and_then(|c| c.utf8_text(source.text.as_bytes()).ok())
+                .is_some_and(|t| t == name)
+        {
+            fn_node = Some(n);
+            break;
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    let Some(fn_node) = fn_node else {
+        return format!("{file}::{name}");
+    };
+    let mut classes: Vec<String> = Vec::new();
+    let mut cursor = fn_node;
+    while let Some(parent) = cursor.parent() {
+        if parent.kind() == "class_definition"
+            && let Some(class) = parent.child_by_field_name("name")
+            && let Ok(class) = class.utf8_text(source.text.as_bytes())
+        {
+            classes.push(class.to_string());
+        }
+        cursor = parent;
+    }
+    classes.reverse();
+    let mut parts = vec![file.to_string()];
+    parts.extend(classes);
+    parts.push(name.to_string());
+    parts.join("::")
+}
+
+/// The Cargo target selector for a unit test in `file`.
+///
+/// A unit test lives in exactly one target: the library, or a binary.
+/// Selecting `--lib` for a test that lives in `src/main.rs` or in a module
+/// owned by a `[[bin]]` runs ZERO tests and still exits 0, so a failing
+/// binary test read as a pass. The owning target is resolved from the crate
+/// root the module chain starts at (`main.rs` => the package's default
+/// binary) or from a `[[bin]]` entry whose `path` is that root.
+fn cargo_unit_target(file: &str) -> Option<&'static str> {
+    let (root, _) = out_of_line_module_ancestry(file)?;
+    // Only `src/lib.rs` (or a `[lib] path = …`) is the library; every other
+    // crate root (`main.rs`, `src/bin/*.rs`, `[[bin]] path`) is a binary.
+    let rel = root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let is_lib = rel == "lib.rs"
+        || std::fs::read_to_string(
+            root.parent()
+                .and_then(|src| src.parent())
+                .map(|pkg| pkg.join("Cargo.toml"))?,
+        )
+        .ok()
+        .is_some_and(|m| {
+            m.contains("[lib]")
+                && m.lines()
+                    .any(|l| l.trim().starts_with("path") && l.contains(&rel))
+                && !m.contains("[[bin]]")
+        });
+    Some(if is_lib { "--lib" } else { "--bin" })
 }
 
 /// The exact command that runs one test.
@@ -365,14 +500,25 @@ fn command_for(
             let path = source
                 .and_then(|source| unit_module_path(source, node, &node.name))
                 .unwrap_or_else(|| node.name.clone());
-            format!("cargo test {dash_p}--lib {path} -- --exact")
+            match cargo_unit_target(file) {
+                // `--bin` without a name is "all binaries"; the package's
+                // default binary is named after the package.
+                Some("--bin") => {
+                    let bin = cargo_package(file).unwrap_or_default();
+                    format!("cargo test {dash_p}--bin {bin} {path} -- --exact")
+                }
+                _ => format!("cargo test {dash_p}--lib {path} -- --exact"),
+            }
         }
         Some(TestRunner::Pytest) => {
-            let name = &node.name;
-            let locator = match line {
-                Some(line) => format!("{file}::{name} or {file}:{line}"),
-                None => format!("{file}::{name}"),
-            };
+            // ONE executable node id. pytest's positional arguments are
+            // `[file_or_dir]`, so a previous `file::test or file:12` form
+            // made pytest treat the literal word `or` as a path: `ERROR:
+            // file or directory not found: or`, nothing collected. Class
+            // ancestry (`file::TestFoo::test_bar`) is required for a method
+            // and comes from the live tree; a line number is not part of a
+            // node id, so it is not appended.
+            let locator = pytest_node_id(file, &node.name, source);
             format!("pytest {locator}")
         }
         Some(TestRunner::Jest) => format!("npx jest {} -t {}", file, node.name),
@@ -422,7 +568,10 @@ fn callers_by_depth(
 /// until real code appears. `#[tokio::test]`, `#[proptest]` and multi-line
 /// attributes are all matched; anything else stops the scan.
 fn attributes_say_test(text: &str, fn_start: usize) -> Option<&'static str> {
-    let before = &text[..fn_start.min(text.len())];
+    // `fn_start` is a PDG byte offset while `text` is the LIVE file; after an
+    // edit the stale offset can sit inside a multi-byte character, and a
+    // bare slice there panics mid-classification. Floor to a boundary.
+    let before = &text[..crate::cli::mcp::call_sites::floor_char_boundary(text, fn_start)];
     for line in before.lines().rev() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -662,6 +811,87 @@ mod tests {
         command_for(&test_fn, Some(1), Some(&src))
     }
 
+    /// A pytest method needs its class in the node id, read from the live
+    /// tree; a module-level test stays `file::test`. The command must be a
+    /// single node id with no `or` and no line suffix.
+    #[test]
+    fn test_pytest_node_id_includes_class_ancestry_and_is_executable() {
+        let dir = manifest_dir("pyproj");
+        let file = dir.path().join("tests").join("core_test.py");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let source = "class TestOuter:\n    class TestInner:\n        def test_nested(self):\n            assert True\n\n    def test_method(self):\n        assert True\n\ndef test_plain():\n    assert True\n";
+        std::fs::write(&file, source).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&crate::parse::traits::languages::python::language())
+            .unwrap();
+        let src = crate::cli::mcp::call_sites::FileSource {
+            text: source.to_string(),
+            tree: parser.parse(source, None),
+        };
+        let py = |name: &str| {
+            node(
+                name,
+                &file.display().to_string(),
+                "python",
+                (source.find(name).unwrap(), source.len()),
+            )
+        };
+        let shown = file.display().to_string();
+        assert_eq!(
+            command_for(&py("test_nested"), Some(3), Some(&src)),
+            format!("pytest {shown}::TestOuter::TestInner::test_nested")
+        );
+        assert_eq!(
+            command_for(&py("test_method"), Some(6), Some(&src)),
+            format!("pytest {shown}::TestOuter::test_method")
+        );
+        assert_eq!(
+            command_for(&py("test_plain"), Some(9), Some(&src)),
+            format!("pytest {shown}::test_plain")
+        );
+        // Without a tree it degrades to the function alone — still one id.
+        assert_eq!(
+            command_for(&py("test_method"), Some(6), None),
+            format!("pytest {shown}::test_method")
+        );
+        // Execute the generated command with real pytest (if installed) on a
+        // deliberately failing method: it must collect and run that test.
+        if std::process::Command::new("python3")
+            .arg("-m")
+            .arg("pytest")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            let failing = source.replace(
+                "    def test_method(self):\n        assert True",
+                "    def test_method(self):\n        assert False",
+            );
+            std::fs::write(&file, failing).unwrap();
+            let out = std::process::Command::new("python3")
+                .args([
+                    "-m",
+                    "pytest",
+                    "-q",
+                    "tests/core_test.py::TestOuter::test_method",
+                ])
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                text.contains("1 failed"),
+                "pytest must run exactly that test: {text}"
+            );
+            assert!(!out.status.success());
+        }
+    }
+
     /// For a test in `src/foo.rs`, the enclosing `foo` module is declared in
     /// `src/lib.rs`, not in the file. The filter used to come out as
     /// `tests::test_x`; `--exact` then matched nothing and cargo exited 0
@@ -729,6 +959,124 @@ mod tests {
         assert!(!output.status.success(), "a failing test must fail the run");
     }
 
+    /// A unit test in `src/main.rs` belongs to the BINARY target. `--lib`
+    /// runs zero tests there and exits 0, so a failing binary test read as a
+    /// pass; the command must select `--bin <package>` instead.
+    #[test]
+    fn test_binary_unit_tests_select_the_bin_target() {
+        let dir = manifest_dir("binpkg");
+        let src = dir.path().join("src");
+        std::fs::write(
+            src.join("main.rs"),
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn test_in_bin() {\n        assert!(true);\n    }\n}\n\nfn main() {}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            command_for_test_in(&dir, "main.rs", "test_in_bin"),
+            "cargo test -p binpkg --bin binpkg tests::test_in_bin -- --exact"
+        );
+        // A `[[bin]]` with an explicit path is a binary too.
+        std::fs::write(src.join("lib.rs"), "pub mod tool;\n").unwrap();
+        std::fs::write(
+            src.join("tool.rs"),
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn test_in_tool() {\n        assert!(true);\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("lib.rs"),
+            "pub mod tool;\n#[test]\nfn test_in_lib() {\n    assert!(true);\n}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            command_for_test_in(&dir, "lib.rs", "test_in_lib"),
+            "cargo test -p binpkg --lib test_in_lib -- --exact"
+        );
+        assert_eq!(
+            command_for_test_in(&dir, "tool.rs", "test_in_tool"),
+            "cargo test -p binpkg --lib tool::tests::test_in_tool -- --exact"
+        );
+
+        // Real cargo, with BOTH a lib and a bin in the package (the case the
+        // reviewer describes): make the binary test fail. The generated
+        // command must run it and fail...
+        std::fs::write(
+            src.join("main.rs"),
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn test_in_bin() {\n        assert!(false);\n    }\n}\n\nfn main() {}\n",
+        )
+        .unwrap();
+        let command = command_for_test_in(&dir, "main.rs", "test_in_bin");
+        // Run the generated command directly (the generated form has no
+        // quoting), so the test does not depend on `sh` finding cargo.
+        let cargo = std::env::var_os("PATH")
+            .map(|paths| {
+                std::env::split_paths(&paths)
+                    .map(|d| d.join("cargo"))
+                    .find(|c| c.is_file())
+            })
+            .unwrap_or_default();
+        let Some(cargo) = cargo else {
+            eprintln!("skipping real-cargo check: cargo not on PATH");
+            return;
+        };
+        let run = |cmd: &str| {
+            // `cargo` is the first word; resolve it to the absolute path found
+            // above so the test does not depend on the harness's PATH lookup.
+            let words = cmd.split_whitespace().skip(1);
+            let program = cargo.clone();
+            let out = std::process::Command::new(program)
+                .args(words)
+                .current_dir(dir.path())
+                .env("CARGO_TERM_COLOR", "never")
+                .output()
+                .unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            (out.status.success(), text)
+        };
+        let (ok, text) = run(&command);
+        assert!(
+            text.contains("test tests::test_in_bin ... FAILED"),
+            "binary test must run ({command}): {text}"
+        );
+        assert!(!ok, "a failing binary test must fail the run");
+        // ...while the old `--lib` form runs ZERO tests and exits 0, which is
+        // exactly the silent pass the finding describes.
+        let (ok, text) = run("cargo test -p binpkg --lib tests::test_in_bin -- --exact");
+        assert!(
+            ok && text.contains("0 passed"),
+            "control: --lib runs no binary tests: {text}"
+        );
+    }
+
+    /// A stale PDG offset must not panic the tests classifier (same class as
+    /// the caller-list fix): the indexed file's `fn` byte offset, applied to
+    /// a live file whose leading comment grew by a multi-byte character,
+    /// lands inside that character.
+    #[test]
+    fn test_tests_classifier_tolerates_a_stale_multibyte_offset() {
+        // Indexed: `//` + 9x `x` + `\n` (12 bytes) => `fn` starts at byte 12.
+        let indexed = "//xxxxxxxxx\nfn test_x() {}\n";
+        let stale = indexed.find("fn test_x").unwrap();
+        assert_eq!(stale, 12);
+        // Live: the last two `x` became `é` (2 bytes each), so `é` spans
+        // bytes 9..13 and the stale byte 12 is INSIDE the second `é`.
+        let live = "//xxxxxxx\u{e9}\u{e9}\nfn test_x() {}\n";
+        assert!(
+            !live.is_char_boundary(stale),
+            "fixture must put the stale offset inside a multi-byte char"
+        );
+        // Must not panic: the offset floors to byte 9 and the scan simply
+        // finds no attribute there ("no evidence"), never a crash.
+        let _ = attributes_say_test(live, stale);
+        // With an attribute above the fn and the REAL offset, it classifies.
+        let with_attr = format!("#[test]\n{live}");
+        let real = with_attr.find("fn test_x").unwrap();
+        assert!(attributes_say_test(&with_attr, real).is_some());
+    }
+
     #[test]
     fn test_root_level_unit_test_has_no_module_prefix() {
         let dir = manifest_dir("proj");
@@ -772,9 +1120,11 @@ mod tests {
             "python",
             (0, 1),
         );
+        // A single executable node id: never `a or b` (pytest would take the
+        // literal `or` as a path) and no `:line` suffix (not a node id).
         assert_eq!(
             command_for(&py, Some(12), None),
-            "pytest /proj/tests/core_test.py::test_round_trip or /proj/tests/core_test.py:12"
+            "pytest /proj/tests/core_test.py::test_round_trip"
         );
         let js = node(
             "should round trip",

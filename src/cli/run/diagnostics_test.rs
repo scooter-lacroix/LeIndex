@@ -259,7 +259,10 @@ fn test_cargo_workspace_root_follows_manifest_claims() {
         &root.join("solo/Cargo.toml"),
         "[package]\nname = \"solo\"\n",
     );
-    assert_eq!(cargo_workspace_root(&root.join("solo")), root.join("solo"));
+    assert_eq!(
+        cargo_workspace_root(&root.join("solo"), &root),
+        root.join("solo")
+    );
 
     // A member with its own `[workspace]` table is its own root even under
     // a parent workspace (the shape the earlier fixture had).
@@ -281,18 +284,42 @@ fn test_cargo_workspace_root_follows_manifest_claims() {
     );
     // Listed by `crates/*`: the parent is the root.
     assert_eq!(
-        cargo_workspace_root(&root.join("ws/crates/a")),
+        cargo_workspace_root(&root.join("ws/crates/a"), &root),
         root.join("ws")
     );
     // Excluded by name: the parent does not claim it; its own table does.
     assert_eq!(
-        cargo_workspace_root(&root.join("ws/crates/own")),
+        cargo_workspace_root(&root.join("ws/crates/own"), &root),
         root.join("ws/crates/own")
     );
     // Two levels under `crates/*` is not matched by a one-level glob.
     assert_eq!(
-        cargo_workspace_root(&root.join("ws/crates/deep/x")),
+        cargo_workspace_root(&root.join("ws/crates/deep/x"), &root),
         root.join("ws/crates/deep/x")
+    );
+}
+
+/// The walk stops at the project root: a `[workspace]` in a manifest ABOVE
+/// the project (a stray parent checkout) must never become the base for
+/// paths inside it, or diagnostics would be resolved against a directory
+/// outside the project.
+#[test]
+fn test_cargo_workspace_root_never_escapes_the_project() {
+    let outer = tempfile::tempdir().unwrap();
+    let outer = std::fs::canonicalize(outer.path()).unwrap();
+    // A stray workspace above the project claiming everything.
+    write(
+        &outer.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"**\"]\n",
+    );
+    // The project is a subdirectory that is a stand-alone package.
+    let root = outer.join("project");
+    write(&root.join("Cargo.toml"), "[package]\nname = \"solo\"\n");
+    // With the project root as the bound, the stray parent is not used.
+    assert_eq!(
+        cargo_workspace_root(&root, &root),
+        root,
+        "a workspace above the project must not be selected"
     );
 }
 
