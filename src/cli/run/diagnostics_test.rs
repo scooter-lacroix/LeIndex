@@ -168,6 +168,46 @@ fn test_diagnostics_for_is_empty_without_a_store() {
     assert!(diagnostics_for(dir.path(), Path::new("a.rs"), 1..=10).is_empty());
 }
 
+/// PR #117 finding #118: the filter compared the stored and requested paths
+/// LEXICALLY, so the same file reached through a symlink (a linked workspace,
+/// a symlinked home) never matched and the overlay silently reported no
+/// diagnostics for a file that had them.
+#[cfg(unix)]
+#[test]
+fn test_diagnostics_for_matches_the_same_file_through_a_symlinked_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(real.join("src")).unwrap();
+    std::fs::write(real.join("src/lib.rs"), "fn a() {}\n").unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    // Stored under the REAL root (what the lexical resolver produced)…
+    let storage = storage_for(&real);
+    record(
+        &storage,
+        &[Diagnostic {
+            file: real.join("src/lib.rs"),
+            line: 3,
+            severity: Severity::Error,
+            code: Some("E0308".to_string()),
+            message: "m".to_string(),
+        }],
+    )
+    .unwrap();
+
+    // …and asked for through the SYMLINKED root. Same file, different text.
+    let hits = diagnostics_for(&link, Path::new("src/lib.rs"), 1..=10);
+    assert_eq!(
+        hits.len(),
+        1,
+        "a symlinked root must still find its own file's diagnostics"
+    );
+    assert_eq!(hits[0].code.as_deref(), Some("E0308"));
+    // The line filter is unaffected.
+    assert!(diagnostics_for(&link, Path::new("src/lib.rs"), 100..=200).is_empty());
+}
+
 #[test]
 fn test_concurrent_record_writers_all_publish_a_valid_store() {
     let dir = tempfile::tempdir().unwrap();

@@ -110,10 +110,26 @@ pub(crate) fn diagnostics_for(
         return Vec::new();
     };
     let wanted = absolute(project_root, file);
+    // A stored path and the requested path can name the SAME file while
+    // differing textually, because one side resolved a symlink and the other
+    // did not (PR #117 finding #118). `absolute` is deliberately lexical, so
+    // the comparison also accepts a canonical match whenever both sides can be
+    // canonicalised — the lexical form still wins for a file that no longer
+    // exists.
+    let wanted_canonical = wanted.canonicalize().ok();
+    let same_file = |stored: &std::path::Path| -> bool {
+        if stored == wanted {
+            return true;
+        }
+        match (&wanted_canonical, stored.canonicalize().ok()) {
+            (Some(a), Some(b)) => *a == b,
+            _ => false,
+        }
+    };
     store
         .diagnostics
         .into_iter()
-        .filter(|d| d.file == wanted && lines.contains(&d.line))
+        .filter(|d| same_file(&d.file) && lines.contains(&d.line))
         .collect()
 }
 
