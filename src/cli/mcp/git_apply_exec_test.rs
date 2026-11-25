@@ -10,17 +10,15 @@ use super::*;
 use std::path::Path;
 
 /// A git child isolated from whatever launched the test binary.
+///
+/// The variable list is the shared [`REPOSITORY_LOCATION_OVERRIDES`] constant
+/// (imported here by `use super::*`), not a local copy: a fixture that clears a
+/// different set can pass while the code under test inherits a variable.
 fn isolated_git(dir: &Path) -> std::process::Command {
     let mut command = std::process::Command::new("git");
+    scrub_std(&mut command);
     command
         .current_dir(dir)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .env_remove("GIT_CEILING_DIRECTORIES")
-        .env_remove("GIT_COMMON_DIR")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_EDITOR", "true")
         .env("GIT_CONFIG_NOSYSTEM", "1");

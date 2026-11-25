@@ -653,12 +653,20 @@ pub(super) fn pdg_parse_stats(results: &[crate::parse::parallel::ParsingResult])
     }
 }
 
+/// The worktree's tree oid, for the index fingerprint.
+///
+/// Scrubbed like every other git child (`REPOSITORY_LOCATION_OVERRIDES`): an
+/// inherited `GIT_DIR` / `GIT_WORK_TREE` outranks `current_dir`, so without the
+/// scrub this returned a DIFFERENT repository's tree and the index recorded a
+/// fingerprint that could never match the worktree it described. The write path
+/// was scrubbed in round 10 (id 4697090106); this probe was missed.
 pub(super) fn git_tree_oid(project_path: &std::path::Path) -> Option<String> {
-    let output = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    command
         .args(["rev-parse", "HEAD^{tree}"])
-        .current_dir(project_path)
-        .output()
-        .ok()?;
+        .current_dir(project_path);
+    crate::cli::mcp::git_apply_exec::scrub_std(&mut command);
+    let output = command.output().ok()?;
     output
         .status
         .success()

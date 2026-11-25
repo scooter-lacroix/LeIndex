@@ -7,18 +7,22 @@ use super::*;
 /// `GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE`, and those override the
 /// working directory: fixture commands would then read or mutate the CALLER'S
 /// repository. A `TempDir` protects only paths that resolve inside it, which
-/// is not enough when the variables point elsewhere. They are cleared here.
+/// is not enough when the variables point elsewhere.
+///
+/// The list is NOT repeated here: it comes from
+/// [`super::super::git_apply_exec::REPOSITORY_LOCATION_OVERRIDES`], the same
+/// constant the production builders scrub. A fixture that cleared a different
+/// set could pass while the code under test inherited a variable, and
+/// `test_an_inherited_git_dir_cannot_redirect_a_request` poisons the process
+/// environment for the whole binary while other tests run — so the fixtures
+/// must be immune for exactly the same reasons the handler is.
 fn isolated_git(dir: &Path) -> std::process::Command {
     let mut command = std::process::Command::new("git");
+    // `git_apply_exec` is a SIBLING module of this test module's parent, so it
+    // is reached through `super::super`, not `super`.
+    super::super::git_apply_exec::scrub_std(&mut command);
     command
         .current_dir(dir)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .env_remove("GIT_CEILING_DIRECTORIES")
-        .env_remove("GIT_COMMON_DIR")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_EDITOR", "true")
         .env("GIT_CONFIG_NOSYSTEM", "1");
@@ -35,6 +39,22 @@ fn git(dir: &Path, args: &[&str]) {
         .status()
         .expect("git available");
     assert!(status.success(), "git {args:?} failed");
+}
+
+/// Captured output from the SAME isolated git as [`git`].
+///
+/// Fixture READS go through here too, never a bare
+/// `std::process::Command::new("git")`: the poisoned
+/// `GIT_DIR` / `GIT_WORK_TREE` window opened by
+/// `test_an_inherited_git_dir_cannot_redirect_a_request` is process-global and
+/// overlaps other tests, so an unscrubbed read inspects that test's decoy
+/// repository — or fails with "not a git repository" — and the failure lands
+/// nowhere near its cause.
+fn git_out(dir: &Path, args: &[&str]) -> std::process::Output {
+    isolated_git(dir)
+        .args(args)
+        .output()
+        .expect("git available")
 }
 
 fn scratch() -> tempfile::TempDir {
@@ -196,22 +216,15 @@ fn test_force_push_argv_really_pushes_while_the_single_argument_does_not() {
     );
     // The remote-tracking oid the plan reviewed, captured the same way
     // the plan captures it.
-    let reviewed = std::process::Command::new("git")
-        .args(["rev-parse", "refs/remotes/origin/main"])
-        .current_dir(&work)
-        .output()
-        .expect("git available");
+    let reviewed = git_out(&work, &["rev-parse", "refs/remotes/origin/main"]);
     let reviewed = String::from_utf8_lossy(&reviewed.stdout).trim().to_string();
     std::fs::write(work.join("f.txt"), "two\n").unwrap();
     git(&work, &["add", "."]);
     git(&work, &["commit", "-q", "-m", "two"]);
 
     let run = |argv: &[String]| {
-        std::process::Command::new("git")
-            .args(argv)
-            .current_dir(&work)
-            .output()
-            .expect("git available")
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        git_out(&work, &args)
     };
     let broken = run(&vuec(["push", "--force-with-lease", "origin/main"]));
     assert!(
@@ -225,11 +238,7 @@ fn test_force_push_argv_really_pushes_while_the_single_argument_does_not() {
         String::from_utf8_lossy(&fixed.stderr)
     );
     // The remote now carries the second commit.
-    let log = std::process::Command::new("git")
-        .args(["log", "--oneline", "main"])
-        .current_dir(&bare)
-        .output()
-        .expect("git available");
+    let log = git_out(&bare, &["log", "--oneline", "main"]);
     assert!(
         String::from_utf8_lossy(&log.stdout).contains("two"),
         "the push must reach the remote: {}",
@@ -265,11 +274,7 @@ fn test_force_push_lease_refuses_to_overwrite_a_remote_that_moved_after_the_plan
         git(&work, &["config", "user.name", "t"]);
     }
     let run_in = |dir: &Path, args: &[&str]| {
-        let output = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("git available");
+        let output = git_out(dir, args);
         assert!(
             output.status.success(),
             "git {args:?} in {} failed: {}",
@@ -307,16 +312,15 @@ fn test_force_push_lease_refuses_to_overwrite_a_remote_that_moved_after_the_plan
     );
 
     // THE BUG: the implicit lease overwrites their commit.
-    let implicit = std::process::Command::new("git")
-        .args([
+    let implicit = git_out(
+        &ours,
+        &[
             "push",
             "--force-with-lease",
             "origin",
             "HEAD:refs/heads/main",
-        ])
-        .current_dir(&ours)
-        .output()
-        .expect("git available");
+        ],
+    );
     assert!(
         implicit.status.success(),
         "precondition: the implicit lease must push — the bug is real: {}",
@@ -340,11 +344,8 @@ fn test_force_push_lease_refuses_to_overwrite_a_remote_that_moved_after_the_plan
     );
     run_in(&ours, &["fetch", "-q", "origin"]);
     let argv = force_push_argv("origin/main", Some(&reviewed));
-    let leased = std::process::Command::new("git")
-        .args(&argv)
-        .current_dir(&ours)
-        .output()
-        .expect("git available");
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let leased = git_out(&ours, &argv);
     assert!(
         !leased.status.success(),
         "a lease pinned to the reviewed oid must refuse the moved remote: {}",
@@ -554,11 +555,7 @@ async fn test_commit_reads_the_validated_index_not_whatever_is_staged_later() {
     );
 
     // Nothing was committed by the refused apply.
-    let tree = std::process::Command::new("git")
-        .args(["ls-tree", "-r", "--name-only", "HEAD"])
-        .current_dir(root)
-        .output()
-        .expect("git available");
+    let tree = git_out(root, &["ls-tree", "-r", "--name-only", "HEAD"]);
     let tree = String::from_utf8_lossy(&tree.stdout).to_string();
     assert!(
         !tree.contains("g.txt") && !tree.contains("reviewed"),
@@ -577,11 +574,7 @@ async fn test_commit_reads_the_validated_index_not_whatever_is_staged_later() {
     .await
     .expect("a freshly planned commit applies");
     assert_eq!(applied["applied"], true, "{applied}");
-    let tree = std::process::Command::new("git")
-        .args(["ls-tree", "-r", "--name-only", "HEAD"])
-        .current_dir(root)
-        .output()
-        .expect("git available");
+    let tree = git_out(root, &["ls-tree", "-r", "--name-only", "HEAD"]);
     let tree = String::from_utf8_lossy(&tree.stdout).to_string();
     assert!(
         tree.contains("f.txt") && tree.contains("g.txt"),
@@ -612,11 +605,7 @@ async fn test_a_plain_commit_does_include_content_staged_after_the_plan() {
     )
     .await
     .expect("the plain commit applies");
-    let tree = std::process::Command::new("git")
-        .args(["ls-tree", "-r", "--name-only", "HEAD"])
-        .current_dir(root)
-        .output()
-        .expect("git available");
+    let tree = git_out(root, &["ls-tree", "-r", "--name-only", "HEAD"]);
     let tree = String::from_utf8_lossy(&tree.stdout).to_string();
     assert!(
         tree.contains("g.txt"),
@@ -661,11 +650,7 @@ async fn test_the_validated_tree_commit_leaves_no_window_for_a_staging_hook() {
     .expect("the confirmed commit applies");
     assert_eq!(applied["applied"], true, "{applied}");
 
-    let tree = std::process::Command::new("git")
-        .args(["ls-tree", "-r", "--name-only", "HEAD"])
-        .current_dir(root)
-        .output()
-        .expect("git available");
+    let tree = git_out(root, &["ls-tree", "-r", "--name-only", "HEAD"]);
     let tree = String::from_utf8_lossy(&tree.stdout).to_string();
     assert!(
         tree.contains("f.txt") && !tree.contains("g.txt"),
@@ -811,13 +796,7 @@ fn test_add_argv_uses_literal_pathspecs_so_a_star_filename_is_not_a_wildcard() {
     std::fs::write(root.join("*"), "star2\n").unwrap();
     std::fs::write(root.join("other.rs"), "changed2\n").unwrap();
     git(root, &["reset", "-q"]);
-    let run = |args: &[&str]| {
-        std::process::Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .output()
-            .expect("git available")
-    };
+    let run = |args: &[&str]| git_out(root, args);
     // The bug: a bare `add -- "*"` stages BOTH files.
     let wildcard = run(&["add", "--", "*"]);
     assert!(wildcard.status.success());

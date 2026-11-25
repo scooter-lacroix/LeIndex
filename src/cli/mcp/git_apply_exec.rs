@@ -112,27 +112,54 @@ pub(crate) fn count_chars_streaming(carry: &mut Vec<u8>, piece: &[u8]) -> usize 
     count
 }
 
+/// Repository-location variables that OVERRIDE `current_dir(root)`.
+///
+/// `Command::current_dir` alone does NOT redirect a git child that inherited
+/// one of these — from a git hook that launched the MCP process, for instance.
+/// They win over the working directory, so a caller asking about repository B
+/// reads (or mutates) repository A. CodeRabbit round 10 (id 4697090106) found
+/// this on the WRITE path; the READ path and the indexer's tree probe had the
+/// same hole and were missed, so an inherited `GIT_DIR` also made the preview
+/// token bind a DIFFERENT repository's HEAD and index (every mutation then
+/// rejected on a token that could never match) and recorded an index tree oid
+/// belonging to another worktree.
+///
+/// One list, every spawn site, so a variable cannot be scrubbed in one place
+/// and forgotten in another.
+pub(crate) const REPOSITORY_LOCATION_OVERRIDES: [&str; 7] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_COMMON_DIR",
+];
+
+/// Remove the inherited repository-location overrides from a blocking child.
+pub(crate) fn scrub_std(command: &mut std::process::Command) {
+    for variable in REPOSITORY_LOCATION_OVERRIDES {
+        command.env_remove(variable);
+    }
+}
+
+/// Tokio twin of [`scrub_std`], for the async mutation path.
+fn scrub_async(command: &mut tokio::process::Command) {
+    for variable in REPOSITORY_LOCATION_OVERRIDES {
+        command.env_remove(variable);
+    }
+}
+
 /// Every git child this module spawns starts here: `current_dir(root)` AND
 /// the inherited repository-location overrides removed.
 ///
-/// `current_dir(root)` alone does NOT redirect a git child that inherited
-/// `GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE` — from a hook that launched
-/// the MCP process, for instance. Those variables win over the working
-/// directory, so a request for repository B could inspect or mutate
-/// repository A (CodeRabbit round 10, id 4697090106). They are cleared here
-/// for every probe and mutation; the validated index snapshot is then set
-/// EXPLICITLY and nothing else is.
+/// Those variables are cleared for every probe and mutation; the validated
+/// index snapshot is then set EXPLICITLY and nothing else is.
 pub(super) fn git_command(root: &Path) -> tokio::process::Command {
     let mut command = tokio::process::Command::new("git");
+    scrub_async(&mut command);
     command
         .current_dir(root)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .env_remove("GIT_CEILING_DIRECTORIES")
-        .env_remove("GIT_COMMON_DIR")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", "echo")
         .env("GIT_EDITOR", "true")
@@ -148,15 +175,9 @@ pub(super) fn git_command(root: &Path) -> tokio::process::Command {
 /// (`check-ignore`) that runs on a plain thread.
 pub(super) fn git_command_sync(root: &Path) -> std::process::Command {
     let mut command = std::process::Command::new("git");
+    scrub_std(&mut command);
     command
         .current_dir(root)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .env_remove("GIT_CEILING_DIRECTORIES")
-        .env_remove("GIT_COMMON_DIR")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", "echo")
         .env("GIT_EDITOR", "true")

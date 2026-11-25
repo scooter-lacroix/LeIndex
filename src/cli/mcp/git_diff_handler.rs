@@ -313,14 +313,26 @@ pub(crate) fn lines_to_bytes(
 /// and a runaway command is killed instead of buffered without bound.
 /// `GIT_TERMINAL_PROMPT=0` keeps a command that would ask for credentials
 /// (`push`, a `fetch` triggered by `pull`) from blocking the server forever.
+///
+/// The inherited repository-location overrides are SCRUBBED here too. Without
+/// that, `current_dir(root)` is not enough: a `GIT_DIR` / `GIT_WORK_TREE`
+/// inherited from a hook that launched this process wins over the working
+/// directory, so `git diff`, `git status` and every other live read reported a
+/// DIFFERENT repository than the caller named. The write path was fixed for
+/// this in round 10 (id 4697090106); the read path was missed, and the hole
+/// was reproducible: with `GIT_DIR` pointed at a decoy, a read of the real
+/// repository failed with "not a git repository", and the preview token bound
+/// the decoy's HEAD and index, so every mutation of the real repo was then
+/// rejected on a token that could never match.
 pub(crate) fn run_git_capped(
     root: &Path,
     args: &[String],
     cap: u64,
 ) -> Result<(Vec<u8>, bool), std::io::Error> {
-    let child = Command::new("git")
-        .args(args)
-        .current_dir(root)
+    let mut command = Command::new("git");
+    command.args(args).current_dir(root);
+    super::git_apply_exec::scrub_std(&mut command);
+    let child = command
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1152,9 +1164,14 @@ mod tests {
     }
 
     fn git(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .args(args)
-            .current_dir(dir)
+        let mut command = Command::new("git");
+        command.args(args).current_dir(dir);
+        // Fixtures use the SAME scrub as the code under test: the poisoned
+        // window opened by `test_an_inherited_git_dir_cannot_redirect_a_live_read`
+        // is process-global, so an unscrubbed setup command would be redirected
+        // into that test's decoy and fail here for the wrong reason.
+        super::super::git_apply_exec::scrub_std(&mut command);
+        let status = command
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@t")
             .env("GIT_COMMITTER_NAME", "t")
@@ -1162,6 +1179,112 @@ mod tests {
             .status()
             .expect("git available");
         assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// Names a builder has been told to CLEAR (`env_remove`).
+    fn cleared<'a>(
+        pairs: impl Iterator<Item = (&'a std::ffi::OsStr, Option<&'a std::ffi::OsStr>)>,
+    ) -> Vec<String> {
+        pairs
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().to_string())
+            .collect()
+    }
+
+    /// Round 13: the READ path never scrubbed `GIT_DIR` / `GIT_WORK_TREE`.
+    ///
+    /// The write path was scrubbed in round 10 (id 4697090106); every live
+    /// read was not, so `git status` / `git diff` against the named repository
+    /// resolved the INHERITED one instead. Two consequences, both silent: the
+    /// read reported another worktree's contents, and the preview token bound
+    /// that other repository's HEAD and index — after which every mutation of
+    /// the real repository was rejected on a token that could never match.
+    ///
+    /// Red-verified: with the scrub removed from `run_git_capped`, the decoy's
+    /// CLEAN tree is what both reads report and both assertions fail.
+    #[test]
+    fn test_an_inherited_git_dir_cannot_redirect_a_live_read() {
+        let real = tempfile::tempdir().unwrap();
+        let decoy = tempfile::tempdir().unwrap();
+        git(real.path(), &["init", "-q"]);
+        std::fs::write(real.path().join("a.rs"), "fn a() {}\n").unwrap();
+        git(real.path(), &["add", "."]);
+        git(real.path(), &["commit", "-q", "-m", "real"]);
+        // The REAL tree is dirty; the decoy is clean, so the two are
+        // distinguishable without reading any oid.
+        std::fs::write(real.path().join("a.rs"), "fn a() { let _x = 1; }\n").unwrap();
+        git(decoy.path(), &["init", "-q"]);
+        std::fs::write(decoy.path().join("a.rs"), "fn decoy() {}\n").unwrap();
+        git(decoy.path(), &["add", "."]);
+        git(decoy.path(), &["commit", "-q", "-m", "decoy"]);
+
+        let real_root = real.path().to_path_buf();
+        let decoy_git = decoy.path().join(".git");
+        let decoy_tree = decoy.path().to_path_buf();
+        // The environment is process-global, so the poisoned window runs on a
+        // blocking thread holding the crate-wide env lock, and is restored on
+        // drop — including on panic.
+        let observed = std::thread::spawn(move || {
+            let _env_lock = crate::test_env::EnvLock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            struct Restore;
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    // SAFETY: serialized by _env_lock, which outlives this guard.
+                    unsafe {
+                        std::env::remove_var("GIT_DIR");
+                        std::env::remove_var("GIT_WORK_TREE");
+                    }
+                }
+            }
+            let _restore = Restore;
+            // SAFETY: serialized by _env_lock; restored by _restore.
+            unsafe {
+                std::env::set_var("GIT_DIR", &decoy_git);
+                std::env::set_var("GIT_WORK_TREE", &decoy_tree);
+            }
+            let diff = collect_diff(&real_root, &DiffSpec::WorkingTree, false)
+                .map(|working| working.files.len());
+            (diff, crate::cli::git::status(&real_root))
+        })
+        .join()
+        .expect("read worker");
+
+        assert_eq!(
+            observed.0.expect("the named repository must stay readable"),
+            1,
+            "the diff must describe the REAL working tree, not the decoy's clean one"
+        );
+        let status = observed
+            .1
+            .expect("the named repository must keep a live status");
+        assert_eq!(
+            status.modified,
+            vec![std::path::PathBuf::from("a.rs")],
+            "the status must report the REAL repository's dirty file"
+        );
+    }
+
+    /// The scrub list is the seam: a variable dropped from it would be patched
+    /// in one spawn site and silently inherited in another.
+    ///
+    /// `tokio::process::Command` has no `get_envs`, so the async builder is not
+    /// introspectable. The blocking one is, and it shares the constant with
+    /// `run_git_capped`; the async builder clears the same list through
+    /// `scrub_async`, and `test_an_inherited_git_dir_cannot_redirect_a_live_read`
+    /// proves the read path's behaviour end to end.
+    #[test]
+    fn test_the_blocking_builder_clears_the_shared_override_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let builder = super::super::git_apply_exec::git_command_sync(dir.path());
+        let present = cleared(builder.get_envs());
+        for variable in super::super::git_apply_exec::REPOSITORY_LOCATION_OVERRIDES {
+            assert!(
+                present.iter().any(|key| key == variable),
+                "{variable} must be cleared by the blocking builder: {present:?}"
+            );
+        }
     }
 
     #[test]
