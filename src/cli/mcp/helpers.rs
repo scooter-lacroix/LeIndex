@@ -1101,11 +1101,18 @@ mod tests {
             "a file inside a symlinked project root is INSIDE the project: {result:?}"
         );
         // …and the escape hatch the check exists for still closes.
-        let outside = tempdir().unwrap();
-        std::fs::write(outside.path().join("secret.txt"), "s").unwrap();
+        //
+        // The escaping file must EXIST at the path `../secret.txt` actually
+        // resolves to — `real` is `dir/real`, so that is `dir/secret.txt`. An
+        // earlier version wrote it into a SEPARATE tempdir, so canonicalize()
+        // failed first and the assertion passed even with the containment
+        // guard deleted (CodeRabbit round 13, id 4701646449).
+        std::fs::write(dir.path().join("secret.txt"), "s").unwrap();
+        let refusal = validate_file_within_project("../secret.txt", &real)
+            .expect_err("a path escaping the root must be refused");
         assert!(
-            validate_file_within_project("../secret.txt", &real).is_err(),
-            "a path escaping the root must still be refused"
+            format!("{refusal}").contains("outside the project boundary"),
+            "the refusal must come from the CONTAINMENT check, not a failed resolve: {refusal}"
         );
     }
 
