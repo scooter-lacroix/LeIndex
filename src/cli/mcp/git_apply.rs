@@ -584,32 +584,180 @@ fn head_oid(root: &Path) -> Option<String> {
     .filter(|oid| !oid.is_empty())
 }
 
-/// The live state a mutation token binds: HEAD oid + the index digest.
+/// The live state a mutation token binds.
 ///
 /// ONE binding, used at both ends of the seam: `mutation_plan` issues the
 /// advertised token against it, `validate_before_apply` recomputes it before
 /// spawning git. Issuing against an empty string (the pre-fix behaviour) made
 /// every plan-issued token unmatchable, which silently disabled every
 /// `TOKEN_ONLY` operation and every destructive shape.
-pub(crate) fn state_binding(root: &Path) -> Result<String, JsonRpcError> {
-    Ok(format!(
+///
+/// ## What "state" has to mean (CodeRabbit round 8, ids 4691119074 and
+/// 4691119087)
+///
+/// HEAD + the index are necessary but NOT sufficient. Git re-resolves several
+/// things when the command runs, and each is state the plan reviewed:
+///
+/// * a `checkout`/`merge`/`rebase`/`reset` TARGET NAME. If `master` moves
+///   after planning, HEAD and the index do not change, the old token still
+///   matched, and git resolved the name again at run time — acting on a
+///   commit the plan never showed. The commit the name resolves to is bound.
+/// * the REMOTE branch a force-push overwrites. `--force-with-lease` with no
+///   expected value is an implicit lease against the CURRENT remote-tracking
+///   ref, so a background `git fetch` that advanced it made the lease
+///   satisfied by exactly the commit the plan never saw, and the push
+///   silently replaced someone else's work (verified against git 2.56.1:
+///   `+ 1a989c8...027b451 (forced update)`). The remote-tracking oid is bound
+///   and the lease carries it explicitly (see `git_handler::force_push_argv`).
+///
+/// The name stays in the argv on purpose — `git checkout <branch>` attaches
+/// HEAD while `<oid>` detaches it, and a merge by name records the name in its
+/// default message — so the oid goes in the STATE, not the argv. A moved name
+/// then changes the state, and the reviewed token no longer applies.
+///
+/// Branch deletion (`-d <branch>`) and `clean -fd` name no revision, so they
+/// bind nothing extra: for them HEAD + index already cover what the command
+/// acts on.
+pub(crate) fn state_binding(
+    root: &Path,
+    op: &str,
+    argv: &[String],
+) -> Result<String, JsonRpcError> {
+    let mut state = format!(
         "{}\u{0}{}",
         head_oid(root).unwrap_or_else(|| "none".to_string()),
-        index_digest(root)?,
-    ))
+        index_digest(root)?
+    );
+    for oid in resolved_target_oids(root, op, argv) {
+        state.push('\u{0}');
+        state.push_str(&oid);
+    }
+    Ok(state)
+}
+
+/// The oids a plan has to bind beyond HEAD and the index, in a stable order.
+///
+/// A name that does not resolve is bound as the literal `unresolved:<name>`
+/// rather than skipped: a target that did not resolve at plan time must not
+/// become resolvable later under the same token. The unresolved fact is bound
+/// too, so the token cannot be reused for a different resolution.
+fn resolved_target_oids(root: &Path, op: &str, argv: &[String]) -> Vec<String> {
+    match op {
+        // The four revision-taking operations: bind the commit each name
+        // resolves to NOW, so a moved branch invalidates the token.
+        "checkout" | "merge" | "rebase" | "reset" => {
+            // The name is the LAST argument for every revision form:
+            // `checkout --no-guess <t>`, `merge --no-edit <t>`,
+            // `rebase <t>`, `reset --hard|--mixed <t>`.
+            let Some(name) = argv.last() else {
+                return Vec::new();
+            };
+            // Flag-shaped targets (`reset -d <branch>`, `reset clean -fd`)
+            // are not revisions; `-d`'s branch is a deletion, not a commit.
+            if name.starts_with('-') || argv.iter().any(|arg| arg == "-d") {
+                Vec::new()
+            } else {
+                vec![resolve_oid(root, name)]
+            }
+        }
+        // Force-push: bind the remote branch it will overwrite. The lease
+        // (`git_handler::force_push_argv`) is built from the SAME resolution,
+        // so the argv the token binds and the oid the state binds agree.
+        "force" => match force_refspec(argv) {
+            Some((remote, branch)) => vec![resolve_oid(
+                root,
+                &format!("refs/remotes/{remote}/{branch}"),
+            )],
+            None => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// The `<remote>, <branch>` pair a force-push argv targets, when it names one.
+///
+/// Mirrors `git_handler::force_push_argv`: `push --force-with-lease[=…]
+/// <remote> HEAD:refs/heads/<branch>`. A bare remote (`push … origin`) keeps
+/// git's own upstream resolution and names no branch to bind.
+///
+/// The remote is the argument immediately BEFORE the `HEAD:refs/heads/…`
+/// refspec, read from the argv itself — never assumed to be `origin`, since
+/// the plan may name any configured remote.
+fn force_refspec(argv: &[String]) -> Option<(String, String)> {
+    let refspec_at = argv
+        .iter()
+        .position(|arg| arg.starts_with("HEAD:refs/heads/"))?;
+    let branch = argv[refspec_at]
+        .strip_prefix("HEAD:refs/heads/")?
+        .to_string();
+    let remote = argv.get(refspec_at.checked_sub(1)?)?;
+    if remote.is_empty() || remote.starts_with('-') {
+        return None;
+    }
+    Some((remote.clone(), branch))
+}
+
+/// The remote-tracking oid a force-push lease must pin, when it names a
+/// remote branch.
+///
+/// ONE resolution shared by the argv builder (`force_push_argv`) and the
+/// token state (`resolved_target_oids`): the lease the command carries and the
+/// oid the token binds are read from the same place, so the two cannot
+/// disagree about what "reviewed" means.
+///
+/// `None` when the shape names no branch (bare remote) or the branch does not
+/// resolve yet (unborn) — the caller then falls back to git's implicit lease.
+pub(crate) fn force_lease_oid(root: &Path, argv: &[String]) -> Option<String> {
+    let (remote, branch) = force_refspec(argv)?;
+    let oid = resolve_oid(root, &format!("refs/remotes/{remote}/{branch}"));
+    (oid.len() == 40 && oid.bytes().all(|b| b.is_ascii_hexdigit())).then_some(oid)
+}
+
+/// Resolve a revision name to the commit it names RIGHT NOW.
+///
+/// `--verify --quiet` makes an unknown name a failure instead of echoing the
+/// input back, so a typo can never bind as if it were a commit.
+fn resolve_oid(root: &Path, name: &str) -> String {
+    let resolved = super::git_diff_handler::git_output_capped(
+        root,
+        &[
+            "rev-parse".to_string(),
+            "--verify".to_string(),
+            "--quiet".to_string(),
+            format!("{name}^{{commit}}"),
+        ],
+        4096,
+    );
+    match resolved {
+        Ok((text, _)) => {
+            let oid = text.trim();
+            if oid.len() == 40 && oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+                oid.to_string()
+            } else {
+                format!("unresolved:{name}")
+            }
+        }
+        Err(_) => format!("unresolved:{name}"),
+    }
 }
 
 /// Recompute the preview token for `(op, argv)` against the CURRENT state.
 ///
 /// The token is the plan's identity AND its validity window: it changes when
 /// the argv changes (caller typo, tree grew) and when the state changes
-/// (HEAD moved, index changed), so a stale token can never apply.
+/// (HEAD moved, index changed, a bound target moved), so a stale token can
+/// never apply.
 ///
 /// `pub(crate)` so `git_handler::mutation_plan` issues its advertised token
 /// through this exact function — a plan token that is not the apply token is
 /// a dead seam.
 pub(crate) fn token_now(root: &Path, op: &str, argv: &[String]) -> Result<String, JsonRpcError> {
-    Ok(preview_token(root, op, argv, &state_binding(root)?))
+    Ok(preview_token(
+        root,
+        op,
+        argv,
+        &state_binding(root, op, argv)?,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -792,13 +940,119 @@ fn count_chars_streaming(carry: &mut Vec<u8>, piece: &[u8]) -> usize {
     count
 }
 
+/// Whether this apply is a commit that reads the WHOLE index.
+///
+/// `commit -- <paths>` commits the worktree contents of exactly those paths
+/// and ignores what is staged for others, so the index is not what it
+/// consumes. Only the pathspec-free form commits the staged set, and only
+/// that form needs the validated-tree commit.
+fn commits_whole_index(op: &str, argv: &[String]) -> bool {
+    op == "commit" && !argv.iter().any(|arg| arg == "--")
+}
+
+/// Turn a planned whole-index `git commit` into a commit of an IMMUTABLE tree.
+///
+/// CodeRabbit round 8 (id 4691119067): the token check compares an index
+/// digest and only then spawns git, so content staged between the two was
+/// committed under a token that never reviewed it.
+///
+/// The obvious fix — run the commit with `GIT_INDEX_FILE` pointing at a
+/// snapshot — does NOT close the window, and this was verified against git
+/// 2.56.1 rather than assumed:
+///
+/// * `git commit` builds the tree AFTER the `pre-commit` hook runs, and the
+///   hook inherits the commit's environment. A hook that runs `git add`
+///   therefore writes into the snapshot and its content IS committed
+///   (`f.txt g.txt` in a clean repo).
+/// * A read-only snapshot does not help: git locks via `<index>.lock` and
+///   REPLACES the file, so file permissions never stop it.
+///
+/// The primitive that does hold is the tree object: `git write-tree` run
+/// against the validated snapshot produces an immutable object, and a commit
+/// made from that tree cannot contain anything that was not in it. So the
+/// whole-index commit becomes three steps —
+///
+/// 1. `write-tree` from the validated index snapshot → `<tree>`,
+/// 2. `commit-tree <tree> -p HEAD` with the reviewed message, trailers and
+///    signing, → `<commit>`,
+/// 3. `update-ref HEAD <commit> <old-HEAD>` — the compare-and-swap makes the
+///    final step itself conditional on HEAD not having moved.
+///
+/// Trailers are appended to the message in git's own trailer-block form,
+/// because `commit-tree` has no `--trailer` flag. The live index is never
+/// touched: whatever was staged during the commit stays staged.
+///
+/// Returns `None` when the step cannot be planned (no index to read yet), in
+/// which case the caller falls back to the ordinary `git commit`.
+fn validated_tree_commit(
+    root: &Path,
+    argv: &[String],
+) -> Result<Option<ValidatedCommit>, JsonRpcError> {
+    let Some((message, trailers)) = commit_message_and_trailers(argv) else {
+        return Ok(None);
+    };
+    let index_path = index_root(root).join(".git").join("index");
+    let Ok(bytes) = std::fs::read(&index_path) else {
+        return Ok(None);
+    };
+    let mut snapshot = tempfile::NamedTempFile::new()
+        .map_err(|error| JsonRpcError::internal_error(format!("index snapshot failed: {error}")))?;
+    std::io::Write::write_all(&mut snapshot, &bytes)
+        .map_err(|error| JsonRpcError::internal_error(format!("index snapshot failed: {error}")))?;
+    // Keep the path; close our handle so git can open the file freely.
+    let (_, path) = snapshot.into_parts();
+    Ok(Some(ValidatedCommit {
+        index: path,
+        message: compose_message(&message, &trailers),
+    }))
+}
+
+/// A whole-index commit planned against a frozen index.
+struct ValidatedCommit {
+    index: tempfile::TempPath,
+    message: String,
+}
+
+/// The message and trailer lines a planned commit argv carries.
+fn commit_message_and_trailers(argv: &[String]) -> Option<(String, Vec<String>)> {
+    let at = argv.iter().position(|arg| arg == "-m")?;
+    let message = argv.get(at + 1)?.clone();
+    let mut trailers = Vec::new();
+    let mut cursor = at + 2;
+    while argv.get(cursor).map(String::as_str) == Some("--trailer") {
+        trailers.push(argv.get(cursor + 1)?.clone());
+        cursor += 2;
+    }
+    Some((message, trailers))
+}
+
+/// Git's trailer block: a blank line, then the trailers, in the order given.
+///
+/// This is the shape `git commit --trailer` writes, reproduced because
+/// `commit-tree` has no `--trailer` flag. Each line is already validated as
+/// single-line and non-empty by `commit_argv`.
+fn compose_message(message: &str, trailers: &[String]) -> String {
+    if trailers.is_empty() {
+        return message.to_string();
+    }
+    let mut composed = String::from(message.trim_end());
+    composed.push_str("\n\n");
+    composed.push_str(&trailers.join("\n"));
+    composed.push('\n');
+    composed
+}
+
 /// Run one mutating git command under the hardened environment.
 ///
 /// stdin is closed so hooks cannot block on input; credential prompts are
 /// disabled by `GIT_TERMINAL_PROMPT=0` (and `GIT_ASKPASS=echo` as a second
 /// latch); `GIT_EDITOR=true` keeps `merge --no-edit`-class operations from
 /// opening an editor even where a hook or git path tries.
-async fn run_mutation(root: &Path, argv: &[String]) -> Result<MutationOutput, JsonRpcError> {
+async fn run_mutation_with_env(
+    root: &Path,
+    argv: &[String],
+    index_snapshot: Option<&Path>,
+) -> Result<MutationOutput, JsonRpcError> {
     let mut command = tokio::process::Command::new("git");
     command
         .args(argv)
@@ -812,6 +1066,9 @@ async fn run_mutation(root: &Path, argv: &[String]) -> Result<MutationOutput, Js
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    if let Some(snapshot) = index_snapshot {
+        command.env("GIT_INDEX_FILE", snapshot);
+    }
 
     let mut child = command
         .spawn()
@@ -858,6 +1115,76 @@ async fn run_mutation(root: &Path, argv: &[String]) -> Result<MutationOutput, Js
         stdout,
         truncated_chars,
     })
+}
+
+/// Run a mutation with no index pin — the plain form every non-commit
+/// operation uses, and what the executor's own tests call.
+async fn run_mutation(root: &Path, argv: &[String]) -> Result<MutationOutput, JsonRpcError> {
+    run_mutation_with_env(root, argv, None).await
+}
+
+/// Commit a validated tree: `write-tree` → `commit-tree` → `update-ref`.
+///
+/// Each step is a separate git process, so the tree is frozen as an object
+/// BEFORE anything else can touch it, and the final step is a compare-and-swap
+/// on HEAD (`update-ref HEAD <new> <old>`): git refuses the update if HEAD
+/// moved between the plan and this moment, which keeps the token's HEAD
+/// binding true even across the three steps.
+///
+/// The parent is `HEAD` at the moment the tree was validated, and an unborn
+/// branch (no HEAD yet) yields a root commit — `update-ref` then names no old
+/// value, which is the only shape where the CAS cannot apply.
+async fn run_validated_commit(
+    root: &Path,
+    plan: &ValidatedCommit,
+) -> Result<MutationOutput, JsonRpcError> {
+    // 1. Freeze the validated index as a tree object.
+    let tree_output =
+        run_mutation_with_env(root, &["write-tree".to_string()], Some(&plan.index)).await?;
+    let tree = tree_output.stdout.trim();
+    if tree.len() != 40 || !tree.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(JsonRpcError::internal_error(format!(
+            "git write-tree did not return a tree id: {tree:?}"
+        )));
+    }
+
+    // 2. Commit that tree, carrying the reviewed message (trailers composed
+    //    into it) and the same parent rule `git commit` uses.
+    let parent = head_oid(root);
+    let mut commit_argv = vec!["commit-tree".to_string(), tree.to_string()];
+    if let Some(parent) = &parent {
+        commit_argv.push("-p".to_string());
+        commit_argv.push(parent.clone());
+    }
+    // `--no-gpg-sign` matches the planned argv: the plan promised an
+    // unsigned commit, so the commit must not quietly sign.
+    commit_argv.push("--no-gpg-sign".to_string());
+    commit_argv.push("-m".to_string());
+    commit_argv.push(plan.message.clone());
+    let commit_output = run_mutation_with_env(root, &commit_argv, None).await?;
+    let commit = commit_output.stdout.trim();
+    if commit.len() != 40 || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(JsonRpcError::internal_error(format!(
+            "git commit-tree did not return a commit id: {commit:?}"
+        )));
+    }
+
+    // 3. Move HEAD to the new commit, conditional on it not having moved.
+    //    Passing the old value makes this a compare-and-swap: a HEAD that
+    //    moved since the plan is rejected by git instead of overwritten.
+    let mut update = vec![
+        "update-ref".to_string(),
+        "HEAD".to_string(),
+        commit.to_string(),
+    ];
+    if let Some(parent) = &parent {
+        update.push(parent.clone());
+    }
+    let output = run_mutation_with_env(root, &update, None).await?;
+    // The payload's `stdout` is what the push parser reads; a commit's
+    // summary is built from the repository instead, so the (empty) update-ref
+    // output is fine here.
+    Ok(output)
 }
 
 /// Build the error for a failed mutation: the combined output VERBATIM,
@@ -1097,7 +1424,25 @@ pub(crate) async fn handle(op: &str, root: &Path, args: &Value) -> Result<Value,
         }
     }
 
-    let output = run_mutation(root, &argv).await?;
+    // A whole-index commit reads the LIVE index when git runs, and nothing
+    // above holds it between the digest check and the spawn — another process
+    // (or a pre-commit hook, which inherits the commit's environment) could
+    // stage content in that window and the reviewed token would authorise a
+    // commit that includes it (CodeRabbit round 8, id 4691119067). The
+    // commit is therefore made from an immutable tree built from the
+    // validated index (`validated_tree_commit` explains why a snapshot alone
+    // does not suffice). A pathspec commit (`commit -- <paths>`) reads the
+    // WORKTREE for its paths, not the index, so it keeps the ordinary command.
+    let validated = if commits_whole_index(op, &argv) {
+        validated_tree_commit(root, &argv)?
+    } else {
+        None
+    };
+
+    let output = match &validated {
+        Some(plan) => run_validated_commit(root, plan).await?,
+        None => run_mutation(root, &argv).await?,
+    };
 
     let mut payload = json!({
         "action": op,
@@ -1137,804 +1482,5 @@ pub(crate) async fn handle(op: &str, root: &Path, args: &Value) -> Result<Value,
 }
 
 #[cfg(test)]
-mod test {
-    use super::*;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .status()
-            .expect("git available");
-        assert!(status.success(), "git {args:?} failed");
-    }
-
-    fn scratch() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        git(dir.path(), &["init", "-q", "-b", "master"]);
-        std::fs::write(dir.path().join("f.txt"), "a\n").unwrap();
-        git(dir.path(), &["add", "."]);
-        git(dir.path(), &["commit", "-q", "-m", "one"]);
-        dir
-    }
-
-    /// Codex round 5 (id 4688435762): the token's index digest was taken with
-    /// `git ls-files` run from whatever `root` the caller named. When that
-    /// root is a SUBDIRECTORY of the repository, the listing covers only that
-    /// subtree — yet a `commit` with no `paths` commits the repository-wide
-    /// staged set. Staging a sibling after the plan therefore left HEAD and
-    /// the digest untouched, and the reviewed token authorized a commit
-    /// containing changes the plan never showed.
-    ///
-    /// The digest must cover the whole worktree index.
-    #[test]
-    fn test_index_digest_covers_the_worktree_not_just_the_named_subdirectory() {
-        let repo = scratch();
-        let toplevel = repo.path();
-        let member = toplevel.join("member");
-        std::fs::create_dir_all(&member).unwrap();
-        git(toplevel, &["config", "commit.gpgSign", "false"]);
-        std::fs::write(member.join("a.txt"), "a\n").unwrap();
-        std::fs::write(toplevel.join("sibling.txt"), "s\n").unwrap();
-        git(toplevel, &["add", "."]);
-        git(toplevel, &["commit", "-q", "-m", "two"]);
-
-        let before = index_digest(&member).expect("digest from the subdirectory");
-        // The digest of the subdirectory and of the worktree root agree on a
-        // clean tree: both name the same repository state.
-        assert_eq!(
-            before,
-            index_digest(toplevel).expect("digest from the root"),
-            "a subdirectory's digest must be the worktree's digest"
-        );
-
-        // Stage a SIBLING of the subdirectory. A commit issued from `member`
-        // with no `paths` would include it, so the digest MUST move.
-        std::fs::write(toplevel.join("sibling.txt"), "changed\n").unwrap();
-        git(toplevel, &["add", "sibling.txt"]);
-        let after = index_digest(&member).expect("digest after staging the sibling");
-        assert_ne!(
-            before, after,
-            "staging a sibling changed what a commit would carry, so the token's state must change too"
-        );
-        assert_eq!(
-            after,
-            index_digest(toplevel).expect("root digest after staging"),
-            "the subdirectory digest tracks the worktree index"
-        );
-    }
-
-    /// Codex round 6 (id 4688809351): the advertised `force-push
-    /// origin/branch` shape was passed to git as ONE argument, which `git push`
-    /// reads as a repository name — git refuses it outright ("'origin/main' is
-    /// not a valid push target"). The plan has to be executable: split it into
-    /// `<remote> HEAD:refs/heads/<branch>`.
-    #[test]
-    fn test_force_push_argv_is_executable() {
-        use super::super::git_handler::force_push_argv;
-        assert_eq!(
-            force_push_argv("origin/main"),
-            [
-                "push",
-                "--force-with-lease",
-                "origin",
-                "HEAD:refs/heads/main"
-            ]
-        );
-        assert_eq!(
-            force_push_argv("origin/feature/x"),
-            [
-                "push",
-                "--force-with-lease",
-                "origin",
-                "HEAD:refs/heads/feature/x"
-            ],
-            "a slashed branch name must survive whole"
-        );
-        // A bare remote keeps git's own upstream resolution.
-        assert_eq!(
-            force_push_argv("origin"),
-            ["push", "--force-with-lease", "origin"]
-        );
-    }
-
-    /// …and the split form must actually push, while the single-argument form
-    /// must not. A local bare remote makes that provable without a network.
-    #[test]
-    fn test_force_push_argv_really_pushes_while_the_single_argument_does_not() {
-        use super::super::git_handler::force_push_argv;
-        let holder = tempfile::tempdir().unwrap();
-        let bare = holder.path().join("remote.git");
-        let work = holder.path().join("work");
-        git(
-            holder.path(),
-            &["init", "-q", "--bare", bare.to_str().unwrap()],
-        );
-        git(
-            holder.path(),
-            &["clone", "-q", bare.to_str().unwrap(), "work"],
-        );
-        git(&work, &["config", "commit.gpgSign", "false"]);
-        git(&work, &["config", "user.email", "t@t"]);
-        git(&work, &["config", "user.name", "t"]);
-        std::fs::write(work.join("f.txt"), "one\n").unwrap();
-        git(&work, &["add", "."]);
-        git(&work, &["commit", "-q", "-m", "one"]);
-        git(
-            &work,
-            &["push", "-q", "-u", "origin", "HEAD:refs/heads/main"],
-        );
-        std::fs::write(work.join("f.txt"), "two\n").unwrap();
-        git(&work, &["add", "."]);
-        git(&work, &["commit", "-q", "-m", "two"]);
-
-        let run = |argv: &[String]| {
-            std::process::Command::new("git")
-                .args(argv)
-                .current_dir(&work)
-                .output()
-                .expect("git available")
-        };
-        let broken = run(&vuec(["push", "--force-with-lease", "origin/main"]));
-        assert!(
-            !broken.status.success(),
-            "precondition: the single-argument form is the bug and must fail"
-        );
-        let fixed = run(&force_push_argv("origin/main"));
-        assert!(
-            fixed.status.success(),
-            "the split form must push: stderr={}",
-            String::from_utf8_lossy(&fixed.stderr)
-        );
-        // The remote now carries the second commit.
-        let log = std::process::Command::new("git")
-            .args(["log", "--oneline", "main"])
-            .current_dir(&bare)
-            .output()
-            .expect("git available");
-        assert!(
-            String::from_utf8_lossy(&log.stdout).contains("two"),
-            "the push must reach the remote: {}",
-            String::from_utf8_lossy(&log.stdout)
-        );
-    }
-
-    fn vuec(parts: [&str; 3]) -> Vec<String> {
-        parts.iter().map(|part| (*part).to_string()).collect()
-    }
-
-    /// Codex round 6 (id 4688809355): a truncated `ls-files` listing hashed
-    /// only a prefix, so entries past the cap could change without moving the
-    /// token. Binding state we cannot see must be refused.
-    #[test]
-    fn test_digest_listing_refuses_a_truncated_inventory() {
-        let listing = "100644 aaaa 0\tf.txt\n";
-        assert!(
-            digest_listing(listing, false).is_ok(),
-            "a complete listing binds"
-        );
-        let error = digest_listing(listing, true).unwrap_err();
-        assert!(
-            error
-                .message_with_hint()
-                .contains("cannot bind the mutation token"),
-            "{error:?}"
-        );
-        // The guard must be about completeness, not contents: the same text
-        // that binds when whole is refused when cut.
-        assert_ne!(
-            digest_listing(listing, false).unwrap(),
-            digest_listing("", false).unwrap(),
-            "the digest must actually cover the listing"
-        );
-    }
-
-    /// The real probe path is unambiguous on a small repo (must succeed) — the
-    /// refusal branch above is unreachable without a >8 MiB index, so it is
-    /// pinned at the seam instead of by building 70k files.
-    #[test]
-    fn test_index_digest_binds_a_real_repository() {
-        let repo = scratch();
-        assert!(index_digest(repo.path()).is_ok());
-    }
-
-    /// CodeRabbit round 8 (id 4691119051): bulk discovery walked the
-    /// filesystem, so an IGNORED file such as `dist/bundle.js` was named
-    /// explicitly in the argv — and `git add` REJECTS an explicitly named
-    /// ignored path ("Use -f if you really want to add it"), so an ordinary
-    /// `paths:["."]` failed outright.
-    #[test]
-    fn test_bulk_staging_skips_git_ignored_files() {
-        let repo = scratch();
-        let root = repo.path();
-        git(root, &["config", "commit.gpgSign", "false"]);
-        std::fs::write(root.join(".gitignore"), "dist/\n").unwrap();
-        git(root, &["add", ".gitignore"]);
-        git(root, &["commit", "-q", "-m", "ignore"]);
-        std::fs::create_dir_all(root.join("dist")).unwrap();
-        std::fs::write(root.join("dist/bundle.js"), "built\n").unwrap();
-        std::fs::write(root.join("src_new.rs"), "fn a() {}\n").unwrap();
-
-        let outcome = staging_outcome(root, &json!({ "paths": ["."] })).unwrap();
-        assert!(
-            !outcome.staged.iter().any(|path| path.starts_with("dist/")),
-            "an ignored file must never be named explicitly: {:?}",
-            outcome.staged
-        );
-        assert!(
-            outcome.staged.iter().any(|path| path == "src_new.rs"),
-            "a non-ignored file must still be staged: {:?}",
-            outcome.staged
-        );
-        let argv = add_argv(&outcome);
-        assert!(
-            !argv.iter().any(|arg| arg.starts_with("dist/")),
-            "the argv must not carry the ignored path: {argv:?}"
-        );
-    }
-
-    /// CodeRabbit round 8 (id 4691119058): `--` stops OPTION parsing, not
-    /// PATHSPEC expansion. A file literally named `*` would make
-    /// `git add -- "*"` stage everything — including a `.env` the guardrail
-    /// just excluded. Literal pathspec mode makes each name mean itself.
-    #[test]
-    fn test_add_argv_uses_literal_pathspecs_so_a_star_filename_is_not_a_wildcard() {
-        let outcome = StagingOutcome {
-            staged: vec!["*".to_string(), "src/lib.rs".to_string()],
-            excluded: vec![(".env".to_string(), "likely secret")],
-            warnings: Vec::new(),
-        };
-        let argv = add_argv(&outcome);
-        assert_eq!(
-            argv.first().map(String::as_str),
-            Some("--literal-pathspecs"),
-            "the global option must precede the subcommand: {argv:?}"
-        );
-        assert_eq!(argv.get(1).map(String::as_str), Some("add"));
-        assert!(
-            !argv.iter().any(|arg| arg == ".env"),
-            "the excluded secret must not appear: {argv:?}"
-        );
-
-        // Prove the difference against real git: without literal mode the
-        // wildcard matches every path; with it, only the literal file.
-        let repo = scratch();
-        let root = repo.path();
-        git(root, &["config", "commit.gpgSign", "false"]);
-        // A file literally named `*` — the case that turns the argv item into
-        // a wildcard if literal mode is dropped.
-        std::fs::write(root.join("*"), "star\n").unwrap();
-        std::fs::write(root.join("other.rs"), "changed\n").unwrap();
-        git(root, &["add", "--", "*"]);
-        git(root, &["commit", "-q", "-m", "star"]);
-        std::fs::write(root.join("*"), "star2\n").unwrap();
-        std::fs::write(root.join("other.rs"), "changed2\n").unwrap();
-        git(root, &["reset", "-q"]);
-        let run = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(root)
-                .output()
-                .expect("git available")
-        };
-        // The bug: a bare `add -- "*"` stages BOTH files.
-        let wildcard = run(&["add", "--", "*"]);
-        assert!(wildcard.status.success());
-        let cached = run(&["diff", "--cached", "--name-only"]);
-        let listed = String::from_utf8_lossy(&cached.stdout).to_string();
-        assert!(
-            listed.contains("other.rs"),
-            "precondition: the wildcard form stages an unrelated file: {listed}"
-        );
-        // The fix: only the literal `*` file.
-        git(root, &["reset", "-q"]);
-        let literal_argv = add_argv(&StagingOutcome {
-            staged: vec!["*".to_string()],
-            excluded: Vec::new(),
-            warnings: Vec::new(),
-        });
-        let literal_args: Vec<&str> = literal_argv.iter().map(String::as_str).collect();
-        let literal = run(&literal_args);
-        assert!(
-            literal.status.success(),
-            "stderr={}",
-            String::from_utf8_lossy(&literal.stderr)
-        );
-        let cached = run(&["diff", "--cached", "--name-only"]);
-        let listed = String::from_utf8_lossy(&cached.stdout).to_string();
-        assert!(
-            !listed.contains("other.rs"),
-            "literal mode must not touch the unrelated file: {listed}"
-        );
-    }
-
-    /// CodeRabbit round 8 (id 4691119046): when the walk stops on its budget
-    /// or depth limit it never ENTERS the remaining subtree, so `skipped`
-    /// stays 0 and the response claimed a complete bulk add.
-    #[test]
-    fn test_bulk_staging_warns_when_enumeration_is_incomplete() {
-        let repo = scratch();
-        let root = repo.path();
-        // 20 nested directories exceed the walk's depth cap of 16.
-        let mut deep = root.to_path_buf();
-        for index in 0..20 {
-            deep = deep.join(format!("d{index}"));
-        }
-        std::fs::create_dir_all(&deep).unwrap();
-        std::fs::write(deep.join("buried.rs"), "fn deep() {}\n").unwrap();
-
-        let outcome = staging_outcome(root, &json!({ "paths": ["."] })).unwrap();
-        assert!(
-            outcome
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("INCOMPLETE")),
-            "an incomplete walk must say so: {:?}",
-            outcome.warnings
-        );
-    }
-
-    /// CodeRabbit round 8 (id 4691119062): the porcelain parser looked for a
-    /// `>` line prefix that git never emits and expected a fourth `<old>:<new>`
-    /// field, so every successful push answered `remote_ref: null, range: null`.
-    /// The three shapes below are copied verbatim from git 2.56.1 output
-    /// (captured with `cat -A`, hence the leading space on the fast-forward
-    /// flag).
-    #[tokio::test]
-    async fn test_push_payload_parses_the_three_real_porcelain_shapes() {
-        let repo = scratch();
-        let root = repo.path();
-
-        // New branch: `*` flag plus `[new branch]`.
-        let new_branch = push_payload(
-            "To /tmp/remote\n*\trefs/heads/main:refs/heads/main\t[new branch]\nDone\n",
-            root,
-        )
-        .await;
-        assert_eq!(
-            new_branch["remote_ref"], "refs/heads/main:refs/heads/main",
-            "a new branch must report its refspec: {new_branch}"
-        );
-        assert_eq!(
-            new_branch["range"], "[new branch] (new)",
-            "a new branch has no old oid: {new_branch}"
-        );
-
-        // Fast forward: a literal space flag and an `old..new` summary.
-        let fast_forward = push_payload(
-            "To /tmp/remote\n \trefs/heads/main:refs/heads/main\t548a312..c2fc253\nDone\n",
-            root,
-        )
-        .await;
-        assert_eq!(
-            fast_forward["range"], "548a312..c2fc253",
-            "a fast-forward must report the moved range: {fast_forward}"
-        );
-
-        // Up to date: `=` flag, `[up to date]` summary — no range, and a note.
-        let up_to_date = push_payload(
-            "To /tmp/remote\n=\trefs/heads/main:refs/heads/main\t[up to date]\nDone\n",
-            root,
-        )
-        .await;
-        assert_eq!(
-            up_to_date["remote_ref"], "refs/heads/main:refs/heads/main",
-            "the refspec is reported even when nothing moved: {up_to_date}"
-        );
-        assert_eq!(
-            up_to_date["range"],
-            Value::Null,
-            "nothing moved, so there is no range: {up_to_date}"
-        );
-        assert!(
-            up_to_date["note"]
-                .as_str()
-                .is_some_and(|note| note.contains("already up to date")),
-            "the note must say why the range is empty: {up_to_date}"
-        );
-
-        // A forced update keeps the three-dot form and says so.
-        let forced = push_payload(
-            "To /tmp/remote\n+\trefs/heads/main:refs/heads/main\tabc123...def456 (forced update)\nDone\n",
-            root,
-        )
-        .await;
-        assert_eq!(
-            forced["range"], "abc123...def456",
-            "a forced update must keep the three-dot range: {forced}"
-        );
-        assert!(
-            forced["note"]
-                .as_str()
-                .is_some_and(|note| note.contains("forced update")),
-            "a forced update must be labelled: {forced}"
-        );
-
-        // A rejected push surfaces the reason instead of a range.
-        let rejected = push_payload(
-            "To /tmp/remote\n!\trefs/heads/main:refs/heads/main\t[rejected] (non-fast-forward)\nDone\n",
-            root,
-        )
-        .await;
-        assert_eq!(
-            rejected["range"],
-            Value::Null,
-            "a rejected push moved nothing: {rejected}"
-        );
-        assert!(
-            rejected["note"]
-                .as_str()
-                .is_some_and(|note| note.contains("non-fast-forward")),
-            "the rejection reason must survive: {rejected}"
-        );
-
-        // The header lines (`To …`, `Done`) must not be read as records.
-        let header_only = push_payload("To /tmp/remote\nDone\n", root).await;
-        assert_eq!(
-            header_only["remote_ref"],
-            Value::Null,
-            "no record means no refspec: {header_only}"
-        );
-    }
-
-    #[test]
-    fn test_staging_includes_deleted_tracked_files() {
-        let repo = scratch();
-        let root = repo.path();
-        git(root, &["config", "commit.gpgSign", "false"]);
-        std::fs::write(root.join("keep.txt"), "b\n").unwrap();
-        git(root, &["add", "."]);
-        git(root, &["commit", "-q", "-m", "two"]);
-        // Modify one tracked file and delete another from the worktree.
-        std::fs::write(root.join("f.txt"), "changed\n").unwrap();
-        std::fs::remove_file(root.join("keep.txt")).unwrap();
-
-        // Bulk: the walk finds f.txt; git's inventory must add keep.txt.
-        let outcome = staging_outcome(root, &serde_json::json!({ "paths": ["."] })).unwrap();
-        assert!(
-            outcome.staged.iter().any(|p| p == "f.txt"),
-            "modified file staged: {:?}",
-            outcome.staged
-        );
-        assert!(
-            outcome.staged.iter().any(|p| p == "keep.txt"),
-            "deleted tracked file must be staged for removal: {:?}",
-            outcome.staged
-        );
-
-        // Explicit: the deleted path is accepted although it no longer exists.
-        let outcome =
-            staging_outcome(root, &serde_json::json!({ "paths": ["./keep.txt"] })).unwrap();
-        assert_eq!(outcome.staged, vec!["./keep.txt".to_string()]);
-
-        // A deleted path scoped to a subdirectory only picks deletions there.
-        std::fs::create_dir_all(root.join("sub")).unwrap();
-        std::fs::write(root.join("sub/g.txt"), "g\n").unwrap();
-        git(root, &["add", "."]);
-        git(root, &["commit", "-q", "-m", "three"]);
-        std::fs::remove_file(root.join("sub/g.txt")).unwrap();
-        let outcome = staging_outcome(root, &serde_json::json!({ "paths": ["sub"] })).unwrap();
-        assert!(
-            outcome.staged.iter().any(|p| p == "sub/g.txt"),
-            "{:?}",
-            outcome.staged
-        );
-        assert!(
-            !outcome.staged.iter().any(|p| p == "keep.txt"),
-            "deletion outside the requested directory must not be staged: {:?}",
-            outcome.staged
-        );
-
-        // Containment is still enforced: a nonexistent path that is NOT a
-        // tracked deletion, or one that traverses out, is rejected.
-        let rejected = |paths: serde_json::Value| match staging_outcome(root, &paths) {
-            Err(error) => error.message,
-            Ok(_) => panic!("{paths} must be rejected"),
-        };
-        assert!(
-            rejected(serde_json::json!({ "paths": ["ghost.txt"] }))
-                .contains("not a path inside this project")
-        );
-        assert!(
-            rejected(serde_json::json!({ "paths": ["../outside"] }))
-                .contains("not a path inside this project")
-        );
-    }
-
-    /// A hook that floods stderr well past the OS pipe buffer (64 KiB on
-    /// Linux). Before the fix, `run_mutation` read stdout to EOF first and
-    /// only then stderr, so git blocked on the full stderr pipe, stdout never
-    /// reached EOF, and the call hung until the 300s timeout.
-    #[tokio::test]
-    async fn test_run_mutation_drains_both_pipes_when_a_hook_floods_stderr() {
-        let repo = scratch();
-        let hooks = repo.path().join(".git/hooks");
-        std::fs::write(
-            hooks.join("pre-commit"),
-            "#!/bin/sh\nhead -c 300000 /dev/zero | tr '\\0' 'x' >&2\necho hook-stderr >&2\nexit 0\n",
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            hooks.join("pre-commit"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
-        std::fs::write(repo.path().join("f.txt"), "b\n").unwrap();
-        // `git commit` refuses an empty commit (nothing staged), which is
-        // what the hook-flood commit would be without this. Stage through the
-        // executor under test so the setup is itself exercised end-to-end.
-        run_mutation(repo.path(), &["add".to_string(), "f.txt".to_string()])
-            .await
-            .expect("staging the fixture must succeed");
-
-        // Well under MUTATION_TIMEOUT: a regression hangs here, and the
-        // assertion fails the test instead of stalling the suite for 300s.
-        let started = std::time::Instant::now();
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            run_mutation(
-                repo.path(),
-                &[
-                    "commit".to_string(),
-                    "-q".to_string(),
-                    "-m".to_string(),
-                    "two".to_string(),
-                ],
-            ),
-        )
-        .await
-        .expect("run_mutation must not deadlock on a hook that floods stderr")
-        .expect("commit with a passing hook succeeds");
-        assert!(started.elapsed() < std::time::Duration::from_secs(30));
-        // git routes hook output to ITS stderr, so the marker never reaches
-        // stdout; what the success path proves is that the 300 KB flood was
-        // drained concurrently (no deadlock) and that the overflow past the
-        // per-stream cap was counted rather than lost.
-        assert!(output.stdout.trim().is_empty(), "{}", output.stdout);
-        // 300,000 bytes in, 262,144 kept: the difference is the drop.
-        assert!(
-            output.truncated_chars >= 300_000 - MAX_MUTATION_OUTPUT_BYTES,
-            "stderr past the cap must be reported as dropped, got {}",
-            output.truncated_chars
-        );
-    }
-
-    #[tokio::test]
-    async fn test_drain_capped_keeps_the_cap_and_reports_dropped_characters() {
-        // A 64-byte duplex forces many small reads, so the cap is crossed
-        // mid-stream rather than in one shot.
-        let (mut tx, rx) = tokio::io::duplex(64);
-        let payload: Vec<u8> =
-            std::iter::repeat_n(b'x', MAX_MUTATION_OUTPUT_BYTES + 1000).collect();
-        let write = async move {
-            use tokio::io::AsyncWriteExt;
-            tx.write_all(&payload).await.unwrap();
-            tx.shutdown().await.unwrap();
-        };
-        let ((text, dropped), ()) = tokio::join!(drain_capped(Some(rx)), write);
-        assert_eq!(text.len(), MAX_MUTATION_OUTPUT_BYTES, "kept text is capped");
-        assert_eq!(
-            dropped, 1000,
-            "exactly the characters past the cap are counted"
-        );
-    }
-
-    #[test]
-    fn test_count_chars_streaming_is_exact_for_multibyte_split_across_reads() {
-        // 2-byte characters ("é" is U+00E9 = 0xC3 0xA9), so a split can land
-        // in the middle of one.
-        let bytes = "éééééééééé".as_bytes();
-        for cut in 1..bytes.len() {
-            let (a, b) = bytes.split_at(cut);
-            let mut carry = Vec::new();
-            let counted = count_chars_streaming(&mut carry, a)
-                + count_chars_streaming(&mut carry, b)
-                + usize::from(!carry.is_empty());
-            assert_eq!(
-                counted, 10,
-                "split at byte {cut} must still count 10 characters"
-            );
-        }
-        // An invalid byte is one replacement character and is consumed, so
-        // the following valid byte is counted on its own.
-        let mut carry = Vec::new();
-        assert_eq!(count_chars_streaming(&mut carry, &[0xFF, b'a']), 2);
-        assert!(carry.is_empty());
-    }
-
-    #[test]
-    fn test_secret_names_are_classified() {
-        assert!(is_secret_path(".env"));
-        assert!(is_secret_path("config/.env.production"));
-        assert!(is_secret_path("server.pem"));
-        assert!(is_secret_path("keys/id_rsa"));
-        assert!(is_secret_path("client.key"));
-        assert!(is_secret_path("credentials/google.json"));
-        // A `secrets/` directory is sensitive regardless of the basename —
-        // the doc promised it; the predicate used to check only
-        // `credentials` (Codex round 4, C4-3).
-        assert!(is_secret_path("secrets/prod-token.txt"));
-        assert!(is_secret_path("deploy/Secrets/api.json"));
-        assert!(is_secret_path("my_secret_notes.txt"));
-        assert!(!is_secret_path("src/key.rs"));
-        assert!(!is_secret_path("environment.rs"));
-        // A basename that merely STARTS with the directory word is not a
-        // directory: `secretary/` and `credentials-old/` hold no secrets.
-        assert!(!is_secret_path("secretary/notes.txt"));
-        assert!(!is_secret_path("credentials-old/notes.txt"));
-    }
-
-    #[test]
-    fn test_runtime_artifacts_are_classified() {
-        assert!(is_runtime_artifact(".maestro/operations/1-lock/lock"));
-        assert!(is_runtime_artifact(".maestro/operations/9x/lock"));
-        assert!(is_runtime_artifact("selection.json"));
-        assert!(is_runtime_artifact("initializer.json"));
-        assert!(is_runtime_artifact("deep/nested/target/debug/blob"));
-        assert!(is_runtime_artifact("logs/server.log"));
-        assert!(!is_runtime_artifact("src/lock.rs"));
-        assert!(!is_runtime_artifact("selection_reader.rs"));
-        assert!(!is_runtime_artifact("initializer.rs"));
-    }
-
-    #[test]
-    fn test_staging_report_excludes_and_warns_on_bulk_add() {
-        let repo = scratch();
-        let root = repo.path();
-        std::fs::write(root.join(".env"), "TOKEN=x\n").unwrap();
-        std::fs::write(root.join("keep.rs"), "fn a() {}\n").unwrap();
-        std::fs::create_dir_all(root.join(".maestro/operations/j1")).unwrap();
-        std::fs::write(root.join(".maestro/operations/j1/lock"), "1").unwrap();
-
-        let outcome = staging_outcome(root, &serde_json::json!({ "paths": ["."] })).unwrap();
-        assert!(outcome.staged.contains(&"keep.rs".to_string()));
-        assert!(
-            !outcome.staged.iter().any(|p| p == ".env"),
-            "{:?}",
-            outcome.staged
-        );
-        assert!(
-            !outcome
-                .staged
-                .iter()
-                .any(|p| p.contains(".maestro/operations")),
-            "{:?}",
-            outcome.staged
-        );
-        assert!(
-            outcome
-                .excluded
-                .iter()
-                .any(|(p, r)| p == ".env" && *r == "likely secret")
-        );
-        assert!(
-            outcome
-                .excluded
-                .iter()
-                .any(|(p, r)| p.ends_with("/lock") && *r == "runtime artefact")
-        );
-        assert!(outcome.warnings.iter().any(|w| w.contains(".env")));
-    }
-
-    #[test]
-    fn test_explicit_secret_path_overrides_the_exclusion_with_a_warning() {
-        let repo = scratch();
-        let root = repo.path();
-        std::fs::write(root.join(".env"), "TOKEN=x\n").unwrap();
-        let outcome = staging_outcome(root, &serde_json::json!({ "paths": [".env"] })).unwrap();
-        assert_eq!(outcome.staged, vec![".env".to_string()]);
-        assert!(outcome.warnings.iter().any(|w| w.contains(".env")));
-    }
-
-    #[test]
-    fn test_allow_sensitive_stages_directory_discovered_secrets() {
-        let repo = scratch();
-        let root = repo.path();
-        std::fs::write(root.join(".env"), "TOKEN=x\n").unwrap();
-        let outcome = staging_outcome(
-            root,
-            &serde_json::json!({ "paths": ["."], "allow_sensitive": true }),
-        )
-        .unwrap();
-        assert!(outcome.staged.contains(&".env".to_string()));
-        assert!(outcome.excluded.is_empty());
-    }
-
-    #[test]
-    fn test_large_and_binary_files_are_warned() {
-        let repo = scratch();
-        let root = repo.path();
-        std::fs::write(root.join("big.bin"), [0u8; 1024 * 1024 + 42]).unwrap();
-        let outcome = staging_outcome(root, &serde_json::json!({ "paths": ["big.bin"] })).unwrap();
-        assert!(
-            outcome
-                .warnings
-                .iter()
-                .any(|w| w.contains("MiB") && w.contains("big.bin"))
-        );
-        assert!(outcome.warnings.iter().any(|w| w.contains("binary")));
-    }
-
-    #[test]
-    fn test_failure_error_redacts_credentials_from_git_output() {
-        // F3: git echoes remote URLs and hook chatter verbatim. A push that
-        // fails against `https://user:token@host/…` must not put the token in
-        // an MCP error message.
-        let error = failure_error(
-            &["push".to_string()],
-            "",
-            "fatal: unable to access 'https://scooter:s3cr3t-token@github.com/o/r.git/': 403\n\
-             remote: Authorization: Bearer abcdef123456\n",
-            0,
-        );
-        let message = error.message_with_hint();
-        assert!(
-            !message.contains("s3cr3t-token"),
-            "URL credentials must be redacted: {message}"
-        );
-        assert!(
-            !message.contains("abcdef123456"),
-            "bearer tokens must be redacted: {message}"
-        );
-        assert!(
-            message.contains("[REDACTED]"),
-            "the redaction is visible, not silently dropped: {message}"
-        );
-        // The words the hook printed that matter are still there.
-        assert!(message.contains("403"), "{message}");
-    }
-
-    /// The token binds repository state: once HEAD moves, a plan's token must
-    /// be rejected instead of replaying the reviewed argv against a moved
-    /// branch (brief §5 token binding).
-    ///
-    /// The token is derived through the EXPORTED seam ([`token_now`]) — never
-    /// by rebuilding the state string here. An earlier version hand-built
-    /// `"{head} {index}"` with a SPACE while [`state_binding`] joins with NUL,
-    /// so the apply rejected a token that never matched for the WRONG reason
-    /// and only the loose message assertion kept it green: it proved the
-    /// separator, not the binding.
-    #[tokio::test]
-    async fn test_apply_rejects_a_token_after_head_moves() {
-        let repo = scratch();
-        let root = repo.path();
-        let args = serde_json::json!({ "target": "HEAD" });
-        let argv = plan_argv_for("checkout", root, &args).unwrap();
-        let token = token_now(root, "checkout", &argv).unwrap();
-
-        // Sanity: the token IS valid for the state it was issued against, so
-        // the rejection below can only come from the HEAD move.
-        assert_eq!(
-            token_now(root, "checkout", &argv).unwrap(),
-            token,
-            "an unmoved repository must reproduce the plan's token"
-        );
-
-        // Move HEAD after the plan: the token's state is now stale.
-        std::fs::write(root.join("f.txt"), "changed\n").unwrap();
-        git(root, &["commit", "-aqm", "two"]);
-        assert_ne!(
-            token_now(root, "checkout", &argv).unwrap(),
-            token,
-            "the state binding must change when HEAD moves"
-        );
-
-        let error = handle(
-            "checkout",
-            root,
-            &serde_json::json!({ "target": "HEAD", "preview_token": token }),
-        )
-        .await
-        .expect_err("a stale token must not apply");
-        let message = error.message_with_hint();
-        assert!(
-            message.contains("no longer matches") || message.contains("fresh plan"),
-            "stale token must be refused with guidance: {error}"
-        );
-    }
-}
+#[path = "git_apply_test.rs"]
+mod test;
