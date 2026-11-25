@@ -218,13 +218,20 @@ pub(crate) fn tool_kind(argv: &[String]) -> ToolKind {
 
 /// `cargo check|clippy|build` gets JSON output so errors dedupe by code and
 /// warnings count per lint.
-fn with_json_format(mut argv: Vec<String>) -> Vec<String> {
+///
+/// The flag is a CARGO option, so it must land BEFORE a `--` separator: past
+/// that point the arguments go to the compiler/clippy-driver, which rejects
+/// `--message-format` ("Unrecognized option", exit 101). The documented gate
+/// `cargo clippy --workspace --all-targets -- -D warnings` is exactly that
+/// shape, so appending blindly made the strict gate unrunnable.
+pub(crate) fn with_json_format(mut argv: Vec<String>) -> Vec<String> {
     let machine = argv.iter().any(|a| a.starts_with("--message-format"));
     let compiles = argv
         .get(1)
         .is_some_and(|sub| matches!(sub.as_str(), "check" | "clippy" | "build"));
     if argv[0] == "cargo" && compiles && !machine {
-        argv.push("--message-format=json".to_string());
+        let at = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
+        argv.insert(at, "--message-format=json".to_string());
     }
     argv
 }

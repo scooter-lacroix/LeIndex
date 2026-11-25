@@ -352,3 +352,95 @@ fn test_retention_keeps_newest_logs() {
     assert_eq!(left, 2);
     assert!(run_log::read_by_handle(dir.path(), "log://r4").is_ok());
 }
+
+/// Codex round 6 (id 4688809343): `--message-format=json` is a CARGO option,
+/// so appending it put it AFTER a `--` separator where it is handed to
+/// clippy-driver, which rejects it ("Unrecognized option", exit 101). The
+/// documented gate `cargo clippy --workspace --all-targets -- -D warnings` is
+/// exactly that shape, so the strict gate became unrunnable through `run`.
+#[test]
+fn test_json_format_lands_before_the_argument_separator() {
+    assert_eq!(
+        with_json_format(argv(&[
+            "cargo",
+            "clippy",
+            "--workspace",
+            "--",
+            "-D",
+            "warnings"
+        ])),
+        argv(&[
+            "cargo",
+            "clippy",
+            "--workspace",
+            "--message-format=json",
+            "--",
+            "-D",
+            "warnings",
+        ]),
+        "the flag must precede `--`"
+    );
+    // No separator: appended at the end, unchanged behaviour.
+    assert_eq!(
+        with_json_format(argv(&["cargo", "check"])),
+        argv(&["cargo", "check", "--message-format=json"])
+    );
+    // Already present (either side of the separator): never duplicated.
+    assert_eq!(
+        with_json_format(argv(&["cargo", "build", "--message-format=json"])),
+        argv(&["cargo", "build", "--message-format=json"])
+    );
+    // Not a compiling subcommand: untouched.
+    assert_eq!(
+        with_json_format(argv(&["cargo", "test", "--", "-D"])),
+        argv(&["cargo", "test", "--", "-D"])
+    );
+}
+
+/// The transformation has to make the REAL gate runnable, not just look right:
+/// without it, `cargo clippy ... -- -D warnings --message-format=json` exits
+/// 101 with "Unrecognized option"; with it the same command succeeds.
+#[test]
+fn test_json_format_keeps_the_strict_clippy_gate_executable() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"gate_probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    let raw = vec![
+        "cargo".to_string(),
+        "clippy".to_string(),
+        "--workspace".to_string(),
+        "--all-targets".to_string(),
+        "--".to_string(),
+        "-D".to_string(),
+        "warnings".to_string(),
+    ];
+    let rewritten = with_json_format(raw.clone());
+    let run = |argv: &[String]| {
+        std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .current_dir(dir.path())
+            .output()
+            .expect("cargo available")
+    };
+    let broken = run(&[raw.clone(), vec!["--message-format=json".to_string()]].concat());
+    assert!(
+        !broken.status.success(),
+        "precondition: the appended form must fail (it is the bug), stderr={}",
+        String::from_utf8_lossy(&broken.stderr)
+    );
+    let fixed = run(&rewritten);
+    assert!(
+        fixed.status.success(),
+        "the rewritten gate must run: stderr={}",
+        String::from_utf8_lossy(&fixed.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&fixed.stdout).contains("build-finished"),
+        "cargo must actually emit its JSON records"
+    );
+}

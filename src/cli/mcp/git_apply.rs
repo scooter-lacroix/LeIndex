@@ -414,14 +414,35 @@ pub(crate) fn add_argv(outcome: &StagingOutcome) -> Vec<String> {
 /// directory the listing is byte-identical before and after staging a sibling,
 /// while `git diff --cached` there names that sibling.
 fn index_digest(root: &Path) -> Result<String, JsonRpcError> {
-    let (text, _) = super::git_diff_handler::git_output_capped(
+    let (text, truncated) = super::git_diff_handler::git_output_capped(
         &index_root(root),
         &["ls-files".to_string(), "-s".to_string()],
         MAX_DIFF_BYTES,
     )
     .map_err(|error| JsonRpcError::internal_error(format!("index probe failed: {error}")))?;
+    digest_listing(&text, truncated)
+}
+
+/// Hash one `git ls-files -s` listing, refusing a TRUNCATED one.
+///
+/// A truncated listing hashes only a prefix: entries past the cap could be
+/// staged or unstaged without moving the token, so a reviewed plan could
+/// authorize a commit carrying content it never showed. Refusing to bind
+/// state we cannot see is the only honest answer — the alternative is a token
+/// that silently certifies a partial view.
+fn digest_listing(listing: &str, truncated: bool) -> Result<String, JsonRpcError> {
+    if truncated {
+        return Err(JsonRpcError::invalid_params_with_suggestion(
+            format!(
+                "index inventory exceeds {MAX_DIFF_BYTES} bytes; cannot bind the mutation token \
+                 to the whole staged set"
+            ),
+            "Commit from a narrower repository, or unstage the paths the plan did not cover"
+                .to_string(),
+        ));
+    }
     let mut digest = blake3::Hasher::new();
-    for line in text.lines() {
+    for line in listing.lines() {
         digest.update(line.as_bytes());
         digest.update(b"\n");
     }
@@ -1050,11 +1071,139 @@ mod test {
         );
     }
 
-    /// A tracked file deleted from the worktree is invisible to the
-    /// filesystem walk, so a bulk `paths:["."]` staged every surviving
-    /// change and silently left the deletion unstaged — and naming the
-    /// deleted file explicitly failed the canonicalizing containment check
-    /// because it no longer exists. Both must stage the removal.
+    /// Codex round 6 (id 4688809351): the advertised `force-push
+    /// origin/branch` shape was passed to git as ONE argument, which `git push`
+    /// reads as a repository name — git refuses it outright ("'origin/main' is
+    /// not a valid push target"). The plan has to be executable: split it into
+    /// `<remote> HEAD:refs/heads/<branch>`.
+    #[test]
+    fn test_force_push_argv_is_executable() {
+        use super::super::git_handler::force_push_argv;
+        assert_eq!(
+            force_push_argv("origin/main"),
+            [
+                "push",
+                "--force-with-lease",
+                "origin",
+                "HEAD:refs/heads/main"
+            ]
+        );
+        assert_eq!(
+            force_push_argv("origin/feature/x"),
+            [
+                "push",
+                "--force-with-lease",
+                "origin",
+                "HEAD:refs/heads/feature/x"
+            ],
+            "a slashed branch name must survive whole"
+        );
+        // A bare remote keeps git's own upstream resolution.
+        assert_eq!(
+            force_push_argv("origin"),
+            ["push", "--force-with-lease", "origin"]
+        );
+    }
+
+    /// …and the split form must actually push, while the single-argument form
+    /// must not. A local bare remote makes that provable without a network.
+    #[test]
+    fn test_force_push_argv_really_pushes_while_the_single_argument_does_not() {
+        use super::super::git_handler::force_push_argv;
+        let holder = tempfile::tempdir().unwrap();
+        let bare = holder.path().join("remote.git");
+        let work = holder.path().join("work");
+        git(
+            holder.path(),
+            &["init", "-q", "--bare", bare.to_str().unwrap()],
+        );
+        git(
+            holder.path(),
+            &["clone", "-q", bare.to_str().unwrap(), "work"],
+        );
+        git(&work, &["config", "commit.gpgSign", "false"]);
+        git(&work, &["config", "user.email", "t@t"]);
+        git(&work, &["config", "user.name", "t"]);
+        std::fs::write(work.join("f.txt"), "one\n").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "one"]);
+        git(
+            &work,
+            &["push", "-q", "-u", "origin", "HEAD:refs/heads/main"],
+        );
+        std::fs::write(work.join("f.txt"), "two\n").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "two"]);
+
+        let run = |argv: &[String]| {
+            std::process::Command::new("git")
+                .args(argv)
+                .current_dir(&work)
+                .output()
+                .expect("git available")
+        };
+        let broken = run(&vuec(["push", "--force-with-lease", "origin/main"]));
+        assert!(
+            !broken.status.success(),
+            "precondition: the single-argument form is the bug and must fail"
+        );
+        let fixed = run(&force_push_argv("origin/main"));
+        assert!(
+            fixed.status.success(),
+            "the split form must push: stderr={}",
+            String::from_utf8_lossy(&fixed.stderr)
+        );
+        // The remote now carries the second commit.
+        let log = std::process::Command::new("git")
+            .args(["log", "--oneline", "main"])
+            .current_dir(&bare)
+            .output()
+            .expect("git available");
+        assert!(
+            String::from_utf8_lossy(&log.stdout).contains("two"),
+            "the push must reach the remote: {}",
+            String::from_utf8_lossy(&log.stdout)
+        );
+    }
+
+    fn vuec(parts: [&str; 3]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_string()).collect()
+    }
+
+    /// Codex round 6 (id 4688809355): a truncated `ls-files` listing hashed
+    /// only a prefix, so entries past the cap could change without moving the
+    /// token. Binding state we cannot see must be refused.
+    #[test]
+    fn test_digest_listing_refuses_a_truncated_inventory() {
+        let listing = "100644 aaaa 0\tf.txt\n";
+        assert!(
+            digest_listing(listing, false).is_ok(),
+            "a complete listing binds"
+        );
+        let error = digest_listing(listing, true).unwrap_err();
+        assert!(
+            error
+                .message_with_hint()
+                .contains("cannot bind the mutation token"),
+            "{error:?}"
+        );
+        // The guard must be about completeness, not contents: the same text
+        // that binds when whole is refused when cut.
+        assert_ne!(
+            digest_listing(listing, false).unwrap(),
+            digest_listing("", false).unwrap(),
+            "the digest must actually cover the listing"
+        );
+    }
+
+    /// The real probe path is unambiguous on a small repo (must succeed) — the
+    /// refusal branch above is unreachable without a >8 MiB index, so it is
+    /// pinned at the seam instead of by building 70k files.
+    #[test]
+    fn test_index_digest_binds_a_real_repository() {
+        let repo = scratch();
+        assert!(index_digest(repo.path()).is_ok());
+    }
     #[test]
     fn test_staging_includes_deleted_tracked_files() {
         let repo = scratch();

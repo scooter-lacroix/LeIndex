@@ -865,6 +865,26 @@ fn require_target(
     })
 }
 
+/// The argv for a force-push to `target`.
+///
+/// `git push` takes `[<repository> [<refspec>...]]`, so a single
+/// `origin/main` argument is parsed as a REPOSITORY and git refuses it
+/// ("fatal: 'origin/main' is not a valid push target", verified on git
+/// 2.56.1). The `remote/branch` form the plan advertises is therefore split
+/// into the two arguments git wants, pushing the local HEAD to that branch.
+/// A bare remote name keeps git's own upstream resolution.
+pub(crate) fn force_push_argv(target: &str) -> Vec<String> {
+    let mut argv = vec!["push".to_string(), "--force-with-lease".to_string()];
+    match target.split_once('/') {
+        Some((remote, branch)) if !remote.is_empty() && !branch.is_empty() => {
+            argv.push(remote.to_string());
+            argv.push(format!("HEAD:refs/heads/{branch}"));
+        }
+        _ => argv.push(target.to_string()),
+    }
+    argv
+}
+
 /// `<subcommand> [flag] <target>` — the shape every single-target op shares.
 fn target_argv(subcommand: &str, flag: Option<&str>, target: String) -> Vec<String> {
     let mut argv = vec![subcommand.to_string()];
@@ -1075,11 +1095,7 @@ fn plan_argv(op: &Op, root: &Path, args: &Value) -> Result<Vec<String>, JsonRpcE
                     format!("Copy it verbatim from the plan: confirm_text:\"{printed}\""),
                 ));
             }
-            Ok(target_argv(
-                "push",
-                Some("--force-with-lease"),
-                branch_target,
-            ))
+            Ok(force_push_argv(&branch_target))
         }
         other => Err(JsonRpcError::internal_error(format!(
             "git operation '{other}' has no plan"
