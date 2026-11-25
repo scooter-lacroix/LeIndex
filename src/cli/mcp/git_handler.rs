@@ -1232,6 +1232,24 @@ fn plan_argv(op: &Op, root: &Path, args: &Value) -> Result<Vec<String>, JsonRpcE
     }
 }
 
+/// Validate the arguments of a named operation — the executor's entry point,
+/// so a mutation refuses unrecognized keys whoever calls it.
+///
+/// The handler's `execute` already runs this before the plan/apply split
+/// (4697090213), but `git_apply::handle` is the mutation gate itself and
+/// must not depend on its caller's hygiene: reaching it directly with a
+/// typo'd `pths` key still committed the whole index. Exposed beside
+/// [`plan_argv_for`] for the same reason — the `Op` table stays here.
+pub(crate) fn argument_warnings_for(
+    op_name: &str,
+    args: &Value,
+) -> Result<Vec<String>, JsonRpcError> {
+    let op = Op::parse(op_name).ok_or_else(|| {
+        JsonRpcError::internal_error(format!("git operation '{op_name}' has no arguments"))
+    })?;
+    argument_warnings(op, args)
+}
+
 /// Resolve an action NAME to its plan argv — the executor's entry point, so
 /// the private [`Op`] table stays encapsulated in this module.
 pub(crate) fn plan_argv_for(

@@ -1820,6 +1820,12 @@ fn test_commit_refuses_a_non_array_paths_value() {
 /// #13 (4697090213): the apply path skipped argument validation, so a
 /// confirmed commit with a typo'd `pths` ignored it and committed the
 /// whole index. Validation must run before the mutation.
+///
+/// This goes THROUGH `handle`, not the validator alone: an earlier version
+/// called `argument_warnings_for_test` directly and then asserted "no commit
+/// ran" — which was vacuous, because nothing in it ever attempted a commit.
+/// It stayed green while the gate itself was unguarded. The gate is the thing
+/// under test, so the gate is what gets called.
 #[tokio::test]
 async fn test_a_typo_in_a_confirmed_commit_is_refused_before_mutating() {
     let repo = scratch();
@@ -1828,22 +1834,19 @@ async fn test_a_typo_in_a_confirmed_commit_is_refused_before_mutating() {
     std::fs::write(root.join("b.txt"), "b\n").unwrap();
     git(root, &["add", "."]);
     // `pths` is a typo for `paths`; the plan path already refused it.
-    let error = super::super::git_handler::commit_argv_for_test(
-        root,
-        &json!({ "message": "m", "pths": ["a.txt"] }),
-    );
-    // `commit_argv` only reads known keys; the ROUTER's validator refuses
-    // unknown ones. Exercise that validator directly.
-    let warnings = super::super::git_handler::argument_warnings_for_test(
+    let error = super::handle(
         "commit",
-        &json!({ "message": "m", "pths": ["a.txt"] }),
-    );
+        root,
+        &json!({ "message": "m", "pths": ["a.txt"], "confirm": true }),
+    )
+    .await
+    .expect_err("an unknown key must be refused at the mutation gate");
     assert!(
-        warnings.is_err(),
-        "an unknown key must be refused, not ignored: {warnings:?}"
+        error.message_with_hint().contains("pths"),
+        "the refusal must name the key: {}",
+        error.message_with_hint()
     );
-    let _ = error;
-    // Nothing was committed.
+    // Nothing was committed: the staged files are still only staged.
     let tree = isolated_git(root)
         .args(["ls-tree", "-r", "--name-only", "HEAD"])
         .output()

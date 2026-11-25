@@ -22,7 +22,7 @@
 //! `allow_sensitive: true`.
 
 use super::git_diff_handler::MAX_DIFF_BYTES;
-use super::git_handler::{plan_argv_for, preview_token};
+use super::git_handler::{argument_warnings_for, plan_argv_for, preview_token};
 use super::helpers::validate_file_within_project;
 use super::protocol::JsonRpcError;
 use serde_json::{Value, json};
@@ -1761,6 +1761,15 @@ fn head_branch(root: &Path) -> Option<String> {
 
 /// Plan-or-apply entry for every mutating `leindex_git` action.
 pub(crate) async fn handle(op: &str, root: &Path, args: &Value) -> Result<Value, JsonRpcError> {
+    // Argument hygiene is enforced AT THE MUTATION GATE (CodeRabbit round 10,
+    // id 4697090213). The handler validates before the plan/apply split, but
+    // this function is the one that mutates: a caller that reaches it with a
+    // typo'd `pths` key must be refused here, not trusted to have validated.
+    // `plan_argv_for` below ignores keys it does not read, so without this
+    // the unknown key is silently dropped and the mutation runs wider than
+    // the caller asked. The plan path re-runs the same check for its
+    // warnings; here the result is discarded and only refusals matter.
+    argument_warnings_for(op, args)?;
     // `add` is planned over the EXACT path list the guardrails produce, so the
     // plan's staged list is the truth (exclusions included), not a promise.
     // The outcome is computed ONCE and reused for the payload: a second call

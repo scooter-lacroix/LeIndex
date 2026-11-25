@@ -570,6 +570,252 @@ fn test_show_defaults_to_stat_and_omits_the_patch() {
     );
 }
 
+/// CodeRabbit round 10 (id 4697090199): the schema and `plan_argv` accepted
+/// `clean` / `delete` on `reset`, but the operation's argument list named only
+/// `target` and `hard`, so `argument_warnings` refused them and the caller
+/// could never obtain the token the schema told them to get.
+#[tokio::test]
+async fn test_reset_clean_and_delete_obtain_a_token_but_not_a_bare_confirm() {
+    let repo = scratch_repo();
+    let root = repo.path();
+    // The shapes `plan_argv` documents: `clean` is `git clean -f <flag>` and
+    // `delete` is branch deletion, both token-only.
+    for args in [
+        json!({ "target": "-fd", "clean": true }),
+        json!({ "target": "-d", "clean": true }),
+        json!({ "target": "-d stale", "delete": true }),
+    ] {
+        let plan = mutation_plan(Op::parse("reset").unwrap(), root, &args)
+            .await
+            .unwrap_or_else(|error| panic!("a documented flag must be plannable: {error}"));
+        assert!(
+            plan["preview_token"]
+                .as_str()
+                .is_some_and(|t| !t.is_empty()),
+            "the plan must carry a token: {plan}"
+        );
+        assert_eq!(plan["applied"], false);
+    }
+    // `confirm:true` alone is still refused for a destructive reset.
+    let bare = crate::cli::mcp::git_apply::handle(
+        "reset",
+        root,
+        &json!({ "target": "-fd", "clean": true, "confirm": true }),
+    )
+    .await
+    .expect_err("confirm alone must not apply a hard reset");
+    assert!(
+        bare.message_with_hint().contains("confirm:true alone"),
+        "{bare}"
+    );
+}
+
+/// CodeRabbit round 10 (id 4697090213): argument validation ran only on the
+/// plan path. A confirmed commit carrying `pths` (a typo of `paths`) ignored
+/// the key and committed the WHOLE index, while the same key was refused on
+/// the plan path. Validation now runs before either branch.
+#[tokio::test]
+async fn test_a_misspelled_paths_key_is_refused_on_the_apply_path() {
+    let repo = scratch_repo();
+    let root = repo.path();
+    std::fs::write(root.join("a.txt"), "a\n").unwrap();
+    std::fs::write(root.join("b.txt"), "b\n").unwrap();
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["add", "."]);
+
+    let error = crate::cli::mcp::git_apply::handle(
+        "commit",
+        root,
+        &json!({ "message": "m", "pths": ["a.txt"], "confirm": true }),
+    )
+    .await
+    .expect_err("a typo'd paths key must be refused, not ignored");
+    assert!(
+        error.message_with_hint().contains("pths"),
+        "the refusal must name the key: {error}"
+    );
+    // Nothing was committed: HEAD still has exactly one commit.
+    let log = git_log(root, &json!({})).unwrap();
+    assert_eq!(
+        log["count"], 1,
+        "the index must not have been committed: {log}"
+    );
+}
+
+/// CodeRabbit round 10 (id 4697090225): a file whose name is exactly 40 hex
+/// characters is legal. Matching a commit header on OID SHAPE alone turned
+/// such a file record into a phantom commit. The header now requires the tab
+/// separator that only a header carries.
+#[test]
+fn test_a_forty_hex_filename_is_a_file_record_not_a_phantom_commit() {
+    let repo = scratch_repo();
+    let root = repo.path();
+    let hex_name = "0123456789abcdef0123456789abcdef01234567";
+    std::fs::write(root.join(hex_name), "x\n").unwrap();
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "two"]);
+
+    let log = git_log(root, &json!({})).unwrap();
+    assert_eq!(log["count"], 2, "two real commits, no phantom: {log}");
+    let ids: Vec<&str> = log["commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["oid"].as_str())
+        .collect();
+    assert!(
+        !ids.contains(&hex_name),
+        "the filename must never be reported as a commit oid: {ids:?}"
+    );
+    assert_eq!(
+        log["commits"][0]["files_changed"], 1,
+        "the 40-hex file is counted as a file of the newest commit: {log}"
+    );
+}
+
+/// CodeRabbit round 10 (id 4697090236): with `include_patch:true`, `HEAD`
+/// was resolved once for the stat and AGAIN for the patch, so a HEAD that
+/// advanced between the two probes produced the stat of commit A with the
+/// patch of commit B. The target is now resolved to ONE oid for both probes.
+///
+/// The race itself cannot be provoked deterministically (`git show` does not
+/// mutate), so this pins the FIX rather than the symptom: both probes must be
+/// given the RESOLVED COMMIT, not the caller's raw target. An annotated tag
+/// makes that observable without a race — `git show <tag>` renders the TAG
+/// object (tagger line, tag message) while `git show <peeled-oid>` renders the
+/// commit. On the pre-fix code both probes received the raw tag, so the patch
+/// described the tag object instead of the commit.
+#[test]
+fn test_show_reads_the_stat_and_patch_from_one_commit() {
+    let repo = scratch_repo();
+    let root = repo.path();
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    // A tagged commit plus a LATER commit on HEAD, so resolving `HEAD` would
+    // describe something other than the tag.
+    git(&["tag", "-a", "v1", "-m", "release one"]);
+    std::fs::write(root.join("second.txt"), "2\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "two"]);
+
+    let peeled = super::super::git_apply::resolve_to_oid(root, "v1").unwrap();
+    let shown = git_show(root, &json!({ "target": "v1", "include_patch": true })).unwrap();
+    assert_eq!(
+        shown["target"], "v1",
+        "the requested target is kept for display"
+    );
+    for (field, text) in [("stat", &shown["stat"]), ("patch", &shown["patch"])] {
+        let text = text.as_str().unwrap_or_default();
+        assert!(
+            text.contains(&peeled),
+            "{field} must describe the resolved commit {peeled}: {text}"
+        );
+        assert!(
+            !text.contains("release one") && !text.contains("Tagger:"),
+            "{field} must render the COMMIT, not the tag object: {text}"
+        );
+    }
+    // HEAD has moved past the tag: the probes must still describe the tag's
+    // commit, not HEAD.
+    let head = run_text(root, &["rev-parse".to_string(), "HEAD".to_string()])
+        .unwrap()
+        .0;
+    assert_ne!(head.trim(), peeled, "precondition: HEAD is not the tag");
+    assert!(
+        !shown["stat"].as_str().unwrap().contains("second.txt"),
+        "stat must not describe HEAD: {}",
+        shown["stat"]
+    );
+}
+
+/// CodeRabbit round 10 (id 4697090251): `with_warnings` REPLACED the payload's
+/// existing warnings. A bulk add that stopped at the walk limit carried an
+/// INCOMPLETE warning; adding an ignored-argument warning then dropped it, so
+/// the plan looked complete while it omitted files. The lists are merged.
+#[test]
+fn test_with_warnings_merges_instead_of_replacing() {
+    let payload = json!({ "warnings": ["staging stopped at the walk limit"], "x": 1 });
+    let merged = with_warnings(payload, &["git add ignores 'target'".to_string()]);
+    let warnings: Vec<String> = merged["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|w| w.as_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        warnings,
+        vec![
+            "staging stopped at the walk limit".to_string(),
+            "git add ignores 'target'".to_string(),
+        ],
+        "both warnings must reach the reviewer: {merged}"
+    );
+    // A payload with no warnings still gets the array.
+    let fresh = with_warnings(json!({ "y": 2 }), &["w".to_string()]);
+    assert_eq!(fresh["warnings"], json!(["w"]));
+    // Empty input leaves the payload untouched.
+    let untouched = with_warnings(json!({ "z": 3 }), &[]);
+    assert!(untouched.get("warnings").is_none());
+}
+
+/// CodeRabbit round 10 (id 4697090265): a non-array `paths` value used to
+/// skip the pathspec block, so the argv had no `--`, the commit was treated
+/// as a whole-index commit, and ALL staged content was committed while the
+/// caller believed only `paths` was. `add` already refused this shape.
+#[test]
+fn test_commit_refuses_a_non_array_paths_value() {
+    let repo = scratch_repo();
+    for bad in [
+        json!({ "paths": "a.txt" }),
+        json!({ "paths": 7 }),
+        json!({ "paths": null }),
+    ] {
+        let mut args = bad.clone();
+        args["message"] = json!("m");
+        let error = commit_argv_for_test(repo.path(), &args)
+            .expect_err("a non-array paths must be refused");
+        assert!(error.message_with_hint().contains("paths"), "{error}");
+    }
+    // The array shape is still accepted.
+    std::fs::write(repo.path().join("a.txt"), "a\n").unwrap();
+    let ok = commit_argv_for_test(repo.path(), &json!({ "message": "m", "paths": ["a.txt"] }))
+        .expect("an array of paths is valid");
+    assert!(ok.contains(&"--".to_string()), "{ok:?}");
+}
+
 /// Helper: a scratch repository with one commit on branch `master`.
 fn scratch_repo() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();

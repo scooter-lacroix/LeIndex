@@ -1531,6 +1531,44 @@ mod tests {
         );
     }
 
+    /// CodeRabbit round 10 (id 4697090278): the other half. `tests/api/main.rs`
+    /// EXISTS, so the directory IS a target — but it does not declare THIS
+    /// file. `tests/api/shared_test.rs` is imported by `tests/other_test.rs`
+    /// via `#[path]`, so it is a helper that belongs to `other_test`, not to
+    /// `api`. Claiming `--test api` selected a target that does not contain
+    /// the test, and the command exited 0 having run nothing.
+    #[test]
+    fn test_a_shared_file_beside_a_main_rs_that_does_not_declare_it_falls_back() {
+        let dir = manifest_dir("proj");
+        let tests = dir.path().join("tests");
+        let api = tests.join("api");
+        std::fs::create_dir_all(&api).unwrap();
+        std::fs::write(api.join("main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(api.join("shared_test.rs"), "#[test]\nfn test_shared() {}\n").unwrap();
+        std::fs::write(
+            tests.join("other_test.rs"),
+            "#[path = \"api/shared_test.rs\"]\nmod shared_test;\n",
+        )
+        .unwrap();
+
+        let test_fn = node(
+            "test_shared",
+            &api.join("shared_test.rs").display().to_string(),
+            "rust",
+            (0, 1),
+        );
+        assert_eq!(
+            integration_target_name_for_test(&api.join("shared_test.rs").display().to_string()),
+            None,
+            "a main.rs that does not declare the file does not own it"
+        );
+        let cmd = command_for(&test_fn, None, None);
+        assert_eq!(
+            cmd, "cargo test -p proj --tests test_shared",
+            "the fallback runs the test wherever it was compiled in: {cmd}"
+        );
+    }
+
     /// Kilo round 10 (id 4696869415) flagged that `main.rs` is checked with a
     /// bare `is_file()`, which is CWD-relative for a relative path. Verified
     /// rather than assumed:
