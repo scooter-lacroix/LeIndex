@@ -98,6 +98,15 @@ fn integration_target_name(file: &str) -> Option<String> {
         // `tests/<dir>/main.rs` exists to make it one.
         [dir, ..] => {
             let manifest = format!("{}/main.rs", segments[..tests_at + 2].join("/"));
+            // `manifest` is built from `file`'s own segments, so it carries
+            // `file`'s anchoring: the PDG stores ABSOLUTE paths (and
+            // `call_sites` joins `root` for any relative one), which makes
+            // this check CWD-independent with no extra resolution. A purely
+            // relative path would be CWD-anchored here, but nothing could
+            // recover the crate root from it anyway (verified: a relative
+            // `tests/api/handshake.rs` resolves only while the CWD IS the
+            // project). Pinned by test, not papered over.
+            //   (Kilo round 10, id 4696869415)
             Path::new(&manifest).is_file().then(|| (*dir).to_string())
         }
         [] => None,
@@ -1436,6 +1445,78 @@ mod tests {
         assert_eq!(
             cmd, "cargo test -p proj --tests test_fixture",
             "a helper module has no target of its own: {cmd}"
+        );
+    }
+
+    /// Kilo round 10 (id 4696869415) flagged that `main.rs` is checked with a
+    /// bare `is_file()`, which is CWD-relative for a relative path. Verified
+    /// rather than assumed:
+    ///
+    /// * for an ABSOLUTE `file` — what the PDG stores, and what `call_sites`
+    ///   produces by joining `root` — the manifest is built from the same
+    ///   segments and is absolute too, so the check is already CWD-independent
+    ///   and the finding is latent, not live. No change needed, and this test
+    ///   pins that from two different CWDs.
+    /// * for a purely RELATIVE `file` the check IS CWD-anchored — but no code
+    ///   could fix that, because nothing can recover the crate root from
+    ///   `tests/api/handshake.rs` alone. Attempting a root-join made the
+    ///   relative case no better while adding nothing for the absolute one, so
+    ///   it was reverted rather than shipped as dead code.
+    ///
+    /// `set_current_dir` is process-global: serialised on a lock and restored
+    /// on drop, including on panic.
+    #[test]
+    fn test_a_directory_integration_target_is_found_from_any_cwd() {
+        static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = CWD_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        struct Restore(std::path::PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let original = std::env::current_dir().unwrap();
+        let _restore = Restore(original);
+
+        let dir = manifest_dir("proj");
+        let api = dir.path().join("tests").join("api");
+        std::fs::create_dir_all(&api).unwrap();
+        std::fs::write(api.join("main.rs"), "mod handshake;\n").unwrap();
+        std::fs::write(api.join("handshake.rs"), "fn helper() {}\n").unwrap();
+
+        // The contract that matters: an ABSOLUTE path is CWD-independent and
+        // the directory target is recognised from anywhere.
+        let absolute = api.join("handshake.rs").display().to_string();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let from_root = integration_target_name(&absolute);
+        std::env::set_current_dir(elsewhere.path()).unwrap();
+        let from_elsewhere = integration_target_name(&absolute);
+        assert_eq!(
+            from_root.as_deref(),
+            Some("api"),
+            "recognised from the project: {from_root:?}"
+        );
+        assert_eq!(
+            from_elsewhere, from_root,
+            "an absolute path must not depend on the process CWD: root={from_root:?} elsewhere={from_elsewhere:?}"
+        );
+
+        // The stated limitation: a bare relative path is CWD-anchored, and no
+        // crate-root resolution can rescue it. It resolves only while the CWD
+        // is the project.
+        let relative = "tests/api/handshake.rs";
+        assert!(
+            integration_target_name(relative).is_none(),
+            "a bare relative path has no crate root to resolve against"
+        );
+        std::env::set_current_dir(dir.path()).unwrap();
+        assert_eq!(
+            integration_target_name(relative).as_deref(),
+            Some("api"),
+            "the same relative path resolves once the CWD is the project"
         );
     }
 
