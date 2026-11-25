@@ -1922,6 +1922,54 @@ mod tests {
         );
     }
 
+    /// Codex/CodeRabbit round 8 (ids 4691102602, 4691119041): the page limit
+    /// was spent across FILE ROWS, but exhausting it only `break`-ed out of the
+    /// truncation loop — the remaining rows kept their hits and were returned.
+    /// Two files with one call each therefore answered `limit: 1` with TWO
+    /// calls, and (with more rows) hits that WERE returned were also counted
+    /// as withheld, so their cursors rewound and repeated them.
+    #[tokio::test]
+    async fn test_find_callsites_limit_across_files_returns_exactly_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in [
+            ("a_calls.rs", "fn a() {\n    parse_config();\n}\n"),
+            ("b_calls.rs", "fn b() {\n    parse_config();\n}\n"),
+            ("c_calls.rs", "fn c() {\n    parse_config();\n}\n"),
+        ] {
+            std::fs::write(dir.path().join(name), body).unwrap();
+        }
+        let count_calls = |value: &Value| -> usize {
+            value["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|file| file["hits"].as_array().map_or(0, Vec::len))
+                .sum()
+        };
+        let first = run(
+            dir.path(),
+            json!({"pattern": "parse_config", "output": "callsites", "limit": 1}),
+        )
+        .await;
+        assert_eq!(
+            count_calls(&first),
+            1,
+            "a limit of 1 must deliver exactly one call across files: {first}"
+        );
+        // Two files' worth of budget: exactly two calls, no more.
+        let two = run(
+            dir.path(),
+            json!({"pattern": "parse_config", "output": "callsites", "limit": 2}),
+        )
+        .await;
+        assert_eq!(
+            count_calls(&two),
+            2,
+            "a limit of 2 must deliver exactly two calls: {two}"
+        );
+        assert_eq!(two["has_more"], true, "a third call remains: {two}");
+    }
+
     /// #089: the ignore regression runs against a REAL Git worktree, so the
     /// default inventory is git-aware before `paths` bypasses it.
     #[tokio::test]

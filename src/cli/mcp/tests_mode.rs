@@ -71,6 +71,39 @@ impl TestTarget {
     }
 }
 
+/// The Cargo integration-target name for a file under `tests/`, when one owns
+/// it.
+///
+/// Cargo derives one target per top-level entry of `tests/`:
+/// * `tests/foo.rs` → `foo` (any `.rs` file there is a target);
+/// * `tests/foo/main.rs`, and every module beside it → `foo`.
+///
+/// Only the immediate-parent form used to be recognised, and the selector was
+/// always the FILE stem, so `tests/api/main.rs` produced `--test main`, which
+/// matches no target and exits 0 having run nothing (Codex round 8, id
+/// 4691102595).
+///
+/// `None` is the honest answer for a file under `tests/<dir>/` when that
+/// directory has no `main.rs`: such a file is a HELPER module compiled into
+/// whichever targets `mod` it, not a target of its own. Naming `--test <dir>`
+/// there would name a target that does not exist.
+fn integration_target_name(file: &str) -> Option<String> {
+    let lowered = file.replace('\\', "/");
+    let segments: Vec<&str> = lowered.split('/').collect();
+    let tests_at = segments.iter().position(|segment| *segment == "tests")?;
+    match &segments[tests_at + 1..] {
+        // `tests/<name>.rs`
+        [name] => Some(name.strip_suffix(".rs").unwrap_or(name).to_string()),
+        // `tests/<dir>/…` — the DIRECTORY is the target name, and only when
+        // `tests/<dir>/main.rs` exists to make it one.
+        [dir, ..] => {
+            let manifest = format!("{}/main.rs", segments[..tests_at + 2].join("/"));
+            Path::new(&manifest).is_file().then(|| (*dir).to_string())
+        }
+        [] => None,
+    }
+}
+
 /// The test framework a target runs under, inferred from path and language.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TestRunner {
@@ -88,7 +121,15 @@ fn runner_for(path: &str, language: &str) -> Option<TestRunner> {
     let lowered = path.replace('\\', "/");
     let segments: Vec<&str> = lowered.split('/').collect();
     let file = segments.last().copied().unwrap_or("");
-    let under_tests = segments.len() >= 2 && segments[segments.len() - 2] == "tests";
+    // `tests/` can appear at ANY depth below the crate root: `tests/api/main.rs`
+    // and `tests/common/mod.rs` are integration-target files just as
+    // `tests/api_test.rs` is (Codex round 8, id 4691102595). Only the
+    // immediate-parent form was recognised, so a nested file fell through to
+    // CargoUnit and `command_for` emitted `--lib`, which runs ZERO tests.
+    let under_tests = segments
+        .iter()
+        .take(segments.len().saturating_sub(1))
+        .any(|segment| *segment == "tests");
     match language {
         "rust" | "rs" => {
             if under_tests && file.ends_with(".rs") {
@@ -704,11 +745,23 @@ fn command_for(
         .unwrap_or_default();
     match runner_for(file, &node.language) {
         Some(TestRunner::CargoIntegration) => {
-            let stem = Path::new(file)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("test");
-            format!("cargo test {dash_p}--test {stem} {}", node.name)
+            // Cargo names an integration target after the file stem
+            // (`tests/api_test.rs` => `api_test`) — but a DIRECTORY target is
+            // named after the directory: `tests/api/main.rs` is `--test api`,
+            // and `--test main` runs nothing (Codex round 8, id 4691102595).
+            match integration_target_name(file) {
+                Some(target) => format!("cargo test {dash_p}--test {target} {}", node.name),
+                // A file under `tests/<dir>/` with no `main.rs` beside it is a
+                // shared HELPER module: it belongs to whichever targets `mod`
+                // it, so `--test <dir>` would name a target Cargo does not
+                // have. `--tests` runs every test target and the name filter
+                // picks the test wherever it was compiled in — runnable, and
+                // it does not claim a target that is not there. The filter is
+                // a SUBSTRING, exactly like the target-selected branch above
+                // (`-- --exact` would refuse the module-qualified path the
+                // helper's test actually carries).
+                None => format!("cargo test {dash_p}--tests {}", node.name),
+            }
         }
         Some(TestRunner::CargoUnit) => {
             let path = source
@@ -1330,6 +1383,59 @@ mod tests {
         assert_eq!(
             cmd, "cargo test -p proj --test api_test test_api",
             "cmd: {cmd}"
+        );
+    }
+
+    /// Codex round 8 (id 4691102595): `tests/<dir>/` with a `main.rs` is ONE
+    /// Cargo target named after the DIRECTORY. The selector used the file stem,
+    /// so `tests/api/main.rs` produced `--test main`, which matches no target
+    /// and exits 0 having run nothing — a non-existent test read as a pass.
+    #[test]
+    fn test_directory_integration_target_is_named_after_the_directory() {
+        let dir = manifest_dir("proj");
+        let api = dir.path().join("tests").join("api");
+        std::fs::create_dir_all(&api).unwrap();
+        std::fs::write(api.join("main.rs"), "mod handshake;\n").unwrap();
+        std::fs::write(api.join("handshake.rs"), "fn helper() {}\n").unwrap();
+
+        // The entry point and a sibling module both belong to target `api`.
+        for file in ["main.rs", "handshake.rs"] {
+            let test_fn = node(
+                "test_handshake",
+                &api.join(file).display().to_string(),
+                "rust",
+                (0, 1),
+            );
+            let cmd = command_for(&test_fn, None, None);
+            assert_eq!(
+                cmd, "cargo test -p proj --test api test_handshake",
+                "{file} belongs to the `api` target: {cmd}"
+            );
+        }
+    }
+
+    /// The other half of the same review finding: without a `main.rs`,
+    /// `tests/<dir>/` is NOT a target — its files are helper modules compiled
+    /// into whichever targets `mod` them. Naming `--test <dir>` there would
+    /// point at a target Cargo does not have, so the command falls back to
+    /// `--tests`, which runs the test wherever it was compiled in.
+    #[test]
+    fn test_helper_module_without_main_rs_falls_back_to_all_test_targets() {
+        let dir = manifest_dir("proj");
+        let common = dir.path().join("tests").join("common");
+        std::fs::create_dir_all(&common).unwrap();
+        std::fs::write(common.join("mod.rs"), "fn fixture() {}\n").unwrap();
+
+        let test_fn = node(
+            "test_fixture",
+            &common.join("mod.rs").display().to_string(),
+            "rust",
+            (0, 1),
+        );
+        let cmd = command_for(&test_fn, None, None);
+        assert_eq!(
+            cmd, "cargo test -p proj --tests test_fixture",
+            "a helper module has no target of its own: {cmd}"
         );
     }
 

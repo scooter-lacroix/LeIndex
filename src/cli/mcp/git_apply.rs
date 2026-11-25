@@ -143,6 +143,67 @@ fn lexical_relative(raw: &str) -> String {
     out.join("/")
 }
 
+/// Paths among `candidates` that git's ignore rules match.
+///
+/// `git status --porcelain=v2` reports ignored entries only when `--ignored`
+/// is passed, and the shared status call does not pass it — so
+/// `GitStatus::ignored` is empty in practice and filtering on it silently
+/// filtered nothing (round-8 review, id 4691119051). Asking git directly is
+/// exact and cheap: `check-ignore` answers from the rules alone, without
+/// walking the worktree. It also skips TRACKED files by design, which is what
+/// we want — a tracked file that matches an ignore pattern (`app.log` under
+/// `*.log`) stages fine and must not be dropped from the argv.
+///
+/// Both directions are NUL-delimited, so a path containing a newline cannot be
+/// read as two records. Exit 1 means "none of these are ignored" — a normal
+/// answer, not a failure. Any other non-zero exit yields an empty set: the
+/// bulk add then proceeds un-filtered, which is the pre-fix behaviour, instead
+/// of failing the whole add because the ignore query itself broke.
+fn ignored_paths(root: &Path, candidates: &[String]) -> std::collections::BTreeSet<String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut ignored = std::collections::BTreeSet::new();
+    if candidates.is_empty() {
+        return ignored;
+    }
+    let Ok(mut child) = Command::new("git")
+        .args(["check-ignore", "-z", "--stdin"])
+        .current_dir(root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return ignored;
+    };
+    let mut payload = Vec::new();
+    for candidate in candidates {
+        payload.extend_from_slice(candidate.as_bytes());
+        payload.push(0);
+    }
+    if let Some(mut stdin) = child.stdin.take() {
+        // A short write still leaves every complete record answered, so a
+        // closed pipe cannot turn a partial answer into a wrong one.
+        let _ = stdin.write_all(&payload);
+    }
+    let Ok(output) = child.wait_with_output() else {
+        return ignored;
+    };
+    if !output.status.success() && output.status.code() != Some(1) {
+        return ignored;
+    }
+    for record in output.stdout.split(|byte| *byte == 0) {
+        if let Ok(text) = std::str::from_utf8(record)
+            && !text.is_empty()
+        {
+            ignored.insert(text.replace('\\', "/"));
+        }
+    }
+    ignored
+}
+
 /// Expand the requested `paths` into concrete files.
 ///
 /// Directories are walked (`.git` and build-output directories skipped)
@@ -151,11 +212,17 @@ fn lexical_relative(raw: &str) -> String {
 fn expand_paths(
     root: &Path,
     requested: &[String],
-) -> Result<(Vec<String>, usize, Vec<String>), JsonRpcError> {
+) -> Result<(Vec<String>, usize, Vec<String>, bool), JsonRpcError> {
     const MAX_DISCOVERED: usize = 2_000;
 
     let mut files = Vec::new();
     let mut skipped = 0usize;
+    // Set when the walk stops on its BUDGET or DEPTH limit instead of
+    // exhausting the tree. `skipped` counts files it saw and dropped; a
+    // subtree it never entered contributes nothing, so without this flag the
+    // response could claim a complete bulk add that was actually partial
+    // (CodeRabbit round 8, id 4691119046).
+    let mut incomplete = false;
     let mut dirs = Vec::new();
     for raw in requested {
         let absolute = root.join(raw);
@@ -180,33 +247,44 @@ fn expand_paths(
             &mut files,
             &mut skipped,
             &mut budget,
+            &mut incomplete,
         )?;
     }
-    // The filesystem walk can only see files that exist. A tracked file
-    // deleted from the worktree is invisible to it, so a bulk
-    // `paths:["."]` used to stage every surviving change and silently leave
-    // the deletions unstaged. Git's own inventory knows about them: add
-    // every deleted tracked path under a requested directory.
-    if !dirs.is_empty()
-        && let Ok(status) = crate::cli::git::status(root)
-    {
-        for deleted in &status.deleted {
-            let rel = deleted.to_string_lossy().replace('\\', "/");
-            let under_requested_dir = dirs.iter().any(|(dir, _)| {
-                dir.is_empty() || rel.starts_with(&format!("{dir}/")) || &rel == dir
-            });
-            if under_requested_dir {
-                files.push(rel);
+    // Bulk discovery must not hand git the name of an IGNORED file: `git add`
+    // rejects an explicitly named ignored path ("Use -f if you really want to
+    // add it"), so an ordinary `paths:["."]` failed outright, and any file it
+    // had already staged stayed staged (CodeRabbit round 8, id 4691119051).
+    // Git's own ignore rules know exactly which files those are; the status
+    // dump does NOT (it omits ignored entries unless `--ignored` is passed),
+    // so the filter asks the rules directly.
+    if !dirs.is_empty() {
+        let ignored = ignored_paths(root, &files);
+        files.retain(|file| !ignored.contains(&lexical_relative(file)));
+        // The filesystem walk can only see files that exist. A tracked file
+        // deleted from the worktree is invisible to it, so a bulk
+        // `paths:["."]` used to stage every surviving change and silently leave
+        // the deletions unstaged. Git's own inventory knows about them.
+        if let Ok(status) = crate::cli::git::status(root) {
+            for deleted in &status.deleted {
+                let rel = deleted.to_string_lossy().replace('\\', "/");
+                let under_requested_dir = dirs.iter().any(|(dir, _)| {
+                    dir.is_empty() || rel.starts_with(&format!("{dir}/")) || &rel == dir
+                });
+                if under_requested_dir {
+                    files.push(rel);
+                }
             }
         }
     }
     files.sort();
     files.dedup();
-    Ok((files, skipped, dir_rels))
+    Ok((files, skipped, dir_rels, incomplete))
 }
 
 /// Recursive worker for [`expand_paths`]. `budget` is shared per directory
-/// request; when it runs out the walk stops and `skipped` counts the rest.
+/// request; when it runs out the walk stops, `skipped` counts the rest and
+/// `incomplete` is set.
+#[allow(clippy::too_many_arguments)]
 fn walk_dir(
     root: &Path,
     rel: &str,
@@ -215,9 +293,11 @@ fn walk_dir(
     files: &mut Vec<String>,
     skipped: &mut usize,
     budget: &mut usize,
+    incomplete: &mut bool,
 ) -> Result<(), JsonRpcError> {
     const SKIP_DIR_NAMES: [&str; 2] = [".git", "node_modules"];
     if depth > 16 || *budget == 0 {
+        *incomplete = true;
         return Ok(());
     }
     let entries = std::fs::read_dir(absolute).map_err(|error| {
@@ -248,6 +328,7 @@ fn walk_dir(
                 files,
                 skipped,
                 budget,
+                incomplete,
             )?;
         } else if *budget > 0 {
             *budget -= 1;
@@ -318,7 +399,7 @@ pub(crate) fn staging_outcome(root: &Path, args: &Value) -> Result<StagingOutcom
         .iter()
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
-    let (discovered, skipped, dirs) = expand_paths(root, &requested)?;
+    let (discovered, skipped, dirs, incomplete) = expand_paths(root, &requested)?;
 
     let mut staged = Vec::new();
     let mut excluded = Vec::new();
@@ -367,6 +448,17 @@ pub(crate) fn staging_outcome(root: &Path, args: &Value) -> Result<StagingOutcom
             2_000, skipped
         ));
     }
+    // The walk can also stop BEFORE entering a subtree, in which case it never
+    // saw the files there and `skipped` stays 0. Say the enumeration was
+    // incomplete anyway: the count is unknown, but silence would claim a
+    // complete bulk add (CodeRabbit round 8, id 4691119046).
+    if incomplete && skipped == 0 {
+        warnings.push(
+            "directory walk stopped at its depth/entry limit; enumeration is INCOMPLETE \
+             (unknown remainder) — pass narrower paths to cover the rest"
+                .to_string(),
+        );
+    }
     for (relative, reason) in &excluded {
         warnings.push(format!(
             "excluded '{relative}' from bulk add: {reason} (stage it explicitly or set allow_sensitive:true)"
@@ -391,8 +483,19 @@ pub(crate) fn staging_outcome(root: &Path, args: &Value) -> Result<StagingOutcom
 ///
 /// ONE definition: the plan's advertised argv, the argv the token binds, and
 /// the argv the executor runs all come from here, so the three cannot drift.
+///
+/// `--literal-pathspecs` is a GLOBAL git option, so it goes before the
+/// subcommand. `--` stops option parsing but NOT pathspec expansion: a
+/// directory containing a file literally named `*` would otherwise be handed
+/// to git as a wildcard, and `git add -- "*"` stages everything — including
+/// the `.env` the guardrail just excluded (CodeRabbit round 8, id
+/// 4691119058). Literal mode makes every enumerated name mean exactly itself.
 pub(crate) fn add_argv(outcome: &StagingOutcome) -> Vec<String> {
-    let mut argv = vec!["add".to_string(), "--".to_string()];
+    let mut argv = vec![
+        "--literal-pathspecs".to_string(),
+        "add".to_string(),
+        "--".to_string(),
+    ];
     argv.extend(outcome.staged.iter().cloned());
     argv
 }
@@ -845,33 +948,67 @@ async fn commit_summary(root: &Path) -> Result<Value, JsonRpcError> {
 
 /// Remote ref range reported by `git push --porcelain`, plus the upstream
 /// ahead/behind AFTER the push.
+///
+/// Porcelain records are `<flag>\t<refspec>\t<summary>`, where the flag is one
+/// of `space` (fast-forward), `+` (forced update), `-` (deleted), `*` (new
+/// ref), `=` (up to date) or `!` (rejected). The old parser looked for a `>`
+/// prefix — which git never emits — and expected a fourth `<old>:<new>` field,
+/// so EVERY successful push reported `remote_ref: null, range: null`
+/// (CodeRabbit round 8, id 4691119062). Verified against git 2.56.1: a
+/// fast-forward prints ` \tHEAD:refs/heads/main\t7518c48..3f841eb`, an
+/// up-to-date push prints `=\t…\t[up to date]`, a new branch prints `*`.
 async fn push_payload(stdout: &str, root: &Path) -> Value {
     let mut range = Value::Null;
     let mut remote_ref = Value::Null;
     let mut note = String::new();
     for line in stdout.lines() {
-        // Porcelain rows: `>\trefs/heads/x:refs/heads/x\t[up-to-date|new reference]\told:new`
-        if let Some(rest) = line.strip_prefix(">\t") {
-            let mut fields = rest.split('\t');
-            let refspec = fields.next().unwrap_or_default().to_string();
-            let flag = fields.next().unwrap_or_default().to_string();
-            let oids = fields.next().unwrap_or_default();
-            let mut sides = oids.split(':');
-            let (Some(old), Some(new)) = (sides.next(), sides.next()) else {
-                continue;
-            };
-            remote_ref = Value::String(refspec);
-            if flag.contains("up-to-date") || old.is_empty() && new.is_empty() {
-                note.push_str("already up to date; ");
-                continue;
-            }
-            if !old.is_empty() && !new.is_empty() {
-                range = json!(format!("{old}..{new}"));
-            } else if new.is_empty() {
+        let mut fields = line.split('\t');
+        let Some(flag) = fields.next() else { continue };
+        // A record's first field is exactly one flag character (or a word like
+        // `To`/`Done`, which land here too and are skipped by the length test).
+        if flag.chars().count() != 1 {
+            continue;
+        }
+        let Some(refspec) = fields.next() else {
+            continue;
+        };
+        let summary = fields.next().unwrap_or_default();
+        if refspec.is_empty() {
+            continue;
+        }
+        remote_ref = Value::String(refspec.to_string());
+        let forced = flag == "+";
+        // `[up to date]`, `[new branch]`, `[rejected] (non-fast-forward)`,
+        // `<old>..<new>`, or `<old>...<new> (forced update)`. The oid pair is
+        // the first whitespace-delimited token; anything after it is an
+        // annotation, so splitting on the space keeps `(forced update)` out of
+        // the range (verified against git 2.56.1).
+        let (oids, annotation) = summary.split_once(' ').unwrap_or((summary, ""));
+        if summary.contains("up to date") {
+            note.push_str("already up to date; ");
+            continue;
+        }
+        if summary.contains("rejected") {
+            note.push_str(&format!("rejected ({summary}); "));
+            continue;
+        }
+        if let Some((old, new)) = oids.split_once("...").or_else(|| oids.split_once("..")) {
+            if old.is_empty() || new.is_empty() {
                 note.push_str("remote ref deleted; ");
             } else {
-                range = json!(format!("{new} (new)"));
+                range = json!(if forced {
+                    format!("{old}...{new}")
+                } else {
+                    format!("{old}..{new}")
+                });
+                if forced {
+                    note.push_str("forced update; ");
+                }
             }
+        } else if flag == "*" {
+            range = json!(format!("{summary} (new)"));
+        } else if !annotation.is_empty() {
+            note.push_str(&format!("{annotation}; "));
         }
     }
     let branch = head_branch(root);
@@ -1204,6 +1341,246 @@ mod test {
         let repo = scratch();
         assert!(index_digest(repo.path()).is_ok());
     }
+
+    /// CodeRabbit round 8 (id 4691119051): bulk discovery walked the
+    /// filesystem, so an IGNORED file such as `dist/bundle.js` was named
+    /// explicitly in the argv — and `git add` REJECTS an explicitly named
+    /// ignored path ("Use -f if you really want to add it"), so an ordinary
+    /// `paths:["."]` failed outright.
+    #[test]
+    fn test_bulk_staging_skips_git_ignored_files() {
+        let repo = scratch();
+        let root = repo.path();
+        git(root, &["config", "commit.gpgSign", "false"]);
+        std::fs::write(root.join(".gitignore"), "dist/\n").unwrap();
+        git(root, &["add", ".gitignore"]);
+        git(root, &["commit", "-q", "-m", "ignore"]);
+        std::fs::create_dir_all(root.join("dist")).unwrap();
+        std::fs::write(root.join("dist/bundle.js"), "built\n").unwrap();
+        std::fs::write(root.join("src_new.rs"), "fn a() {}\n").unwrap();
+
+        let outcome = staging_outcome(root, &json!({ "paths": ["."] })).unwrap();
+        assert!(
+            !outcome.staged.iter().any(|path| path.starts_with("dist/")),
+            "an ignored file must never be named explicitly: {:?}",
+            outcome.staged
+        );
+        assert!(
+            outcome.staged.iter().any(|path| path == "src_new.rs"),
+            "a non-ignored file must still be staged: {:?}",
+            outcome.staged
+        );
+        let argv = add_argv(&outcome);
+        assert!(
+            !argv.iter().any(|arg| arg.starts_with("dist/")),
+            "the argv must not carry the ignored path: {argv:?}"
+        );
+    }
+
+    /// CodeRabbit round 8 (id 4691119058): `--` stops OPTION parsing, not
+    /// PATHSPEC expansion. A file literally named `*` would make
+    /// `git add -- "*"` stage everything — including a `.env` the guardrail
+    /// just excluded. Literal pathspec mode makes each name mean itself.
+    #[test]
+    fn test_add_argv_uses_literal_pathspecs_so_a_star_filename_is_not_a_wildcard() {
+        let outcome = StagingOutcome {
+            staged: vec!["*".to_string(), "src/lib.rs".to_string()],
+            excluded: vec![(".env".to_string(), "likely secret")],
+            warnings: Vec::new(),
+        };
+        let argv = add_argv(&outcome);
+        assert_eq!(
+            argv.first().map(String::as_str),
+            Some("--literal-pathspecs"),
+            "the global option must precede the subcommand: {argv:?}"
+        );
+        assert_eq!(argv.get(1).map(String::as_str), Some("add"));
+        assert!(
+            !argv.iter().any(|arg| arg == ".env"),
+            "the excluded secret must not appear: {argv:?}"
+        );
+
+        // Prove the difference against real git: without literal mode the
+        // wildcard matches every path; with it, only the literal file.
+        let repo = scratch();
+        let root = repo.path();
+        git(root, &["config", "commit.gpgSign", "false"]);
+        // A file literally named `*` — the case that turns the argv item into
+        // a wildcard if literal mode is dropped.
+        std::fs::write(root.join("*"), "star\n").unwrap();
+        std::fs::write(root.join("other.rs"), "changed\n").unwrap();
+        git(root, &["add", "--", "*"]);
+        git(root, &["commit", "-q", "-m", "star"]);
+        std::fs::write(root.join("*"), "star2\n").unwrap();
+        std::fs::write(root.join("other.rs"), "changed2\n").unwrap();
+        git(root, &["reset", "-q"]);
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git available")
+        };
+        // The bug: a bare `add -- "*"` stages BOTH files.
+        let wildcard = run(&["add", "--", "*"]);
+        assert!(wildcard.status.success());
+        let cached = run(&["diff", "--cached", "--name-only"]);
+        let listed = String::from_utf8_lossy(&cached.stdout).to_string();
+        assert!(
+            listed.contains("other.rs"),
+            "precondition: the wildcard form stages an unrelated file: {listed}"
+        );
+        // The fix: only the literal `*` file.
+        git(root, &["reset", "-q"]);
+        let literal_argv = add_argv(&StagingOutcome {
+            staged: vec!["*".to_string()],
+            excluded: Vec::new(),
+            warnings: Vec::new(),
+        });
+        let literal_args: Vec<&str> = literal_argv.iter().map(String::as_str).collect();
+        let literal = run(&literal_args);
+        assert!(
+            literal.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&literal.stderr)
+        );
+        let cached = run(&["diff", "--cached", "--name-only"]);
+        let listed = String::from_utf8_lossy(&cached.stdout).to_string();
+        assert!(
+            !listed.contains("other.rs"),
+            "literal mode must not touch the unrelated file: {listed}"
+        );
+    }
+
+    /// CodeRabbit round 8 (id 4691119046): when the walk stops on its budget
+    /// or depth limit it never ENTERS the remaining subtree, so `skipped`
+    /// stays 0 and the response claimed a complete bulk add.
+    #[test]
+    fn test_bulk_staging_warns_when_enumeration_is_incomplete() {
+        let repo = scratch();
+        let root = repo.path();
+        // 20 nested directories exceed the walk's depth cap of 16.
+        let mut deep = root.to_path_buf();
+        for index in 0..20 {
+            deep = deep.join(format!("d{index}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("buried.rs"), "fn deep() {}\n").unwrap();
+
+        let outcome = staging_outcome(root, &json!({ "paths": ["."] })).unwrap();
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("INCOMPLETE")),
+            "an incomplete walk must say so: {:?}",
+            outcome.warnings
+        );
+    }
+
+    /// CodeRabbit round 8 (id 4691119062): the porcelain parser looked for a
+    /// `>` line prefix that git never emits and expected a fourth `<old>:<new>`
+    /// field, so every successful push answered `remote_ref: null, range: null`.
+    /// The three shapes below are copied verbatim from git 2.56.1 output
+    /// (captured with `cat -A`, hence the leading space on the fast-forward
+    /// flag).
+    #[tokio::test]
+    async fn test_push_payload_parses_the_three_real_porcelain_shapes() {
+        let repo = scratch();
+        let root = repo.path();
+
+        // New branch: `*` flag plus `[new branch]`.
+        let new_branch = push_payload(
+            "To /tmp/remote\n*\trefs/heads/main:refs/heads/main\t[new branch]\nDone\n",
+            root,
+        )
+        .await;
+        assert_eq!(
+            new_branch["remote_ref"], "refs/heads/main:refs/heads/main",
+            "a new branch must report its refspec: {new_branch}"
+        );
+        assert_eq!(
+            new_branch["range"], "[new branch] (new)",
+            "a new branch has no old oid: {new_branch}"
+        );
+
+        // Fast forward: a literal space flag and an `old..new` summary.
+        let fast_forward = push_payload(
+            "To /tmp/remote\n \trefs/heads/main:refs/heads/main\t548a312..c2fc253\nDone\n",
+            root,
+        )
+        .await;
+        assert_eq!(
+            fast_forward["range"], "548a312..c2fc253",
+            "a fast-forward must report the moved range: {fast_forward}"
+        );
+
+        // Up to date: `=` flag, `[up to date]` summary — no range, and a note.
+        let up_to_date = push_payload(
+            "To /tmp/remote\n=\trefs/heads/main:refs/heads/main\t[up to date]\nDone\n",
+            root,
+        )
+        .await;
+        assert_eq!(
+            up_to_date["remote_ref"], "refs/heads/main:refs/heads/main",
+            "the refspec is reported even when nothing moved: {up_to_date}"
+        );
+        assert_eq!(
+            up_to_date["range"],
+            Value::Null,
+            "nothing moved, so there is no range: {up_to_date}"
+        );
+        assert!(
+            up_to_date["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("already up to date")),
+            "the note must say why the range is empty: {up_to_date}"
+        );
+
+        // A forced update keeps the three-dot form and says so.
+        let forced = push_payload(
+            "To /tmp/remote\n+\trefs/heads/main:refs/heads/main\tabc123...def456 (forced update)\nDone\n",
+            root,
+        )
+        .await;
+        assert_eq!(
+            forced["range"], "abc123...def456",
+            "a forced update must keep the three-dot range: {forced}"
+        );
+        assert!(
+            forced["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("forced update")),
+            "a forced update must be labelled: {forced}"
+        );
+
+        // A rejected push surfaces the reason instead of a range.
+        let rejected = push_payload(
+            "To /tmp/remote\n!\trefs/heads/main:refs/heads/main\t[rejected] (non-fast-forward)\nDone\n",
+            root,
+        )
+        .await;
+        assert_eq!(
+            rejected["range"],
+            Value::Null,
+            "a rejected push moved nothing: {rejected}"
+        );
+        assert!(
+            rejected["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("non-fast-forward")),
+            "the rejection reason must survive: {rejected}"
+        );
+
+        // The header lines (`To …`, `Done`) must not be read as records.
+        let header_only = push_payload("To /tmp/remote\nDone\n", root).await;
+        assert_eq!(
+            header_only["remote_ref"],
+            Value::Null,
+            "no record means no refspec: {header_only}"
+        );
+    }
+
     #[test]
     fn test_staging_includes_deleted_tracked_files() {
         let repo = scratch();

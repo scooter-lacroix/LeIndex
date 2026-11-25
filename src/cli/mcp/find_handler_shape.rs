@@ -441,14 +441,16 @@ pub(super) fn filter_callsites_rows(
     let Some(limit) = limit else {
         return truncated;
     };
-    // The budget is spent in rank order. Once it runs out, every later row is
-    // fetched-but-not-delivered, so its cursor must not advance past hits the
-    // client never saw — track where that happens.
-    let mut spent_at: Option<usize> = None;
+    // Spend the budget in rank order. Once it runs out, every later row is
+    // fetched-but-NOT-delivered: its hits must be REMOVED from the page (a row
+    // that keeps its hits is returned, so two files with one call each answered
+    // a `limit:1` request with two calls — Codex round 8, id 4691102602) and
+    // its cursor must not claim them.
+    let mut spent_from: Option<usize> = None;
     let mut remaining = limit;
     for (index, (file, _)) in rows.iter_mut().enumerate() {
         if remaining == 0 {
-            spent_at = Some(index);
+            spent_from = Some(index);
             break;
         }
         let Some(hits) = file.get_mut("hits").and_then(Value::as_array_mut) else {
@@ -460,20 +462,27 @@ pub(super) fn filter_callsites_rows(
         remaining -= hits.len();
         file["matches"] = json!(hits.len());
     }
-    for (index, ((file, key), kept)) in rows.iter_mut().zip(kept_per_row).enumerate() {
-        if spent_at.is_some_and(|spent| index > spent) {
-            // Nothing from this row was delivered: its whole tail is withheld.
-            if kept > 0 && !key.is_empty() {
-                truncated.insert(key.clone(), kept);
+    if let Some(spent) = spent_from {
+        for (file, _) in rows.iter_mut().skip(spent) {
+            if let Some(hits) = file.get_mut("hits").and_then(Value::as_array_mut) {
+                hits.clear();
             }
-            continue;
+            file["matches"] = json!(0);
         }
+    }
+    for (index, ((file, key), kept)) in rows.iter_mut().zip(kept_per_row).enumerate() {
         let shown = file
             .get("hits")
             .and_then(Value::as_array)
             .map_or(0, Vec::len);
         let dropped = kept.saturating_sub(shown);
         if dropped > 0 && !key.is_empty() {
+            // A row the budget closed off entirely is withheld whole; a row
+            // that was cut mid-way is withheld by the difference.
+            debug_assert!(
+                spent_from.is_none_or(|spent| index < spent) || shown == 0,
+                "rows past the spent point must be cleared"
+            );
             truncated.insert(key.clone(), dropped);
         }
     }

@@ -925,6 +925,12 @@ fn commit_argv(root: &Path, args: &Value) -> Result<Vec<String>, JsonRpcError> {
             )
         })?;
     let mut argv = vec![
+        // A GLOBAL option (before the subcommand): `--` stops option parsing
+        // but NOT pathspec expansion, so a validated path whose name happens
+        // to be `*` would otherwise be treated as a wildcard and commit other
+        // modified tracked files the caller never named — contradicting this
+        // function's own contract (CodeRabbit round 8, id 4691119081).
+        "--literal-pathspecs".to_string(),
         "commit".to_string(),
         "--no-gpg-sign".to_string(),
         "-m".to_string(),
@@ -1527,7 +1533,15 @@ mod tests {
         let root = Path::new("/tmp/project");
         let op = Op::parse("commit").unwrap();
         let argv = plan_argv(op, root, &json!({ "message": "hi" })).unwrap();
-        assert_eq!(argv, ["commit", "--no-gpg-sign", "-m", "hi"]);
+        // `--literal-pathspecs` is a GLOBAL option and must lead: `--` stops
+        // option parsing but NOT pathspec expansion, so a validated path named
+        // `*` would otherwise commit unrelated modified files the caller never
+        // named (CodeRabbit round 8, id 4691119081). The assertion below is the
+        // pin that caught the missing guard.
+        assert_eq!(
+            argv,
+            ["--literal-pathspecs", "commit", "--no-gpg-sign", "-m", "hi"]
+        );
         let token = preview_token(root, op.name, &argv, "");
         assert!(!token.is_empty());
         // A different message must not share the token.
@@ -1775,6 +1789,65 @@ mod tests {
         assert!(
             empty.message_with_hint().contains("at least one"),
             "{empty}"
+        );
+    }
+
+    /// CodeRabbit round 8 (id 4691119081): `--` stops OPTION parsing but not
+    /// PATHSPEC expansion, so a validated path literally named `*` made
+    /// `commit -- "*"` sweep in every other modified tracked file the caller
+    /// never named — the opposite of this function's contract. The guard is
+    /// the global `--literal-pathspecs`, which must sit before the subcommand
+    /// to apply at all. Proven against real git.
+    #[test]
+    fn test_commit_paths_with_a_star_filename_do_not_sweep_other_files() {
+        let repo = scratch_repo();
+        let root = repo.path();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git available");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).to_string()
+        };
+        git(&["config", "commit.gpgSign", "false"]);
+        std::fs::write(root.join("*"), "one\n").unwrap();
+        std::fs::write(root.join("other.txt"), "one\n").unwrap();
+        git(&["add", "--", "*"]);
+        git(&["add", "other.txt"]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        // The bug, against real git: a bare pathspec commit of `*` sweeps in
+        // `other.txt` as well.
+        std::fs::write(root.join("*"), "two\n").unwrap();
+        std::fs::write(root.join("other.txt"), "two\n").unwrap();
+        git(&["commit", "--no-gpg-sign", "-m", "wild", "--", "*"]);
+        let listed = git(&["show", "--name-only", "--format=", "HEAD"]);
+        assert!(
+            listed.contains("other.txt"),
+            "precondition: the wildcard commit sweeps an unrelated file: {listed}"
+        );
+
+        // The fix: the argv this function builds carries literal pathspec mode.
+        std::fs::write(root.join("*"), "three\n").unwrap();
+        std::fs::write(root.join("other.txt"), "three\n").unwrap();
+        let argv = commit_argv(root, &json!({ "message": "narrow", "paths": ["*"] })).unwrap();
+        assert_eq!(
+            argv.first().map(String::as_str),
+            Some("--literal-pathspecs"),
+            "the global option must lead the argv: {argv:?}"
+        );
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        git(&args);
+        let listed = git(&["show", "--name-only", "--format=", "HEAD"]);
+        assert!(
+            !listed.contains("other.txt"),
+            "a literal pathspec commit must not touch the unrelated file: {listed}"
         );
     }
 
