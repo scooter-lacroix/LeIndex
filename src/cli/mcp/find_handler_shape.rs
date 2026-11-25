@@ -410,15 +410,27 @@ pub(super) fn shape_matches_page(
         // token budget trimmed away were NOT delivered, so their resume
         // position must not advance — a cursor that claims delivery would
         // make the next page skip hits the client never saw.
+        //
+        // A cursor is carried iff the page shows everything its file has
+        // delivered so far: either the file's row was kept, or the file has
+        // no row at all because an earlier page already delivered it in
+        // full (the engine keeps its cursor so the next page skips it).
+        // Dropping those — the old `kept_keys` filter did — resurrected a
+        // finished file on the page after a continuation (Codex round 4,
+        // C4-1): with no skip it was served fresh from the stream's start.
         let kept_keys: std::collections::HashSet<&str> =
             cursor_keys.iter().take(shown).map(String::as_str).collect();
+        let offered_keys: std::collections::HashSet<&str> =
+            cursor_keys.iter().map(String::as_str).collect();
         let cursors = if result.resume.is_empty() {
             Value::Null
         } else {
             let map: serde_json::Map<String, Value> = result
                 .resume
                 .iter()
-                .filter(|(key, _)| kept_keys.contains(key.as_str()))
+                .filter(|(key, _)| {
+                    kept_keys.contains(key.as_str()) || !offered_keys.contains(key.as_str())
+                })
                 .map(|(key, value)| (key.clone(), json!(value)))
                 .collect();
             if map.is_empty() {

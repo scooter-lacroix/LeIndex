@@ -19,7 +19,7 @@
 
 use serde_json::Value;
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::graph::pdg::{Node, ProgramDependenceGraph};
 
@@ -135,6 +135,168 @@ fn cargo_package(file: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The nearest ancestor directory holding a `Cargo.toml`, starting at
+/// `file`'s own directory. Bounded (16 levels) so a stray file above a
+/// workspace cannot spin here; `None` means the file is not inside a crate.
+fn cargo_package_dir(file: &Path) -> Option<PathBuf> {
+    let mut dir = file.parent()?.to_path_buf();
+    for _ in 0..16 {
+        if dir.join("Cargo.toml").is_file() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+    None
+}
+
+/// A Cargo target that can own a unit test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CargoTarget {
+    /// The package's library target (selected with `--lib`).
+    Lib,
+    /// A binary target, under the name Cargo gives it (`--bin <name>`).
+    Bin(String),
+}
+
+/// Every target the package in `package_dir` defines, as
+/// `(crate root file, target)`.
+///
+/// Cargo's target table is reproduced from the manifest text — no
+/// `cargo metadata` process per lookup — because the selector has to be
+/// exactly right: `--lib` for a test that lives in a binary runs ZERO tests
+/// and exits 0, and `--bin <package>` is just as wrong when the binary
+/// target carries its own name.
+///
+/// Reproduced rules (each verified against `cargo metadata`):
+///
+/// - `[lib]` with a `path` is the library, even when `src/lib.rs` also
+///   exists (then `src/lib.rs` is not a target at all); `[lib]` without a
+///   `path` is `src/lib.rs`. `autolib = false` disables the implicit one.
+/// - a `[[bin]]` takes the `path` it declares; without one it lives at
+///   `src/main.rs` when its name is the package name, else at
+///   `src/bin/<name>.rs` or `src/bin/<name>/main.rs`. A `[[bin]]` without a
+///   name is refused by Cargo and is skipped here.
+/// - auto-discovery (`autobins`, on by default) adds `src/main.rs` under the
+///   package name plus `src/bin/*.rs` and `src/bin/*/main.rs`, except for
+///   paths an explicit `[[bin]]` already claimed (the explicit name wins).
+///
+/// A target whose file does not exist is dropped: Cargo refuses such a
+/// manifest, and a root that cannot be read cannot own a test.
+fn cargo_targets(package_dir: &Path) -> Vec<(PathBuf, CargoTarget)> {
+    let Ok(text) = std::fs::read_to_string(package_dir.join("Cargo.toml")) else {
+        return Vec::new();
+    };
+    let Ok(table) = text.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let package = table.get("package");
+    let package_name = package
+        .and_then(|section| section.get("name"))
+        .and_then(toml::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let switch = |key: &str| -> bool {
+        package
+            .and_then(|section| section.get(key))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(true)
+    };
+
+    let mut targets: Vec<(PathBuf, CargoTarget)> = Vec::new();
+    // A `[lib]` table declares the library explicitly; only its `path` is
+    // optional (default `src/lib.rs`). Without the table, auto-discovery
+    // decides, which `autolib = false` turns off.
+    let lib_path = match table.get("lib") {
+        Some(lib) => Some(
+            lib.get("path")
+                .and_then(toml::Value::as_str)
+                .map(|path| package_dir.join(path))
+                .unwrap_or_else(|| package_dir.join("src/lib.rs")),
+        ),
+        None => switch("autolib").then(|| package_dir.join("src/lib.rs")),
+    };
+    if let Some(path) = lib_path
+        && path.is_file()
+    {
+        targets.push((path, CargoTarget::Lib));
+    }
+
+    // Explicit `[[bin]]` entries, and the paths they claim so auto-discovery
+    // does not also register the same file under a second name.
+    let mut claimed: HashSet<PathBuf> = HashSet::new();
+    for entry in table
+        .get("bin")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(name) = entry.get("name").and_then(toml::Value::as_str) else {
+            continue;
+        };
+        let path = match entry.get("path").and_then(toml::Value::as_str) {
+            Some(explicit) => package_dir.join(explicit),
+            None if name == package_name => package_dir.join("src/main.rs"),
+            None => {
+                let flat = package_dir.join("src/bin").join(format!("{name}.rs"));
+                if flat.is_file() {
+                    flat
+                } else {
+                    package_dir.join("src/bin").join(name).join("main.rs")
+                }
+            }
+        };
+        claimed.insert(path.clone());
+        if path.is_file() {
+            targets.push((path, CargoTarget::Bin(name.to_string())));
+        }
+    }
+
+    if !switch("autobins") {
+        return targets;
+    }
+    let main = package_dir.join("src/main.rs");
+    if main.is_file() && !claimed.contains(&main) {
+        targets.push((main, CargoTarget::Bin(package_name.clone())));
+    }
+    let Ok(entries) = std::fs::read_dir(package_dir.join("src/bin")) else {
+        return targets;
+    };
+    let mut discovered: Vec<(PathBuf, CargoTarget)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let (root, name) = if path.extension().is_some_and(|ext| ext == "rs") && path.is_file() {
+            // Build the name BEFORE moving `path` out: it must not borrow.
+            let name = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_default()
+                .to_string();
+            (path, name)
+        } else if path.is_dir() && path.join("main.rs").is_file() {
+            let name = path
+                .file_name()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_default()
+                .to_string();
+            (path.join("main.rs"), name)
+        } else {
+            continue;
+        };
+        discovered.push((root, CargoTarget::Bin(name)));
+    }
+    // Directory order is unspecified; a stable order keeps the command (and
+    // the reported target) reproducible across machines.
+    discovered.sort_by(|left, right| left.0.cmp(&right.0));
+    for (root, target) in discovered {
+        if !claimed.contains(&root) && !targets.iter().any(|(known, _)| known == &root) {
+            targets.push((root, target));
+        }
+    }
+    targets
 }
 
 /// The `module::path::to::fn` string cargo expects for a unit test.
@@ -275,47 +437,15 @@ fn out_of_line_module_ancestry(file: &str) -> Option<(std::path::PathBuf, Vec<St
         }
     }
     // Every crate root the package has: the library, the default binary,
-    // `src/bin/*.rs`, and any `[[bin]]`/`[lib]` with an explicit `path`.
+    // `src/bin/*.rs`, `src/bin/*/main.rs` and any `[[bin]]`/`[lib]` with an
+    // explicit `path` — the same table Cargo builds (see [`cargo_targets`]).
     // A test in `main.rs` is reachable only from the `main.rs` root, so
     // stopping at the first existing root (as this once did) silently
     // classified binary tests as library tests.
-    let mut roots: Vec<PathBuf> = ["lib.rs", "main.rs"]
+    let roots: Vec<PathBuf> = cargo_targets(&package_dir)
         .into_iter()
-        .map(|r| package_dir.join("src").join(r))
-        .filter(|p| p.is_file())
+        .map(|(root, _)| root)
         .collect();
-    if let Ok(entries) = std::fs::read_dir(package_dir.join("src").join("bin")) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "rs") && path.is_file() {
-                roots.push(path);
-            }
-        }
-    }
-    if let Ok(manifest) = std::fs::read_to_string(package_dir.join("Cargo.toml")) {
-        let mut in_target = false;
-        for line in manifest.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("[[bin]]") || trimmed.starts_with("[lib]") {
-                in_target = true;
-                continue;
-            }
-            if trimmed.starts_with('[') {
-                in_target = false;
-                continue;
-            }
-            if in_target
-                && let Some(rel) = trimmed.strip_prefix("path")
-                && let Some(rel) = rel.trim().strip_prefix('=')
-            {
-                let rel = rel.trim().trim_matches('"');
-                let path = package_dir.join(rel);
-                if path.is_file() && !roots.contains(&path) {
-                    roots.push(path);
-                }
-            }
-        }
-    }
     let same = |p: &Path| p.canonicalize().ok() == Some(canonical_target.clone());
     for root in &roots {
         if same(root) {
@@ -391,42 +521,22 @@ fn out_of_line_module_ancestry(file: &str) -> Option<(std::path::PathBuf, Vec<St
     None
 }
 
-/// A single valid pytest node id for a test: `path::test` for a module-level
-/// function, `path::Class::test` for a method (nested classes joined by
-/// `::`). Class ancestry is read from the live Python tree around the
-/// function; without a tree it degrades to the function name alone.
-fn pytest_node_id(
-    file: &str,
-    name: &str,
-    source: Option<&crate::cli::mcp::call_sites::FileSource>,
-) -> String {
-    let Some(source) = source else {
-        return format!("{file}::{name}");
-    };
-    let Some(tree) = source.tree.as_ref() else {
-        return format!("{file}::{name}");
-    };
-    // Find the function by NAME in the live tree (the PDG byte range may be
-    // stale after an edit, so it is not used to locate it).
-    let mut fn_node = None;
-    let mut stack = vec![tree.root_node()];
-    while let Some(n) = stack.pop() {
-        if n.kind() == "function_definition"
-            && n.child_by_field_name("name")
-                .and_then(|c| c.utf8_text(source.text.as_bytes()).ok())
-                .is_some_and(|t| t == name)
-        {
-            fn_node = Some(n);
-            break;
-        }
-        let mut c = n.walk();
-        for ch in n.children(&mut c) {
-            stack.push(ch);
-        }
-    }
-    let Some(fn_node) = fn_node else {
-        return format!("{file}::{name}");
-    };
+/// A `pytest` locator: the single node id that names one test, or the
+/// ambiguity that has to be reported instead of a guessed id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PytestLocator {
+    /// Exactly one definition matched: run this node id.
+    Id(String),
+    /// Several same-named definitions matched and none could be selected
+    /// positionally — every candidate is listed, none is picked.
+    Ambiguous(Vec<String>),
+}
+
+/// The class ancestry of `fn_node`, outermost class first.
+fn pytest_classes(
+    fn_node: tree_sitter::Node<'_>,
+    source: &crate::cli::mcp::call_sites::FileSource,
+) -> Vec<String> {
     let mut classes: Vec<String> = Vec::new();
     let mut cursor = fn_node;
     while let Some(parent) = cursor.parent() {
@@ -439,43 +549,147 @@ fn pytest_node_id(
         cursor = parent;
     }
     classes.reverse();
-    let mut parts = vec![file.to_string()];
-    parts.extend(classes);
-    parts.push(name.to_string());
-    parts.join("::")
+    classes
 }
 
-/// The Cargo target selector for a unit test in `file`.
+/// Every `path::Class::test` node id that could be the definition named
+/// `name`, deduplicated and in tree order.
+fn pytest_candidates(
+    file: &str,
+    name: &str,
+    source: &crate::cli::mcp::call_sites::FileSource,
+) -> Vec<String> {
+    let Some(tree) = source.tree.as_ref() else {
+        return Vec::new();
+    };
+    let mut found: Vec<String> = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "function_definition"
+            && node
+                .child_by_field_name("name")
+                .and_then(|child| child.utf8_text(source.text.as_bytes()).ok())
+                .is_some_and(|text| text == name)
+        {
+            let mut parts = vec![file.to_string()];
+            parts.extend(pytest_classes(node, source));
+            parts.push(name.to_string());
+            let id = parts.join("::");
+            if !found.contains(&id) {
+                found.push(id);
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    found
+}
+
+/// A single valid pytest node id for a test: `path::test` for a module-level
+/// function, `path::Class::test` for a method (nested classes joined by
+/// `::`).
+///
+/// Same-named methods in different classes both reduce to `Class::test`, so
+/// the definition is first selected POSITIONALLY from the PDG byte range
+/// (clamped to the live tree, so a stale range degrades instead of
+/// panicking). When position cannot decide — the range points at no
+/// definition, or several classes share it — the result is
+/// [`PytestLocator::Ambiguous`]: reporting the ambiguity is the only honest
+/// answer, because silently running the last match can execute the wrong
+/// test while the intended one goes untested.
+fn pytest_locator(
+    file: &str,
+    name: &str,
+    byte_range: (usize, usize),
+    source: Option<&crate::cli::mcp::call_sites::FileSource>,
+) -> PytestLocator {
+    let Some(source) = source else {
+        return PytestLocator::Id(format!("{file}::{name}"));
+    };
+    let Some(tree) = source.tree.as_ref() else {
+        return PytestLocator::Id(format!("{file}::{name}"));
+    };
+    let mut candidates = pytest_candidates(file, name, source);
+    if candidates.len() <= 1 {
+        return match candidates.pop() {
+            Some(id) => PytestLocator::Id(id),
+            None => PytestLocator::Id(format!("{file}::{name}")),
+        };
+    }
+    candidates.sort();
+    // Several definitions share the name: prefer the one the index points
+    // at. `node_for_range` floors to a char boundary, so a stale offset
+    // inside a multi-byte character still resolves to an enclosing node; the
+    // match may be the definition itself or its `name` identifier, so the
+    // search walks up to the enclosing `function_definition`.
+    let by_position = crate::cli::mcp::call_sites::node_for_range(tree.root_node(), byte_range)
+        .and_then(|node| {
+            let mut cursor = Some(node);
+            while let Some(current) = cursor {
+                if current.kind() == "function_definition"
+                    && current
+                        .child_by_field_name("name")
+                        .and_then(|child| child.utf8_text(source.text.as_bytes()).ok())
+                        .is_some_and(|text| text == name)
+                {
+                    return Some(current);
+                }
+                cursor = current.parent();
+            }
+            None
+        })
+        .map(|node| {
+            let mut parts = vec![file.to_string()];
+            parts.extend(pytest_classes(node, source));
+            parts.push(name.to_string());
+            parts.join("::")
+        });
+    match by_position {
+        Some(id) if candidates.contains(&id) => PytestLocator::Id(id),
+        _ => PytestLocator::Ambiguous(candidates),
+    }
+}
+
+/// A single valid pytest node id, or the ambiguity text when the name alone
+/// cannot name one test (see [`pytest_locator`]).
+fn pytest_node_id(
+    file: &str,
+    name: &str,
+    byte_range: (usize, usize),
+    source: Option<&crate::cli::mcp::call_sites::FileSource>,
+) -> String {
+    match pytest_locator(file, name, byte_range, source) {
+        PytestLocator::Id(id) => id,
+        PytestLocator::Ambiguous(ids) => format!(
+            "(ambiguous pytest id for {name} in {file}: {} — the index does not \
+             say which definition this target is; look the test up by file and \
+             line)",
+            ids.join(" | ")
+        ),
+    }
+}
+
+/// The Cargo target that owns the unit test in `file`.
 ///
 /// A unit test lives in exactly one target: the library, or a binary.
 /// Selecting `--lib` for a test that lives in `src/main.rs` or in a module
 /// owned by a `[[bin]]` runs ZERO tests and still exits 0, so a failing
-/// binary test read as a pass. The owning target is resolved from the crate
-/// root the module chain starts at (`main.rs` => the package's default
-/// binary) or from a `[[bin]]` entry whose `path` is that root.
-fn cargo_unit_target(file: &str) -> Option<&'static str> {
+/// binary test read as a pass. The owning target is the one whose crate root
+/// the module chain starts at, looked up in the package's real target table
+/// ([`cargo_targets`]) — not inferred from the root's file name, which
+/// misreads `[lib] path = "core/api.rs"` as a binary whenever a `[[bin]]`
+/// shares the package, and not from the package name, which is only the
+/// binary's name when no `[[bin]]` renamed it.
+fn cargo_unit_target(file: &str) -> Option<CargoTarget> {
     let (root, _) = out_of_line_module_ancestry(file)?;
-    // Only `src/lib.rs` (or a `[lib] path = …`) is the library; every other
-    // crate root (`main.rs`, `src/bin/*.rs`, `[[bin]] path`) is a binary.
-    let rel = root
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default()
-        .to_string();
-    let is_lib = rel == "lib.rs"
-        || std::fs::read_to_string(
-            root.parent()
-                .and_then(|src| src.parent())
-                .map(|pkg| pkg.join("Cargo.toml"))?,
-        )
-        .ok()
-        .is_some_and(|m| {
-            m.contains("[lib]")
-                && m.lines()
-                    .any(|l| l.trim().starts_with("path") && l.contains(&rel))
-                && !m.contains("[[bin]]")
-        });
-    Some(if is_lib { "--lib" } else { "--bin" })
+    let package_dir = cargo_package_dir(Path::new(file))?;
+    let canonical_root = root.canonicalize().ok()?;
+    cargo_targets(&package_dir)
+        .into_iter()
+        .find(|(candidate, _)| candidate.canonicalize().ok() == Some(canonical_root.clone()))
+        .map(|(_, target)| target)
 }
 
 /// The exact command that runs one test.
@@ -501,10 +715,9 @@ fn command_for(
                 .and_then(|source| unit_module_path(source, node, &node.name))
                 .unwrap_or_else(|| node.name.clone());
             match cargo_unit_target(file) {
-                // `--bin` without a name is "all binaries"; the package's
-                // default binary is named after the package.
-                Some("--bin") => {
-                    let bin = cargo_package(file).unwrap_or_default();
+                // The binary's OWN name: `--bin <package>` only works when
+                // no `[[bin]]` renamed the target.
+                Some(CargoTarget::Bin(bin)) => {
                     format!("cargo test {dash_p}--bin {bin} {path} -- --exact")
                 }
                 _ => format!("cargo test {dash_p}--lib {path} -- --exact"),
@@ -518,7 +731,7 @@ fn command_for(
             // ancestry (`file::TestFoo::test_bar`) is required for a method
             // and comes from the live tree; a line number is not part of a
             // node id, so it is not appended.
-            let locator = pytest_node_id(file, &node.name, source);
+            let locator = pytest_node_id(file, &node.name, node.byte_range, source);
             format!("pytest {locator}")
         }
         Some(TestRunner::Jest) => format!("npx jest {} -t {}", file, node.name),
@@ -755,6 +968,17 @@ mod tests {
         );
     }
 
+    fn parse_python(source: &str) -> crate::cli::mcp::call_sites::FileSource {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&crate::parse::traits::languages::python::language())
+            .unwrap();
+        crate::cli::mcp::call_sites::FileSource {
+            text: source.to_string(),
+            tree: parser.parse(source, None),
+        }
+    }
+
     /// A real crate on disk whose unit tests live in out-of-line modules.
     fn crate_with_out_of_line_tests() -> tempfile::TempDir {
         let dir = manifest_dir("outline");
@@ -798,7 +1022,11 @@ mod tests {
     }
 
     fn command_for_test_in(dir: &tempfile::TempDir, rel: &str, name: &str) -> String {
-        let file = dir.path().join("src").join(rel);
+        command_for_test_at(dir, &format!("src/{rel}"), name)
+    }
+
+    fn command_for_test_at(dir: &tempfile::TempDir, rel: &str, name: &str) -> String {
+        let file = dir.path().join(rel);
         let source = std::fs::read_to_string(&file).unwrap();
         let src = parse_rust(&source);
         let start = source.find(&format!("fn {name}")).unwrap();
@@ -821,14 +1049,7 @@ mod tests {
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         let source = "class TestOuter:\n    class TestInner:\n        def test_nested(self):\n            assert True\n\n    def test_method(self):\n        assert True\n\ndef test_plain():\n    assert True\n";
         std::fs::write(&file, source).unwrap();
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&crate::parse::traits::languages::python::language())
-            .unwrap();
-        let src = crate::cli::mcp::call_sites::FileSource {
-            text: source.to_string(),
-            tree: parser.parse(source, None),
-        };
+        let src = parse_python(source);
         let py = |name: &str| {
             node(
                 name,
@@ -1181,6 +1402,134 @@ mod tests {
         assert_eq!(by_depth.len(), 2, "self-loop deduped: {by_depth:?}");
         assert_eq!(by_depth[0].1, 1);
         assert_eq!(by_depth[1].1, 2);
+    }
+
+    /// Same-named methods in different classes must not be conflated. The
+    /// intended definition is selected POSITIONALLY from the PDG byte range;
+    /// when position cannot decide, the ambiguity is reported instead of a
+    /// guessed id (the traversal used to return whichever match it saw last,
+    /// so TestA's test could be reported as TestB's — or vice versa).
+    #[test]
+    fn test_pytest_same_named_methods_in_different_classes_are_disambiguated() {
+        let dir = manifest_dir("pyshared");
+        let file = dir.path().join("tests").join("shared_test.py");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let source = "class TestFirst:\n    def test_shared(self):\n        assert True\n\nclass TestSecond:\n    def test_shared(self):\n        assert True\n";
+        std::fs::write(&file, source).unwrap();
+        let src = parse_python(source);
+        let shown = file.display().to_string();
+        let first = source.find("def test_shared").unwrap();
+        let second = source[first + 1..].find("def test_shared").unwrap() + first + 1;
+        // A point INSIDE each definition. The PDG range is the definition's
+        // span up to its end byte, but the selection must only depend on
+        // containment, so a degenerate point inside the body is enough.
+        let at = |start: usize| node("test_shared", &shown, "python", (start, start));
+        assert_eq!(
+            command_for(&at(first + "def ".len()), Some(2), Some(&src)),
+            format!("pytest {shown}::TestFirst::test_shared")
+        );
+        assert_eq!(
+            command_for(&at(second + "def ".len()), Some(6), Some(&src)),
+            format!("pytest {shown}::TestSecond::test_shared")
+        );
+        // Offset 0 lands on the class header, not a definition: the id must
+        // NOT be guessed — both candidates are disclosed instead.
+        let ambiguous = command_for(&at(0), Some(1), Some(&src));
+        assert!(
+            ambiguous.starts_with("pytest (ambiguous pytest id for test_shared"),
+            "ambiguous: {ambiguous}"
+        );
+        assert!(ambiguous.contains(&format!("{shown}::TestFirst::test_shared")));
+        assert!(ambiguous.contains(&format!("{shown}::TestSecond::test_shared")));
+
+        // Execute the generated command with real pytest (if installed) on a
+        // failing FIRST definition: the intended test must be the one that
+        // runs, and the run must fail.
+        if std::process::Command::new("python3")
+            .arg("-m")
+            .arg("pytest")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            let failing = source.replacen(
+                "    def test_shared(self):\n        assert True",
+                "    def test_shared(self):\n        assert False",
+                1,
+            );
+            std::fs::write(&file, &failing).unwrap();
+            let failing_src = parse_python(&failing);
+            let command = command_for(&at(first + "def ".len()), Some(2), Some(&failing_src));
+            assert_eq!(command, format!("pytest {shown}::TestFirst::test_shared"));
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .current_dir(dir.path())
+                .output()
+                .expect("pytest runnable");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                text.contains("1 failed"),
+                "the intended definition must run: {text}"
+            );
+            assert!(!out.status.success());
+        }
+    }
+
+    /// CR-R4-2: a `[lib]` that sits next to a `[[bin]]` is still the library.
+    /// The library used to be recognised only while no `[[bin]]` existed, so
+    /// every package with both classified its library tests as binary tests
+    /// (and then ran zero tests under `--bin`).
+    ///
+    /// CR-R4-3: `--bin` must carry the OWNING binary target's name. Using the
+    /// package name is right only when no `[[bin]]` renamed the target.
+    #[test]
+    fn test_lib_target_survives_a_coexisting_bin_target() {
+        let dir = manifest_dir("both");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"both\"\nversion = \"0.1.0\"\n\n\
+             [lib]\npath = \"core/api.rs\"\n\n\
+             [[bin]]\nname = \"runner\"\npath = \"src/entry.rs\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("core")).unwrap();
+        std::fs::write(
+            dir.path().join("core/api.rs"),
+            "#[test]\nfn test_in_lib() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/entry.rs"),
+            "#[test]\nfn test_in_bin() {}\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src/bin")).unwrap();
+        std::fs::write(
+            dir.path().join("src/bin/worker.rs"),
+            "#[test]\nfn test_in_worker() {}\n",
+        )
+        .unwrap();
+
+        // The library stays the library despite the coexisting `[[bin]]`.
+        assert_eq!(
+            command_for_test_at(&dir, "core/api.rs", "test_in_lib"),
+            "cargo test -p both --lib test_in_lib -- --exact"
+        );
+        // A `[[bin]]` with its own name and path is selected by THAT name.
+        assert_eq!(
+            command_for_test_at(&dir, "src/entry.rs", "test_in_bin"),
+            "cargo test -p both --bin runner test_in_bin -- --exact"
+        );
+        // An auto-discovered `src/bin/<name>.rs` binary carries its stem.
+        assert_eq!(
+            command_for_test_at(&dir, "src/bin/worker.rs", "test_in_worker"),
+            "cargo test -p both --bin worker test_in_worker -- --exact"
+        );
     }
 
     #[test]

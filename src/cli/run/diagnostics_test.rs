@@ -20,7 +20,7 @@ fn test_parse_cargo_diagnostics_keeps_primary_span_and_dedupes() {
         r#"{"reason":"compiler-message","message":{"level":"error","code":null,"message":"aborting due to 1 previous error","spans":[]}}"#,
         "\n",
     );
-    let found = parse_cargo_diagnostics(root, output);
+    let found = parse_cargo_diagnostics(root, root, output);
     assert_eq!(found.len(), 2, "{found:?}");
     assert_eq!(found[0].file, PathBuf::from("/p/src/b.rs"));
     assert_eq!(found[0].line, 9);
@@ -29,17 +29,64 @@ fn test_parse_cargo_diagnostics_keeps_primary_span_and_dedupes() {
     assert_eq!(found[1].severity, Severity::Warning);
 }
 
+/// A member of a workspace above the project prints paths relative to that
+/// workspace, and the part above the project must be folded away before the
+/// containment check — otherwise every span of a legitimate member would look
+/// like it escaped the project and the store would come back empty.
+#[test]
+fn test_parse_cargo_diagnostics_folds_workspace_relative_spans_into_the_project() {
+    let workspace = Path::new("/ws");
+    let project = Path::new("/ws/member");
+    let output = r#"{"reason":"compiler-message","message":{"level":"error","code":{"code":"E0308"},"message":"mismatched types","spans":[{"file_name":"member/src/lib.rs","line_start":1,"is_primary":true}]}}"#;
+    let found = parse_cargo_diagnostics(workspace, project, output);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].file, project.join("src/lib.rs"));
+}
+
+/// A span that resolves outside the project is dropped, and a message whose
+/// primary span escapes but which also annotates in-project code keeps the
+/// in-project location instead of disappearing.
+#[test]
+fn test_parse_cargo_diagnostics_skips_spans_outside_the_project() {
+    let workspace = Path::new("/ws");
+    let project = Path::new("/ws/member");
+    let output = concat!(
+        // Only an escaping span: nothing to store.
+        r#"{"reason":"compiler-message","message":{"level":"error","code":{"code":"E0308"},"message":"in a dependency","spans":[{"file_name":"/elsewhere/shared/src/lib.rs","line_start":1,"is_primary":true}]}}"#,
+        "\n",
+        // Escaping primary span, in-project note: keep the in-project one.
+        r#"{"reason":"compiler-message","message":{"level":"error","code":{"code":"E0382"},"message":"borrow","spans":[{"file_name":"member/src/lib.rs","line_start":7,"is_primary":false},{"file_name":"/elsewhere/shared/src/lib.rs","line_start":4,"is_primary":true}]}}"#,
+        "\n",
+    );
+    let found = parse_cargo_diagnostics(workspace, project, output);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].file, project.join("src/lib.rs"));
+    assert_eq!(found[0].line, 7);
+    assert!(!found[0].file.to_string_lossy().contains("elsewhere"));
+}
+
 #[test]
 fn test_parse_tsc_diagnostics_resolves_paths_against_cwd() {
     let output = "src/app.ts(10,7): error TS2322: Type 'string' is not assignable to type 'number'.\n\
                   src/app.ts(10,7): error TS2322: Type 'string' is not assignable to type 'number'.\n\
                   src/util.ts(5,1): warning TS6192: All imports are unused.\n";
-    let found = parse_tsc_diagnostics(Path::new("/web"), output);
+    let found = parse_tsc_diagnostics(Path::new("/web"), Path::new("/web"), output);
     assert_eq!(found.len(), 2);
     assert_eq!(found[0].file, PathBuf::from("/web/src/app.ts"));
     assert_eq!(found[0].line, 10);
     assert_eq!(found[0].code.as_deref(), Some("TS2322"));
     assert_eq!(found[1].severity, Severity::Warning);
+}
+
+/// `tsc` reports paths relative to its cwd, but a project can pull in files
+/// from above it; those are dropped for the same reason cargo spans are.
+#[test]
+fn test_parse_tsc_diagnostics_skips_paths_outside_the_project() {
+    let output = "src/app.ts(1,1): error TS2304: Cannot find name 'x'.\n\
+                  ../shared/types.ts(2,1): error TS2304: Cannot find name 'y'.\n";
+    let found = parse_tsc_diagnostics(Path::new("/web"), Path::new("/web"), output);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].file, PathBuf::from("/web/src/app.ts"));
 }
 
 #[test]
@@ -299,27 +346,79 @@ fn test_cargo_workspace_root_follows_manifest_claims() {
     );
 }
 
-/// The walk stops at the project root: a `[workspace]` in a manifest ABOVE
-/// the project (a stray parent checkout) must never become the base for
-/// paths inside it, or diagnostics would be resolved against a directory
-/// outside the project.
+/// The round-3 guarantee, restated against what Cargo actually does.
+///
+/// The stray-parent case cannot produce a mislocated span, because Cargo
+/// REFUSES to run at all when a parent workspace does not list the package
+/// (verified against the installed cargo: `cargo locate-project --workspace`
+/// and `cargo metadata` both exit 101 with "current package believes it's in
+/// a workspace when it's not"). `cargo_workspace_root` therefore falls back to
+/// the manifest walk, and that fallback may never leave the project.
+///
+/// What must never happen either way is a STORED path outside the project:
+/// [`diagnostics_for`] could never read it back, so the diagnostic would
+/// silently vanish. Containment is the load-bearing check and is pinned here
+/// at the parse level (an absolute span outside is dropped, an in-project one
+/// is kept).
 #[test]
-fn test_cargo_workspace_root_never_escapes_the_project() {
+fn test_a_workspace_above_the_project_never_yields_a_base_or_a_span_outside_it() {
     let outer = tempfile::tempdir().unwrap();
     let outer = std::fs::canonicalize(outer.path()).unwrap();
-    // A stray workspace above the project claiming everything.
+    // A stray virtual manifest above the project (no `members` key).
+    write(&outer.join("Cargo.toml"), "[workspace]\nresolver = \"2\"\n");
+    let root = outer.join("project");
+    write(
+        &root.join("Cargo.toml"),
+        "[package]\nname = \"solo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write(&root.join("src/lib.rs"), "pub fn f() {}\n");
+
+    // Cargo refuses, so the fallback decides — and it stays inside.
+    let base = cargo_workspace_root(&root, &root);
+    assert!(
+        base.starts_with(&root),
+        "the base must stay inside the project, got {base:?}"
+    );
+
+    // Spans relative to that base: the in-project one is kept, an absolute
+    // path outside the project is dropped rather than stored unreachable.
+    let output = concat!(
+        r#"{"reason":"compiler-message","message":{"level":"error","code":{"code":"E0308"},"message":"in project","spans":[{"file_name":"src/lib.rs","line_start":3,"is_primary":true}]}}"#,
+        "\n",
+        r#"{"reason":"compiler-message","message":{"level":"error","code":{"code":"E0308"},"message":"outside","spans":[{"file_name":"/elsewhere/x/src/lib.rs","line_start":5,"is_primary":true}]}}"#,
+        "\n",
+    );
+    let found = parse_cargo_diagnostics(&base, &root, output);
+    assert_eq!(
+        found.len(),
+        1,
+        "only the in-project span may be stored: {found:?}"
+    );
+    assert_eq!(found[0].file, root.join("src/lib.rs"));
+    assert!(found[0].file.starts_with(&root));
+}
+
+/// The positive counterpart: when the parent workspace DOES list the project,
+/// Cargo's own answer is the base (that is the directory its spans are
+/// relative to), and it is an ancestor of the project root.
+#[test]
+fn test_cargo_workspace_root_uses_a_parent_workspace_that_lists_the_project() {
+    let outer = tempfile::tempdir().unwrap();
+    let outer = std::fs::canonicalize(outer.path()).unwrap();
     write(
         &outer.join("Cargo.toml"),
-        "[workspace]\nmembers = [\"**\"]\n",
+        "[workspace]\nmembers = [\"member\"]\nresolver = \"2\"\n",
     );
-    // The project is a subdirectory that is a stand-alone package.
-    let root = outer.join("project");
-    write(&root.join("Cargo.toml"), "[package]\nname = \"solo\"\n");
-    // With the project root as the bound, the stray parent is not used.
+    let root = outer.join("member");
+    write(
+        &root.join("Cargo.toml"),
+        "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write(&root.join("src/lib.rs"), "pub fn f() {}\n");
     assert_eq!(
         cargo_workspace_root(&root, &root),
-        root,
-        "a workspace above the project must not be selected"
+        outer,
+        "a genuine member's spans are relative to the workspace root"
     );
 }
 
@@ -394,4 +493,45 @@ fn test_check_scoped_uses_a_unique_log_per_invocation() {
     let second_text = std::fs::read_to_string(&second_log).unwrap();
     assert!(second_text.contains("b/src/lib.rs"), "{second_text}");
     assert!(!second_text.contains("a/src/lib.rs"), "{second_text}");
+}
+/// CodeRabbit CR-R4-4, end to end: the project is a genuine member of a
+/// workspace that lives ABOVE the project root (`/ws/Cargo.toml` lists
+/// `member`, the project is opened at `/ws/member`). Cargo then prints spans
+/// workspace-relative (`member/src/lib.rs`); resolving them against the
+/// project root produced `<root>/member/member/src/lib.rs`, which matched no
+/// file, so the diagnostic silently vanished from `diagnostics_for`.
+#[test]
+fn test_check_scoped_resolves_spans_when_the_workspace_is_above_the_project() {
+    let outer = tempfile::tempdir().unwrap();
+    let outer = std::fs::canonicalize(outer.path()).unwrap();
+    write(
+        &outer.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"member\"]\nresolver = \"2\"\n",
+    );
+    let root = outer.join("member");
+    write(
+        &root.join("Cargo.toml"),
+        "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write(&root.join("src/lib.rs"), "mod foo;\n");
+    write(
+        &root.join("src/foo.rs"),
+        "pub fn f() -> u32 { \"not a number\" }\n",
+    );
+
+    let summary = check_scoped(&root, Path::new("src/foo.rs"), 5).unwrap();
+    assert_ne!(summary.exit_code, 0, "{}", summary.render());
+    assert_eq!(summary.error_count, 1, "{}", summary.render());
+    let stored = diagnostics_for(&root, Path::new("src/foo.rs"), 1..=1);
+    assert_eq!(
+        stored.len(),
+        1,
+        "the span must be readable back: {stored:?}"
+    );
+    assert_eq!(stored[0].code.as_deref(), Some("E0308"));
+    assert_eq!(stored[0].file, root.join("src/foo.rs"));
+    assert!(
+        !stored[0].file.to_string_lossy().contains("member/member"),
+        "the workspace-relative prefix must be folded away: {stored:?}"
+    );
 }

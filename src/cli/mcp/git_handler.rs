@@ -1000,11 +1000,11 @@ fn plan_argv(op: &Op, root: &Path, args: &Value) -> Result<Vec<String>, JsonRpcE
         "tag" => Ok(tag_argv(args, required("target")?)),
         "merge" => Ok(target_argv("merge", Some("--no-edit"), required("target")?)),
         // Non-interactive only (brief §5): no editor, no interactive rebase.
-        "rebase" => Ok(target_argv(
-            "rebase",
-            Some("--no-edit"),
-            required("target")?,
-        )),
+        // `git rebase` has NO `--no-edit` flag (git rejects it with exit
+        // 129 "unknown option"), and a non-`-i` rebase opens no editor
+        // anyway — the executor's `GIT_EDITOR=true` covers the todo-list
+        // case. The argv is deliberately bare: `git rebase <target>`.
+        "rebase" => Ok(target_argv("rebase", None, required("target")?)),
         "push" => Ok(vec!["push".to_string(), "--porcelain".to_string()]),
         "reset" => {
             let target = required("target")?;
@@ -1399,6 +1399,107 @@ mod tests {
         assert!(
             !root.join("dirty.txt").exists(),
             "the stash actually ran — the untracked file is gone from the tree"
+        );
+    }
+
+    /// Regression (Codex round 4, C4-2): the rebase plan carried
+    /// `--no-edit`, which `git rebase` does NOT accept (`error: unknown
+    /// option 'no-edit'`, exit 129) — so every token-authorized rebase failed
+    /// at the executor while the plan looked fine. No argv assertion could
+    /// catch it; the planned argv has to be RUN. A non-`-i` rebase opens no
+    /// editor, and the executor sets `GIT_EDITOR=true`, so a bare
+    /// `git rebase <target>` is already non-interactive.
+    #[tokio::test]
+    async fn test_rebase_plan_token_applies_without_a_bogus_no_edit_flag() {
+        let repo = scratch_repo();
+        let root = repo.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .status()
+                .expect("git available");
+            assert!(status.success(), "git {args:?}");
+        };
+        // A ref, resolved through the same runner the handler uses.
+        let rev = |rev: &str| -> String {
+            git_output_capped(
+                root,
+                &["rev-parse".to_string(), rev.to_string()],
+                MAX_GIT_BYTES,
+            )
+            .map(|(out, _)| out.trim().to_string())
+            .unwrap_or_else(|error| panic!("rev-parse {rev}: {error}"))
+        };
+        // A topic commit on top of master, then a master commit the topic
+        // must be replayed onto.
+        git(&["checkout", "-q", "-b", "topic"]);
+        std::fs::write(root.join("topic.txt"), "topic\n").unwrap();
+        git(&["add", "topic.txt"]);
+        git(&["commit", "-q", "-m", "topic work"]);
+        git(&["checkout", "-q", "master"]);
+        std::fs::write(root.join("master.txt"), "master\n").unwrap();
+        git(&["add", "master.txt"]);
+        git(&["commit", "-q", "-m", "master moved on"]);
+        git(&["checkout", "-q", "topic"]);
+        let master_tip = rev("master");
+        assert_ne!(
+            rev("master~1"),
+            master_tip,
+            "precondition: master must have moved on by exactly one commit"
+        );
+        assert_ne!(
+            rev("topic"),
+            rev("topic~1"),
+            "precondition: topic must have exactly one commit of its own"
+        );
+        // The topic commit sits on master's PARENT — the rebase moves it.
+        assert_eq!(
+            rev("topic^"),
+            rev("master~1"),
+            "precondition: topic forked before master moved"
+        );
+
+        let plan = mutation_plan(
+            Op::parse("rebase").unwrap(),
+            root,
+            &json!({ "target": "master" }),
+        )
+        .await
+        .expect("plan");
+        assert_eq!(plan["applied"], false, "a plan applies nothing: {plan}");
+        // The advertised argv is what the token binds and the executor runs.
+        assert_eq!(
+            plan["argv"],
+            json!(["rebase", "master"]),
+            "the rebase argv must carry no `--no-edit` (git rejects it): {plan}"
+        );
+        let token = plan["preview_token"]
+            .as_str()
+            .expect("the plan advertises a token")
+            .to_string();
+
+        let applied = super::super::git_apply::handle(
+            "rebase",
+            root,
+            &json!({ "target": "master", "preview_token": token }),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("the plan's own token must apply: {error}"));
+        assert_eq!(
+            applied["applied"], true,
+            "token path must reach git: {applied}"
+        );
+
+        // The rebase actually ran: topic's parent is now master's tip.
+        assert_eq!(
+            rev("topic^"),
+            master_tip,
+            "topic must sit directly on master's tip after the rebase"
         );
     }
 

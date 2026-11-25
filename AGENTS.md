@@ -63,7 +63,7 @@ Zero warnings. Zero errors. No exceptions for "pre-existing" issues.
 
 - Rust test files MUST follow the `*_test.rs` naming convention (e.g., `parser_test.rs`, `search_test.rs`).
 - Integration tests live in the top-level `tests/` directory with descriptive names ending in `_test.rs` (e.g., `cli_integration_test.rs`).
-- Unit tests are embedded in source files under `#[cfg(test)] mod test { ... }` modules.
+- Unit tests are embedded in source files under `#[cfg(test)] mod tests { ... }` modules (the repo-wide convention; a handful of older files use `mod test`, both are accepted).
 - Test function names must start with `test_` and be descriptive (e.g., `test_parse_rust_function`, `test_search_returns_results`).
 - Property-based tests use `proptest!` macro; benchmark tests live in `benches/`.
 - CI enforces these conventions via the quality workflow.

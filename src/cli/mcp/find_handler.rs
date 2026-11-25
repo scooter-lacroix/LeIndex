@@ -1355,6 +1355,91 @@ mod tests {
         assert_eq!(second["offset"], first["next_offset"]);
     }
 
+    /// Regression (Codex round 4, C4-1): a continuation page used to drop
+    /// the resume cursors of every file it did not show a row for —
+    /// including files an earlier page had already delivered in full. Those
+    /// files were visited again (the engine keeps their cursor entry so the
+    /// next page skips them), but with no row on the page the shaper filtered
+    /// their cursor out of the next token, and the page after that served
+    /// their already-delivered hits a second time.
+    ///
+    /// Three files (b.txt holds two hits), `limit: 1` pages the stream one
+    /// hit at a time: a:1, b:1 (a.txt fully skipped), b:2, c:1. Walking the
+    /// tokens to exhaustion must deliver every hit exactly once.
+    #[tokio::test]
+    async fn test_find_budget_cut_continuation_keeps_cursors_of_fully_delivered_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in [
+            ("a.txt", "parse_config\n"),
+            ("b.txt", "parse_config\nparse_config\n"),
+            ("c.txt", "parse_config\n"),
+        ] {
+            std::fs::write(dir.path().join(name), body).unwrap();
+        }
+        let page = |args: Value| {
+            let dir = dir.path().to_path_buf();
+            async move {
+                let registry = Arc::new(ProjectRegistry::new(2));
+                let mut args = args;
+                args["project_path"] = json!(dir.to_string_lossy());
+                FindHandler.execute(&registry, args).await.unwrap()
+            }
+        };
+        let hits_of = |value: &Value| -> Vec<(String, u64)> {
+            value["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|file| {
+                    let path = file["file"].as_str().unwrap().to_string();
+                    file["hits"]
+                        .as_array()
+                        .map(|hits| {
+                            hits.iter()
+                                .filter_map(|hit| {
+                                    hit["line"].as_u64().map(|line| (path.clone(), line))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect()
+        };
+
+        let mut delivered: Vec<(String, u64)> = Vec::new();
+        let mut first = page(json!({ "pattern": "parse_config", "limit": 1 })).await;
+        assert_eq!(
+            first["files"].as_array().unwrap().len(),
+            1,
+            "one hit per page: {first}"
+        );
+        let mut pages = 1;
+        loop {
+            delivered.extend(hits_of(&first));
+            let Some(next) = first["next"].as_str().map(str::to_string) else {
+                break;
+            };
+            assert!(pages < 10, "the stream never ends: {first}");
+            first = page(json!({ "next": next, "limit": 1 })).await;
+            pages += 1;
+        }
+        assert_eq!(
+            first["has_more"], false,
+            "the last page must close the stream: {first}"
+        );
+        delivered.sort();
+        assert_eq!(
+            delivered,
+            [
+                ("a.txt".to_string(), 1),
+                ("b.txt".to_string(), 1),
+                ("b.txt".to_string(), 2),
+                ("c.txt".to_string(), 1),
+            ],
+            "every hit exactly once across {pages} pages"
+        );
+    }
+
     #[test]
     fn test_find_regex_like_heuristic_lone_dot_exempt() {
         // §3.8 heuristic, unit-level: the metacharacters that CHANGE meaning

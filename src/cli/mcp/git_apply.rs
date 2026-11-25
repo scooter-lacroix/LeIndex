@@ -86,10 +86,9 @@ fn is_secret_path(relative: &str) -> bool {
         || (lower.starts_with("credentials") && lower.ends_with(".json"));
     basename_looks_secret
         || path.components().rev().skip(1).any(|component| {
-            component
-                .as_os_str()
-                .to_str()
-                .is_some_and(|c| c.eq_ignore_ascii_case("credentials"))
+            component.as_os_str().to_str().is_some_and(|c| {
+                c.eq_ignore_ascii_case("credentials") || c.eq_ignore_ascii_case("secrets")
+            })
         })
 }
 
@@ -1161,9 +1160,18 @@ mod test {
         assert!(is_secret_path("keys/id_rsa"));
         assert!(is_secret_path("client.key"));
         assert!(is_secret_path("credentials/google.json"));
+        // A `secrets/` directory is sensitive regardless of the basename —
+        // the doc promised it; the predicate used to check only
+        // `credentials` (Codex round 4, C4-3).
+        assert!(is_secret_path("secrets/prod-token.txt"));
+        assert!(is_secret_path("deploy/Secrets/api.json"));
         assert!(is_secret_path("my_secret_notes.txt"));
         assert!(!is_secret_path("src/key.rs"));
         assert!(!is_secret_path("environment.rs"));
+        // A basename that merely STARTS with the directory word is not a
+        // directory: `secretary/` and `credentials-old/` hold no secrets.
+        assert!(!is_secret_path("secretary/notes.txt"));
+        assert!(!is_secret_path("credentials-old/notes.txt"));
     }
 
     #[test]

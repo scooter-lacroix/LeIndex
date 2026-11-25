@@ -6,10 +6,12 @@
 //! JSON in `<storage>/logs/last-diagnostics.json`. `diagnostics_for` reads
 //! that store back for a file and line range.
 
+use std::io::Read;
 use std::ops::RangeInclusive;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -115,12 +117,45 @@ pub(crate) fn diagnostics_for(
         .collect()
 }
 
-fn absolute(project_root: &Path, file: &Path) -> PathBuf {
-    if file.is_absolute() {
+/// Resolve `file` against `base` and drop `.`/`..` components.
+///
+/// The result is lexical on purpose: a span may name a file that does not
+/// exist yet (generated source), so asking the filesystem would be wrong as
+/// well as slow. Every caller passes an absolute `base`, so a `..` that
+/// climbs above the root can only be an attempt to leave the tree; it is
+/// dropped at the root.
+fn absolute(base: &Path, file: &Path) -> PathBuf {
+    let joined = if file.is_absolute() {
         file.to_path_buf()
     } else {
-        project_root.join(file)
+        base.join(file)
+    };
+    let mut normalized = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() && !joined.is_absolute() {
+                    normalized.push("..");
+                }
+            }
+            other => normalized.push(other),
+        }
     }
+    normalized
+}
+
+/// The absolute path of one reported span, or `None` when it lands outside
+/// `project_root`.
+///
+/// `base` is the directory the tool printed its paths relative to — the
+/// workspace root Cargo resolved (which for a genuine member is an ancestor of
+/// the project) or the directory `tsc` ran in. A span outside the project is
+/// not stored: [`diagnostics_for`] can never read it back, so storing it would
+/// only look like a diagnostic that silently vanished.
+fn contained(base: &Path, project_root: &Path, file: &Path) -> Option<PathBuf> {
+    let path = absolute(base, file);
+    path.starts_with(project_root).then_some(path)
 }
 
 /// How a file's owning package is checked.
@@ -192,16 +227,88 @@ fn find_scope(project_root: &Path, file: &Path) -> Result<Scope> {
 /// `[workspace]` table inside the package itself (`members = []` or not
 /// listing itself) therefore makes the package its own root — which is why
 /// a stand-alone member prints `src/lib.rs` while a workspace member prints
-/// `member/src/lib.rs`. Stops at `project_root` (inclusive) so a stray
-/// parent manifest outside the project can never become the base.
+/// `member/src/lib.rs`.
 ///
-/// Everything is decided from the manifest text, not `cargo metadata`, so
-/// no second Cargo process is spawned for every scoped check.
+/// Cargo is asked first (see [`cargo_workspace_root_from_cargo`]) because only
+/// Cargo knows its own matching rules; the manifest walk below is the fallback
+/// and never leaves `project_root`, so a stray parent manifest outside the
+/// project can never become the base.
 fn cargo_workspace_root(member_dir: &Path, project_root: &Path) -> PathBuf {
-    /// Does Cargo member pattern `pattern` list the project-relative path
-    /// `rel`? Cargo accepts a literal path, `dir/*` (one level) and
-    /// `dir/**` (any depth); the latter two are matched here without a glob
-    /// dependency.
+    if let Some(root) = cargo_workspace_root_from_cargo(member_dir) {
+        return root;
+    }
+    // Cargo could not answer (no `cargo` on PATH, a manifest without targets,
+    // or a workspace that does not load): decide from the manifest text.
+    manifest_workspace_root(member_dir, project_root)
+}
+
+/// How long the authoritative probe may run before it is abandoned.
+const WORKSPACE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often the probe's child is polled while it runs.
+const WORKSPACE_PROBE_POLL: Duration = Duration::from_millis(5);
+
+/// The workspace root Cargo itself resolves `dir` to, or `None` when Cargo
+/// will not answer.
+///
+/// Only Cargo knows every rule that decides the root: `members` patterns
+/// accept `*` (one path segment), `?`, `[...]` classes and `**` (any depth) in
+/// any position, `exclude` takes the same patterns, a manifest that is both a
+/// package and a workspace root claims itself, and a package that believes it
+/// is in a workspace it is not a member of is an error rather than a root. A
+/// hand-rolled walk can drift from any of those, and a drifted base silently
+/// mislocates every diagnostic, so the answer comes from Cargo when it can be
+/// had.
+///
+/// `locate-project --workspace` prints one short line, so its pipe cannot
+/// fill, and it reads no registry and takes no package lock. `dir` is already
+/// canonicalized by the caller, so this answer and the fallback agree on
+/// spelling. The child is killed at the deadline; the caller then falls back.
+fn cargo_workspace_root_from_cargo(dir: &Path) -> Option<PathBuf> {
+    let mut child = Command::new("cargo")
+        .args(["locate-project", "--workspace", "--message-format", "plain"])
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + WORKSPACE_PROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(WORKSPACE_PROBE_POLL),
+            // Timed out, or the wait itself failed: never leave it running.
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    // The child is reaped, so its pipe is at EOF and this read cannot block.
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    let manifest = Path::new(out.trim());
+    if manifest.file_name() != Some(std::ffi::OsStr::new("Cargo.toml")) {
+        return None;
+    }
+    manifest.parent().map(Path::to_path_buf)
+}
+
+/// Fallback for [`cargo_workspace_root`]: decide from the manifest text alone.
+///
+/// Used only when Cargo cannot answer, so it must never leave `project_root`:
+/// a stray parent manifest is not authoritative, and a base outside the
+/// project would resolve every diagnostic to a path the store never matches.
+/// The member patterns it understands are the trailing `dir/*` (one level) and
+/// `dir/**` (any depth) forms; anything else is read as the literal path Cargo
+/// also accepts. Cargo itself is authoritative for the rest.
+fn manifest_workspace_root(member_dir: &Path, project_root: &Path) -> PathBuf {
+    /// Does member pattern `pattern` list the root-relative path `rel`?
     fn lists(pattern: &str, rel: &str) -> bool {
         if let Some(prefix) = pattern.strip_suffix("/**") {
             return rel == prefix || rel.starts_with(&format!("{prefix}/"));
@@ -264,11 +371,44 @@ fn cargo_workspace_root(member_dir: &Path, project_root: &Path) -> PathBuf {
     member_dir.to_path_buf()
 }
 
+/// The in-project location of a message's primary span, falling back to any
+/// other span the message carries.
+///
+/// A primary span can land outside the project — a macro that expands in a
+/// dependency, an `include!` of a file above the project — while the message
+/// still annotates code inside it. Dropping the whole message then would hide
+/// a real in-project diagnostic, so the remaining spans are tried in order.
+fn primary_location(
+    base: &Path,
+    project_root: &Path,
+    message: &serde_json::Value,
+) -> Option<(PathBuf, usize)> {
+    let spans = message["spans"].as_array()?;
+    let mut ordered = spans
+        .iter()
+        .filter(|span| span["is_primary"].as_bool() == Some(true))
+        .chain(
+            spans
+                .iter()
+                .filter(|span| span["is_primary"].as_bool() != Some(true)),
+        );
+    ordered.find_map(|span| {
+        let name = Path::new(span["file_name"].as_str()?);
+        let line = usize::try_from(span["line_start"].as_u64()?).unwrap_or(usize::MAX);
+        contained(base, project_root, name).map(|file| (file, line))
+    })
+}
+
 /// `cargo check` JSON lines to diagnostics. Messages without a span (the
 /// "aborting due to" trailer) carry no location and are skipped. `file_name`
 /// is relative to the workspace root Cargo resolved, so `base` is that root
-/// (see [`cargo_workspace_root`]) — not the directory the check ran in.
-pub(crate) fn parse_cargo_diagnostics(base: &Path, output: &str) -> Vec<Diagnostic> {
+/// (see [`cargo_workspace_root`]) — not the directory the check ran in — and
+/// `project_root` is the bound every resolved path must stay inside.
+pub(crate) fn parse_cargo_diagnostics(
+    base: &Path,
+    project_root: &Path,
+    output: &str,
+) -> Vec<Diagnostic> {
     let mut found: Vec<Diagnostic> = Vec::new();
     for line in output.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -283,24 +423,12 @@ pub(crate) fn parse_cargo_diagnostics(base: &Path, output: &str) -> Vec<Diagnost
             Some("warning") => Severity::Warning,
             _ => continue,
         };
-        let Some(spans) = message["spans"].as_array() else {
-            continue;
-        };
-        let Some(span) = spans
-            .iter()
-            .find(|span| span["is_primary"].as_bool() == Some(true))
-            .or_else(|| spans.first())
-        else {
-            continue;
-        };
-        let (Some(name), Some(line_start)) =
-            (span["file_name"].as_str(), span["line_start"].as_u64())
-        else {
+        let Some((file, line)) = primary_location(base, project_root, message) else {
             continue;
         };
         let diagnostic = Diagnostic {
-            file: absolute(base, Path::new(name)),
-            line: usize::try_from(line_start).unwrap_or(usize::MAX),
+            file,
+            line,
             severity,
             code: message["code"]["code"].as_str().map(str::to_string),
             message: message["message"].as_str().unwrap_or("").to_string(),
@@ -313,8 +441,13 @@ pub(crate) fn parse_cargo_diagnostics(base: &Path, output: &str) -> Vec<Diagnost
 }
 
 /// `tsc` text (`path(line,col): error TSxxxx: message`) to diagnostics; paths
-/// are relative to the directory tsc ran in.
-pub(crate) fn parse_tsc_diagnostics(base: &Path, output: &str) -> Vec<Diagnostic> {
+/// are relative to the directory tsc ran in, and a path outside the project is
+/// skipped for the same reason a cargo span is.
+pub(crate) fn parse_tsc_diagnostics(
+    base: &Path,
+    project_root: &Path,
+    output: &str,
+) -> Vec<Diagnostic> {
     let mut found: Vec<Diagnostic> = Vec::new();
     for line in output.lines() {
         let Some((location, rest)) = line.split_once("): ") else {
@@ -340,8 +473,11 @@ pub(crate) fn parse_tsc_diagnostics(base: &Path, output: &str) -> Vec<Diagnostic
         let Some((code, message)) = rest.split_once(": ") else {
             continue;
         };
+        let Some(file) = contained(base, project_root, Path::new(path.trim())) else {
+            continue;
+        };
         let diagnostic = Diagnostic {
-            file: absolute(base, Path::new(path.trim())),
+            file,
             line: line_number,
             severity,
             code: Some(code.trim().to_string()),
@@ -413,9 +549,13 @@ pub(crate) fn check_scoped(project_root: &Path, file: &Path, max: usize) -> Resu
     let diagnostics = match &scope {
         // Cargo prints `file_name` relative to the WORKSPACE root it resolved
         // (which may be an ancestor of the member the check ran in), so that
-        // is the base. `tsc` paths are relative to the cwd it ran in.
-        Scope::Cargo { workspace_root, .. } => parse_cargo_diagnostics(workspace_root, &output),
-        Scope::Tsc(dir) => parse_tsc_diagnostics(dir, &output),
+        // is the base. `tsc` paths are relative to the cwd it ran in. Either
+        // way `root` is the bound: a span outside the project is dropped
+        // rather than stored where `diagnostics_for` could never read it.
+        Scope::Cargo { workspace_root, .. } => {
+            parse_cargo_diagnostics(workspace_root, &root, &output)
+        }
+        Scope::Tsc(dir) => parse_tsc_diagnostics(dir, &root, &output),
     };
     record(&storage, &diagnostics)?;
 
