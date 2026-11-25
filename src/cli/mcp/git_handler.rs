@@ -317,7 +317,7 @@ impl GitHandler {
                 "include_patch": {
                     "type": "boolean",
                     "default": false,
-                    "description": "Include the full patch (show defaults to stat + changed symbols; set true for the patch text)"
+                    "description": "Include the full patch (show defaults to the commit's stat plus its message; set true for the patch text)"
                 },
                 "max_chars": {
                     "type": "integer",
@@ -478,16 +478,30 @@ fn argument_warnings(op: &Op, args: &Value) -> Result<Vec<String>, JsonRpcError>
     // `preview_token` and `confirm` are the APPLY authorization fields: the
     // plan path never sees them, but the apply path always does, so the
     // validator — now run on both — must accept them or refuse every apply.
+    // A READ has no apply path, so there they really are ignored and the
+    // caller is told (Kilo round 11, id 4698809176): `confirm:true` on `log`
+    // used to be swallowed without a word.
     const AUTHORIZATION_KEYS: [&str; 2] = ["preview_token", "confirm"];
     let is_transport = |key: &str| {
         SHARED_KEYS.contains(&key)
             || ROUTER_KEYS.contains(&key)
             || SILENTLY_HONORED.contains(&key)
-            || AUTHORIZATION_KEYS.contains(&key)
+            || (op.mutating && AUTHORIZATION_KEYS.contains(&key))
     };
     let mut warnings = Vec::new();
     for key in object.keys() {
         if op.args.contains(&key.as_str()) || is_transport(key) {
+            continue;
+        }
+        // Authorization keys on a READ are real keys the router knows — just
+        // not for this operation. They are reported, never refused: a
+        // session-scoped client that habitually sends `confirm` must not have
+        // its `log` call rejected over a field that is simply inert here.
+        if !op.mutating && AUTHORIZATION_KEYS.contains(&key.as_str()) {
+            warnings.push(format!(
+                "git {} ignores '{key}' (it has no apply step)",
+                op.name
+            ));
             continue;
         }
         if any_op_reads(key) {
@@ -528,7 +542,17 @@ fn with_warnings(mut payload: Value, warnings: &[String]) -> Value {
         // another. Replacing dropped the first, so the plan looked complete
         // while it omitted files.
         match object.get_mut("warnings").and_then(Value::as_array_mut) {
-            Some(existing) => existing.extend(warnings.iter().cloned().map(Value::String)),
+            // Deduplicated on insert (Kilo round 11, id 4698809186): the
+            // same key can be reported from more than one path, and a
+            // duplicated warning reads as two separate problems.
+            Some(existing) => {
+                for warning in warnings {
+                    let warning = Value::String(warning.clone());
+                    if !existing.contains(&warning) {
+                        existing.push(warning);
+                    }
+                }
+            }
             None => {
                 object.insert("warnings".to_string(), json!(warnings));
             }
@@ -602,29 +626,32 @@ fn git_log(root: &Path, args: &Value) -> Result<Value, JsonRpcError> {
     let mut commits: Vec<Value> = Vec::new();
     let mut files = 0usize;
     for line in text.lines() {
+        // ONE split serves both the probe and the record (Kilo round 11, id
+        // 4698809192): a commit header is
+        // `<oid>\t<date>\t<author>\t<subject>`, so a header always has a
+        // second field after the oid. `--name-only` emits bare file records,
+        // and a file whose name is exactly 40 hex characters is legal —
+        // matching on shape alone invented a phantom commit for it
+        // (CodeRabbit round 10, id 4697090225). Require the separator.
         let mut fields = line.splitn(4, '\t');
         let oid = fields.next().unwrap_or_default();
-        // A commit header is `<oid>\t<date>\t<author>\t<subject>`, so the
-        // oid is ALWAYS followed by a tab. `--name-only` emits bare file
-        // records, and a file whose name is exactly 40 hex characters is
-        // legal — matching on shape alone invented a phantom commit for it
-        // (CodeRabbit round 10, id 4697090225). Require the separator.
-        let is_header = fields.next().is_some()
-            && oid.len() == 40
-            && oid.bytes().all(|b| b.is_ascii_hexdigit());
+        let date = fields.next();
+        // `is_oid` accepts 40 or 64 hex digits (CodeRabbit round 11, id
+        // 4698955173): a SHA-256 repository's commit ids are 64 long, and a
+        // 40-only test read every one of them as a FILENAME.
+        let is_header = date.is_some() && super::git_apply::is_oid(oid);
         if is_header {
-            // `fields` was advanced by the probe above; rebuild the remaining
-            // fields in order.
-            let rest: Vec<&str> = line.splitn(4, '\t').skip(2).collect();
+            let author = fields.next().unwrap_or_default();
+            let subject = fields.next().unwrap_or_default();
             if let Some(commit) = commits.last_mut() {
                 commit["files_changed"] = json!(files);
             }
             files = 0;
             commits.push(json!({
                 "oid": oid,
-                "date": rest.first().copied().unwrap_or_default(),
-                "author": rest.get(1).copied().unwrap_or_default(),
-                "subject": rest.get(2).copied().unwrap_or_default(),
+                "date": date.unwrap_or_default(),
+                "author": author,
+                "subject": subject,
             }));
         } else if !line.trim().is_empty() {
             files += 1;
@@ -861,8 +888,10 @@ async fn mutation_plan(op: &Op, root: &Path, args: &Value) -> Result<Value, Json
     let (argv, staging) = if op.name == "add" {
         // Compute the staging outcome ONCE: the shared helper builds the argv
         // from it AND it is the report the plan shows, so a second call could
-        // disagree with the argv the token binds.
-        let outcome = super::git_apply::staging_outcome(root, args)?;
+        // disagree with the argv the token binds. Run off the async worker:
+        // the ignore probe polls a child for up to ten seconds (CodeRabbit
+        // round 11, id 4698955145).
+        let outcome = super::git_apply::staging_outcome_async(root, args).await?;
         (super::git_apply::add_argv(&outcome), Some(outcome))
     } else {
         (plan_argv(op, root, &args.clone())?, None)
@@ -1122,6 +1151,12 @@ fn plan_argv(op: &Op, root: &Path, args: &Value) -> Result<Vec<String>, JsonRpcE
     let target = plan_target(op, args)?;
     let required = |field: &str| require_target(&target, op.name, field);
 
+    // The planner is a pure argv builder, so it cannot await; on the `add`
+    // path it therefore reaches the synchronous staging helper directly.
+    // That is acceptable here — `mutation_plan` and `handle` already staged
+    // through `staging_outcome_async` before calling in, and the executor's
+    // own path is off the async worker — but a future caller must not treat
+    // this fn as a safe place to block.
     match op.name {
         // `add` is planned over the exact post-exclusion path list the
         // guardrails produce, so the plan's staged list is the truth.
@@ -1156,13 +1191,24 @@ fn plan_argv(op: &Op, root: &Path, args: &Value) -> Result<Vec<String>, JsonRpcE
             // explicit flag is set — an unset flag cannot produce a plan
             // that the executor could then token-validate into running.
             if clean {
-                if !target.starts_with('-') {
-                    return Err(JsonRpcError::invalid_params_with_suggestion(
-                        "clean:true expects target '-d' or '-fd'".to_string(),
-                        "Use target:'-fd' with clean:true (token-only)".to_string(),
-                    ));
+                // Only the DOCUMENTED targets are buildable (CodeRabbit round
+                // 11, id 4698955227). Any other flag-shaped target reached
+                // apply as well — `-n` made a dry run report `applied: true`
+                // having removed nothing, and `-x` would delete IGNORED files
+                // (a local `.env`, say) that neither documented form touches.
+                match target.as_str() {
+                    "-d" | "-fd" => return Ok(vec!["clean".to_string(), target, "-f".to_string()]),
+                    other => {
+                        return Err(JsonRpcError::invalid_params_with_suggestion(
+                            format!(
+                                "'{other}' is not a supported clean target: clean:true accepts \
+                                 target '-d' or '-fd'"
+                            ),
+                            "Use target:'-fd' to remove untracked files and directories"
+                                .to_string(),
+                        ));
+                    }
                 }
-                return Ok(vec!["clean".to_string(), target, "-f".to_string()]);
             }
             if target.starts_with('-') {
                 // The one legal flag-shaped target is branch deletion, and

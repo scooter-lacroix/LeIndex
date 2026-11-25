@@ -816,6 +816,129 @@ fn test_commit_refuses_a_non_array_paths_value() {
     assert!(ok.contains(&"--".to_string()), "{ok:?}");
 }
 
+/// Kilo round 11 (id 4698809176): `preview_token` / `confirm` were accepted
+/// silently for EVERY operation so the apply path would not refuse them. A
+/// read has no apply path, so there they are genuinely ignored — and the
+/// caller was told nothing. They are now accepted only for mutating ops.
+#[test]
+fn test_authorization_keys_are_ignored_with_a_warning_on_reads() {
+    for name in ["log", "show", "branch", "remote"] {
+        let op = Op::parse(name).unwrap();
+        let warnings =
+            argument_warnings(op, &json!({ "confirm": true, "preview_token": "t" })).unwrap();
+        assert_eq!(
+            warnings,
+            vec![
+                format!("git {name} ignores 'confirm' (it has no apply step)"),
+                format!("git {name} ignores 'preview_token' (it has no apply step)"),
+            ],
+            "{name}: a read must report the ignored authorization keys"
+        );
+    }
+    // On mutations they are real arguments and must stay silent, or every
+    // apply would be refused.
+    for name in ["commit", "stash", "reset"] {
+        let op = Op::parse(name).unwrap();
+        let warnings =
+            argument_warnings(op, &json!({ "confirm": true, "preview_token": "t" })).unwrap();
+        assert!(
+            warnings.is_empty(),
+            "{name}: apply keys must be accepted silently: {warnings:?}"
+        );
+    }
+}
+
+/// Kilo round 11 (id 4698809186): `with_warnings` merged but did not
+/// deduplicate, so the same warning reported twice read as two problems.
+#[test]
+fn test_with_warnings_deduplicates() {
+    let payload = json!({ "warnings": ["a"] });
+    let merged = with_warnings(
+        payload,
+        &["a".to_string(), "b".to_string(), "a".to_string()],
+    );
+    let warnings: Vec<&str> = merged["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|w| w.as_str())
+        .collect();
+    assert_eq!(warnings, vec!["a", "b"], "{merged}");
+}
+
+/// CodeRabbit round 11 (id 4698955227): `clean:true` accepted ANY target that
+/// started with `-`, so `-n` (a dry run) produced a plan that reported
+/// `applied: true` having removed nothing, and `-x` would delete IGNORED files
+/// — a local `.env`, say — that neither documented form touches. Only the
+/// documented `-d` / `-fd` are buildable now.
+#[test]
+fn test_clean_only_accepts_the_documented_targets() {
+    let repo = scratch_repo();
+    for bad in ["-n", "-x", "-X", "-fdx", "-f", "HEAD", "clean"] {
+        let error = plan_argv(
+            Op::parse("reset").unwrap(),
+            repo.path(),
+            &json!({ "target": bad, "clean": true }),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("'{bad}' must be refused as a clean target"));
+        let text = error.message_with_hint();
+        assert!(
+            text.contains("-d") && text.contains("-fd"),
+            "'{bad}': the refusal must name the documented targets: {text}"
+        );
+    }
+    for good in ["-d", "-fd"] {
+        let argv = plan_argv(
+            Op::parse("reset").unwrap(),
+            repo.path(),
+            &json!({ "target": good, "clean": true }),
+        )
+        .unwrap_or_else(|error| panic!("'{good}' is documented and must build: {error}"));
+        assert_eq!(argv, ["clean", good, "-f"], "{good}");
+    }
+}
+
+/// CodeRabbit round 11 (id 4698955211): the `show` schema advertised
+/// "changed symbols", which the default response never contains — it carries
+/// the commit's stat plus its message. The description must describe what
+/// actually comes back.
+#[test]
+fn test_the_show_schema_does_not_promise_changed_symbols() {
+    let schema = GitHandler.argument_schema();
+    let description = schema["properties"]["include_patch"]["description"]
+        .as_str()
+        .expect("include_patch is documented");
+    assert!(
+        !description.contains("changed symbols"),
+        "the stat response carries no symbol list: {description}"
+    );
+    assert!(
+        description.contains("stat"),
+        "the description must name what `show` returns: {description}"
+    );
+}
+
+/// CodeRabbit round 11 (id 4698955173): git object names are 40 hex digits in
+/// a SHA-1 repository and 64 in a SHA-256 one. A 40-only test rejected every
+/// SHA-256 object, and the log parser read each of those commit ids as a
+/// FILENAME.
+#[test]
+fn test_object_ids_are_accepted_in_either_hash_length() {
+    let sha1 = "0123456789abcdef0123456789abcdef01234567";
+    let sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    assert!(super::super::git_apply::is_oid(sha1));
+    assert!(super::super::git_apply::is_oid(sha256));
+    for bad in ["", "0123", &sha1[..39], &sha256[..63], &format!("{sha1}0")] {
+        assert!(
+            !super::super::git_apply::is_oid(bad),
+            "'{bad}' is not a full object name"
+        );
+    }
+    // Short hex, non-hex and over-long inputs are all refused.
+    assert!(!super::super::git_apply::is_oid(&"z".repeat(40)));
+}
+
 /// Helper: a scratch repository with one commit on branch `master`.
 fn scratch_repo() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();

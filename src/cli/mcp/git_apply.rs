@@ -21,6 +21,13 @@
 //! secrets or runtime artefacts are EXCLUDED and listed, unless
 //! `allow_sensitive: true`.
 
+// The process-execution half of this module now lives in `git_apply_exec`
+// (this file passed the 2000-line limit). These are the items THIS file uses;
+// the test module imports the rest straight from `git_apply_exec`, so nothing
+// here is a re-export kept alive only for a sibling.
+use super::git_apply_exec::{
+    MutationOutput, git_command_sync, run_mutation, run_mutation_with_env,
+};
 use super::git_diff_handler::MAX_DIFF_BYTES;
 use super::git_handler::{argument_warnings_for, plan_argv_for, preview_token};
 use super::helpers::validate_file_within_project;
@@ -28,13 +35,6 @@ use super::protocol::JsonRpcError;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-
-/// Hard timeout for one mutating git command. A hung credential prompt or a
-/// stuck hook must not pin the MCP server; the process is killed at the cap.
-const MUTATION_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// Ceiling on captured stdout/stderr of a mutation, per stream.
-const MAX_MUTATION_OUTPUT_BYTES: usize = 256 * 1024;
 
 /// Operations the `confirm: true` shortcut may apply without a prior plan.
 /// `pub(crate)`: the git_handler test pins the plan hint to exactly this set.
@@ -47,9 +47,6 @@ const TOKEN_ONLY: [&str; 5] = ["checkout", "stash", "tag", "merge", "rebase"];
 /// walk, so it is fast; the deadline exists so a wedged git cannot hang a
 /// staging request with no timeout running at all.
 const IGNORE_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Char budget for a surfaced failure before truncation is counted.
-const FAILURE_CHARS: usize = 4_000;
 
 // ---------------------------------------------------------------------------
 // Staging guardrails
@@ -183,8 +180,6 @@ fn ignored_paths(
     root: &Path,
     candidates: &[String],
 ) -> Result<std::collections::BTreeSet<String>, JsonRpcError> {
-    use std::io::Write;
-
     let mut ignored = std::collections::BTreeSet::new();
     if candidates.is_empty() {
         return Ok(ignored);
@@ -218,18 +213,27 @@ fn ignored_paths(
     // sees EOF and exits. The reply is read uncapped — it is bounded by the
     // request (one record per ignored candidate), and capping it would
     // silently drop ignored paths and then stage them.
+    //
+    // BOTH threads REPORT their result (CodeRabbit round 11, id 4698955155).
+    // Their errors used to be discarded and a panicking reader collapsed to an
+    // empty string, so a PARTIAL reply looked like "nothing is ignored" and the
+    // staging list included files the filter exists to exclude.
     let feeder = std::thread::spawn(move || {
+        use std::io::Write;
         if let Some(mut input) = stdin.take() {
-            let _ = input.write_all(&payload);
+            let mut payload = &payload[..];
+            std::io::copy(&mut payload, &mut input)?;
+            input.flush()?;
         }
+        Ok::<(), std::io::Error>(())
     });
     let reader = std::thread::spawn(move || {
         use std::io::Read;
         let mut buf = Vec::new();
         if let Some(mut pipe) = stdout_pipe {
-            let _ = pipe.read_to_end(&mut buf);
+            pipe.read_to_end(&mut buf)?;
         }
-        String::from_utf8_lossy(&buf).into_owned()
+        Ok::<Vec<u8>, std::io::Error>(buf)
     });
 
     // One deadline for the WHOLE exchange. A wedged git is killed and the
@@ -260,7 +264,22 @@ fn ignored_paths(
         }
     };
     let _ = feeder.join();
-    let stdout: String = reader.join().unwrap_or_default();
+    let stdout: String = match reader.join() {
+        Ok(Ok(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
+        Ok(Err(error)) => {
+            return Err(JsonRpcError::internal_error(format!(
+                "reading git check-ignore's reply failed ({error}); the staging request \
+                 was refused because the ignore answer is incomplete"
+            )));
+        }
+        Err(_) => {
+            return Err(JsonRpcError::internal_error(
+                "git check-ignore's reply could not be read; the staging request was \
+                 refused because the ignore answer is unknown"
+                    .to_string(),
+            ));
+        }
+    };
 
     if !status.success() && status.code() != Some(1) {
         return Err(JsonRpcError::internal_error(format!(
@@ -426,6 +445,32 @@ fn walk_dir(
 /// * everything else — staged, with warnings for files over 1 MiB and
 ///   probable binaries.
 pub(crate) fn staging_outcome(root: &Path, args: &Value) -> Result<StagingOutcome, JsonRpcError> {
+    staging_outcome_inner(root, args)
+}
+
+/// Run staging preparation on a BLOCKING thread (CodeRabbit round 11, id
+/// 4698955145).
+///
+/// `staging_outcome` polls a `check-ignore` child for up to
+/// [`IGNORE_QUERY_TIMEOUT`] and walks the tree synchronously. Called from an
+/// async handler it parks a worker for that whole time, so a handful of
+/// concurrent bulk adds can exhaust the runtime BEFORE the mutation timeout
+/// has even started. The async entry points go through this instead; the
+/// synchronous one stays for the CLI/sync callers and the tests.
+pub(crate) async fn staging_outcome_async(
+    root: &Path,
+    args: &Value,
+) -> Result<StagingOutcome, JsonRpcError> {
+    let root = root.to_path_buf();
+    let args = args.clone();
+    tokio::task::spawn_blocking(move || staging_outcome_inner(&root, &args))
+        .await
+        .map_err(|error| {
+            JsonRpcError::internal_error(format!("staging preparation failed: {error}"))
+        })?
+}
+
+fn staging_outcome_inner(root: &Path, args: &Value) -> Result<StagingOutcome, JsonRpcError> {
     let paths = args.get("paths").and_then(Value::as_array).ok_or_else(|| {
         JsonRpcError::invalid_params_with_suggestion(
             "git add requires a non-empty 'paths' array".to_string(),
@@ -713,6 +758,14 @@ pub(crate) fn state_binding(
     // is still distinguishable from "attached to some branch".
     state.push('\u{0}');
     state.push_str(&head_symbolic_ref(root));
+    // The PENDING MERGE is bound too (CodeRabbit round 11, id 4698955164).
+    // `HEAD` + index digest cannot see a merge: `git merge --quit` forgets
+    // MERGE_HEAD and leaves both untouched, so a plan reviewed during a merge
+    // still validated and then published a SINGLE-parent commit — the merge
+    // was silently dropped. Binding the parent ids makes the quit invalidate
+    // the token, and the capture below re-checks them before publishing.
+    state.push('\u{0}');
+    state.push_str(&merge_parent_ids(root).join(","));
     for oid in resolved_target_oids(root, op, argv) {
         state.push('\u{0}');
         state.push_str(&oid);
@@ -736,7 +789,7 @@ pub(crate) fn resolve_to_oid(root: &Path, target: &str) -> Result<String, JsonRp
         ],
     )?;
     let oid = text.trim();
-    if oid.len() == 40 && oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if is_oid(oid) {
         Ok(oid.to_string())
     } else {
         Err(JsonRpcError::invalid_params(format!(
@@ -840,7 +893,10 @@ fn force_refspec(argv: &[String]) -> Option<(String, String)> {
 pub(crate) fn force_lease_oid(root: &Path, argv: &[String]) -> Option<String> {
     let (remote, branch) = force_refspec(argv)?;
     let oid = resolve_oid(root, &format!("refs/remotes/{remote}/{branch}"));
-    (oid.len() == 40 && oid.bytes().all(|b| b.is_ascii_hexdigit())).then_some(oid)
+    // `is_oid` accepts both hash lengths (CodeRabbit round 11, id 4698955173):
+    // a SHA-256 repository's 64-digit oid used to yield NO lease at all, so a
+    // force-push there fell back to the implicit (unsafe) lease.
+    is_oid(&oid).then_some(oid)
 }
 
 /// Resolve a revision name to the commit it names RIGHT NOW.
@@ -980,96 +1036,6 @@ async fn validate_before_apply(
     ))
 }
 
-// ---------------------------------------------------------------------------
-// Execution
-// ---------------------------------------------------------------------------
-
-struct MutationOutput {
-    stdout: String,
-    /// Characters dropped from the combined output by the byte cap.
-    truncated_chars: usize,
-}
-
-/// Read a child's pipe to EOF, keeping at most [`MAX_MUTATION_OUTPUT_BYTES`]
-/// bytes and DISCARDING the rest.
-///
-/// Draining does not stop at the cap: a child whose output exceeds it must
-/// still be able to finish writing, or it blocks on a full pipe forever.
-/// Returns the kept text (lossy UTF-8) and the number of characters in the
-/// discarded tail. The tail is decoded chunk by chunk with a carry for a
-/// multibyte character split across two reads, so the count is exact and the
-/// discarded text is never held in memory.
-async fn drain_capped<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>) -> (String, usize) {
-    use tokio::io::AsyncReadExt;
-    let Some(mut pipe) = pipe else {
-        return (String::new(), 0);
-    };
-    let mut buffer = Vec::new();
-    let mut dropped_chars = 0usize;
-    let mut carry: Vec<u8> = Vec::new();
-    let mut chunk = vec![0u8; 8192];
-    loop {
-        let read = match pipe.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(read) => read,
-        };
-        let room = MAX_MUTATION_OUTPUT_BYTES.saturating_sub(buffer.len());
-        let keep = room.min(read);
-        buffer.extend_from_slice(&chunk[..keep]);
-        if keep < read {
-            // Only `[keep..read]` is real data; the rest of `chunk` is stale
-            // bytes from earlier reads and must not be counted.
-            dropped_chars += count_chars_streaming(&mut carry, &chunk[keep..read]);
-        }
-    }
-    // A trailing unfinished sequence is one replacement character in the
-    // text the caller would have seen.
-    dropped_chars += usize::from(!carry.is_empty());
-    let text = String::from_utf8_lossy(&buffer).into_owned();
-    (text, dropped_chars)
-}
-
-/// Count the characters in one piece of a UTF-8 stream, carrying an
-/// unfinished multibyte sequence (up to 3 bytes) into the next call so a
-/// character split across two reads is counted once.
-fn count_chars_streaming(carry: &mut Vec<u8>, piece: &[u8]) -> usize {
-    let mut stream = std::mem::take(carry);
-    stream.extend_from_slice(piece);
-    let mut rest = stream.as_slice();
-    let mut count = 0usize;
-    // Decode the whole piece: `from_utf8` reports only the first error, so a
-    // single call would defer every later invalid byte to the next read and
-    // lose them if the stream ends first. An invalid byte is one replacement
-    // character and is consumed; an unfinished sequence (error_len() ==
-    // None) is the tail, and is carried.
-    while !rest.is_empty() {
-        match std::str::from_utf8(rest) {
-            Ok(text) => {
-                count += text.chars().count();
-                rest = &[];
-            }
-            Err(error) => {
-                let valid = &rest[..error.valid_up_to()];
-                count += std::str::from_utf8(valid).unwrap_or("").chars().count();
-                match error.error_len() {
-                    Some(bad) => {
-                        count += 1;
-                        rest = &rest[error.valid_up_to() + bad..];
-                    }
-                    // Truncated tail: carry exactly the unfinished bytes, not
-                    // everything before the error (those were counted above).
-                    None => {
-                        rest = &rest[error.valid_up_to()..];
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    *carry = rest.to_vec();
-    count
-}
-
 /// Everything the publish step is allowed to know, captured ONCE at
 /// validation time. Nothing here is re-read later.
 #[derive(Debug)]
@@ -1099,6 +1065,49 @@ pub(super) struct ValidatedCommit {
 /// that form needs the validated-tree commit.
 pub(super) fn commits_whole_index(op: &str, argv: &[String]) -> bool {
     op == "commit" && !argv.iter().any(|arg| arg == "--")
+}
+
+/// Every oid a pending merge would add as a parent, in order.
+///
+/// Empty when no merge is in progress, so the value is also a faithful
+/// "merge or not" signal in the token state.
+fn merge_parent_ids(root: &Path) -> Vec<String> {
+    let Some(path) = merge_head_path(root) else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|line| is_oid(line))
+        .map(str::to_string)
+        .collect()
+}
+
+/// A marker file's path inside the repository, when it exists.
+///
+/// `--git-path` answers relative to the repository root, so it must be
+/// anchored on `root` before it is tested — a bare `exists()` resolves
+/// against the process CWD. Same helper shape as [`merge_head_path`], shared
+/// so a new marker cannot reintroduce the CWD bug.
+fn git_marker_path(root: &Path, marker: &str) -> Option<PathBuf> {
+    let (text, _) = git_read(
+        root,
+        &[
+            "rev-parse".to_string(),
+            "--git-path".to_string(),
+            marker.to_string(),
+        ],
+    )
+    .ok()?;
+    let path = PathBuf::from(text.trim());
+    let path = if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    };
+    path.is_file().then_some(path)
 }
 
 /// The `MERGE_HEAD` path for `root`'s repository, when a merge is pending.
@@ -1160,6 +1169,37 @@ pub(super) fn validated_tree_commit(
         ));
     };
 
+    // Refuse while a cherry-pick or revert is in progress (CodeRabbit round
+    // 11, id 4698955186). Publishing from the frozen index would move the
+    // branch and leave CHERRY_PICK_HEAD / REVERT_HEAD behind, so git keeps
+    // reporting the operation as in progress for a commit that already
+    // landed. Resolved through git so linked worktrees are covered, and
+    // the markers are NOT deleted here — the user finishes with git.
+    for marker in ["CHERRY_PICK_HEAD", "REVERT_HEAD"] {
+        if let Some(path) = git_marker_path(root, marker) {
+            return Err(JsonRpcError::invalid_params_with_suggestion(
+                format!(
+                    "a {} is in progress ({}); commit it with git so the operation \
+                     completes, or abort it, then re-plan",
+                    if marker == "CHERRY_PICK_HEAD" {
+                        "cherry-pick"
+                    } else {
+                        "revert"
+                    },
+                    path.display()
+                ),
+                format!(
+                    "Run `git {} --continue` (or `--abort`), then re-plan the commit",
+                    if marker == "CHERRY_PICK_HEAD" {
+                        "cherry-pick"
+                    } else {
+                        "revert"
+                    }
+                ),
+            ));
+        }
+    }
+
     // Resolve the real index through git: `.git/index` is wrong in a linked
     // worktree, where `.git` is a file pointing at the real git dir.
     let index_path = git_index_path(root)?;
@@ -1170,8 +1210,8 @@ pub(super) fn validated_tree_commit(
                  must commit exactly the validated content",
                 index_path.display()
             ),
-            "Commit with explicit `paths` (a pathspec commit reads the worktree), or \
-             repair the repository and re-plan"
+            "Commit with explicit `paths` (a pathspec commit reads the worktree). If the \
+             index itself is damaged, `git fsck` and `git gc` can repair it; then re-plan"
                 .to_string(),
         )
     })?;
@@ -1229,6 +1269,23 @@ pub(super) fn validated_tree_commit(
     // `git commit` would record, so a merge is completed rather than lost.
     let mut parents = head.into_iter().collect::<Vec<_>>();
     if let Some(merge) = &merge_head {
+        // An AUTOSTASH merge is refused rather than silently mishandled
+        // (CodeRabbit round 11, id 4698955200). Plain `git commit` applies the
+        // saved edits when the merge completes; this path moves the branch and
+        // clears MERGE_HEAD without touching the autostash, so the caller was
+        // told "done" while their working-tree edits were still in the stash.
+        if git_marker_path(root, "MERGE_AUTOSTASH").is_some()
+            || git_marker_path(root, ".git/MERGE_AUTOSTASH").is_some()
+        {
+            return Err(JsonRpcError::invalid_params_with_suggestion(
+                "this merge was started with autostash; finishing it here would leave \
+                 the stashed edits unapplied"
+                    .to_string(),
+                "Finish the merge with `git commit` (which applies the autostash), then \
+                 re-plan if further commits are needed"
+                    .to_string(),
+            ));
+        }
         let text = std::fs::read_to_string(merge).map_err(|error| {
             JsonRpcError::internal_error(format!("cannot read MERGE_HEAD: {error}"))
         })?;
@@ -1279,8 +1336,41 @@ fn compose_message(message: &str, trailers: &[String]) -> String {
     composed
 }
 
-fn is_oid(text: &str) -> bool {
-    text.len() == 40 && text.bytes().all(|b| b.is_ascii_hexdigit())
+/// Whether `text` is a full object name in EITHER supported hash algorithm.
+///
+/// `pub(crate)` so the git handler's log parser applies the same rule instead
+/// of repeating a 40-digit literal (CodeRabbit round 11, id 4698955173): a
+/// SHA-256 repository's 64-digit commit ids are real, and a parser that
+/// hardcodes 40 turns every one of them into a *file* record.
+pub(crate) fn is_oid(text: &str) -> bool {
+    // 40 hex digits in a SHA-1 repository, 64 in a SHA-256 one (CodeRabbit
+    // round 11, id 4698955173). Hardcoding 40 rejected every SHA-256 object:
+    // `show` failed with "does not name a commit", `validated_tree_commit`
+    // read an existing branch as unborn, and the tree/commit checks rejected
+    // objects git had just written.
+    (text.len() == 40 || text.len() == 64) && text.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The all-zero object name in THIS repository's hash algorithm.
+///
+/// `update-ref`'s "must not exist" expectation is the zero oid, and its
+/// LENGTH must match the repository: a 40-zero value is not a valid SHA-256
+/// object name, so an unborn branch in a SHA-256 repo could not be published.
+/// Asked of git rather than guessed, and defaulting to SHA-1 only when the
+/// probe itself fails (which is the overwhelmingly common case).
+fn zero_oid(root: &Path) -> String {
+    let length = match git_read(
+        root,
+        &["rev-parse".to_string(), "--show-object-format".to_string()],
+    )
+    .ok()
+    .map(|(text, _)| text.trim().to_ascii_lowercase())
+    .as_deref()
+    {
+        Some("sha256") => 64,
+        _ => 40,
+    };
+    "0".repeat(length)
 }
 
 /// The repository's real index path, resolved through git.
@@ -1353,7 +1443,8 @@ async fn git_run(
     run_mutation_with_env(root, argv, index_snapshot).await
 }
 
-/// Publish the validated commit and return the OID that was published.
+/// Publish the validated commit and return the OID that was published, plus
+/// any warnings about post-publish cleanup that failed.
 ///
 /// Three steps, each a separate process, so the tree is an immutable object
 /// before anything else can touch it:
@@ -1370,7 +1461,7 @@ async fn git_run(
 pub(super) async fn run_validated_commit(
     root: &Path,
     plan: &ValidatedCommit,
-) -> Result<String, JsonRpcError> {
+) -> Result<(String, Vec<String>), JsonRpcError> {
     // 1. Freeze the validated index as a tree object.
     let tree_output = git_run(root, &["write-tree".to_string()], Some(&plan.index)).await?;
     let tree = tree_output.stdout.trim();
@@ -1403,7 +1494,21 @@ pub(super) async fn run_validated_commit(
     //    CAPTURED oid. An unborn branch uses the all-zero "must not exist"
     //    expectation, so the update cannot replace a first commit that
     //    appeared after validation.
-    let old = plan.expected_old.clone().unwrap_or_else(|| "0".repeat(40));
+    //
+    //    A merge that vanished between the capture and here would publish a
+    //    merge commit whose second parent nothing records any more, so the
+    //    parents are re-read and must still match what was captured
+    //    (CodeRabbit round 11, id 4698955164).
+    let merge_parents_captured = plan.parents.len().saturating_sub(1);
+    if merge_parent_ids(root).len() != merge_parents_captured {
+        return Err(JsonRpcError::invalid_params_with_suggestion(
+            "the pending merge changed after validation; the captured parents no longer \
+             describe the repository"
+                .to_string(),
+            "Re-plan the commit and review the parents before applying".to_string(),
+        ));
+    }
+    let old = plan.expected_old.clone().unwrap_or_else(|| zero_oid(root));
     let update = vec![
         "update-ref".to_string(),
         plan.target_ref.clone(),
@@ -1416,181 +1521,26 @@ pub(super) async fn run_validated_commit(
     // A merge is complete only once MERGE_HEAD is cleared, exactly as
     // `git commit` would. Clearing AFTER the ref moved keeps a failed
     // publish from leaving a half-finished merge state.
-    if let Some(merge) = &plan.merge_head {
-        let _ = std::fs::remove_file(merge);
+    //
+    // A failure here is NOT an error: the commit is already published, and
+    // returning `Err` would invite the caller to retry a commit that landed.
+    // But a MERGE_HEAD left behind makes git think the merge is still pending,
+    // so the failure is REPORTED to the caller instead of discarded (Kilo
+    // round 11, id 4698809233).
+    let mut warnings = Vec::new();
+    if let Some(merge) = &plan.merge_head
+        && let Err(error) = std::fs::remove_file(merge)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warnings.push(format!(
+            "commit {} was published, but the merge state could not be cleared \
+             ({}: {error}); git will still consider a merge pending — run \
+             `git merge --quit` or remove the file by hand",
+            commit,
+            merge.display()
+        ));
     }
-    Ok(commit)
-}
-
-/// Every git child this module spawns starts here: `current_dir(root)` AND
-/// the inherited repository-location overrides removed.
-///
-/// `current_dir(root)` alone does NOT redirect a git child that inherited
-/// `GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE` — from a hook that launched
-/// the MCP process, for instance. Those variables win over the working
-/// directory, so a request for repository B could inspect or mutate
-/// repository A (CodeRabbit round 10, id 4697090106). They are cleared here
-/// for every probe and mutation; the validated index snapshot is then set
-/// EXPLICITLY and nothing else is.
-fn git_command(root: &Path) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new("git");
-    command
-        .current_dir(root)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .env_remove("GIT_CEILING_DIRECTORIES")
-        .env_remove("GIT_COMMON_DIR")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "echo")
-        .env("GIT_EDITOR", "true")
-        .env("GIT_PAGER", "cat")
-        .env("PAGER", "cat")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(std::process::Stdio::null());
-    command
-}
-
-/// The std-process twin of [`git_command`], for the one blocking probe
-/// (`check-ignore`) that runs on a plain thread.
-fn git_command_sync(root: &Path) -> std::process::Command {
-    let mut command = std::process::Command::new("git");
-    command
-        .current_dir(root)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .env_remove("GIT_CEILING_DIRECTORIES")
-        .env_remove("GIT_COMMON_DIR")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "echo")
-        .env("GIT_EDITOR", "true")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_OPTIONAL_LOCKS", "0");
-    command
-}
-
-/// Run one mutating git command under the hardened environment.
-///
-/// stdin is closed so hooks cannot block on input; credential prompts are
-/// disabled by `GIT_TERMINAL_PROMPT=0` (and `GIT_ASKPASS=echo` as a second
-/// latch); `GIT_EDITOR=true` keeps `merge --no-edit`-class operations from
-/// opening an editor even where a hook or git path tries.
-async fn run_mutation_with_env(
-    root: &Path,
-    argv: &[String],
-    index_snapshot: Option<&Path>,
-) -> Result<MutationOutput, JsonRpcError> {
-    let mut command = git_command(root);
-    command
-        .args(argv)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    if let Some(snapshot) = index_snapshot {
-        command.env("GIT_INDEX_FILE", snapshot);
-    }
-
-    let mut child = command
-        .spawn()
-        .map_err(|error| JsonRpcError::internal_error(format!("failed to spawn git: {error}")))?;
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
-
-    // Output collection and process execution share ONE deadline. Reading
-    // one pipe to EOF before touching the other deadlocks when a hook fills
-    // the other pipe: git blocks on the write, the read never sees EOF, and
-    // the timeout below would never be reached. So drain both concurrently,
-    // and keep draining past the capture cap so git can always make progress.
-    let collect = tokio::time::timeout(MUTATION_TIMEOUT, async {
-        let stdout = drain_capped(stdout_pipe);
-        let stderr = drain_capped(stderr_pipe);
-        let (stdout, stderr) = tokio::join!(stdout, stderr);
-        let status = child.wait().await;
-        (stdout, stderr, status)
-    })
-    .await;
-
-    let ((stdout, stdout_dropped), (stderr, stderr_dropped), status) = match collect {
-        Ok((stdout, stderr, Ok(status))) => (stdout, stderr, status),
-        Ok((_, _, Err(error))) => {
-            return Err(JsonRpcError::internal_error(format!(
-                "git wait failed: {error}"
-            )));
-        }
-        Err(_) => {
-            let _ = child.start_kill();
-            return Err(JsonRpcError::internal_error(format!(
-                "git {} was killed after the {}s mutation timeout",
-                argv.join(" "),
-                MUTATION_TIMEOUT.as_secs()
-            )));
-        }
-    };
-
-    let truncated_chars = stdout_dropped + stderr_dropped;
-    if !status.success() {
-        return Err(failure_error(argv, &stdout, &stderr, truncated_chars));
-    }
-    Ok(MutationOutput {
-        stdout,
-        truncated_chars,
-    })
-}
-
-/// Run a mutation with no index pin — the plain form every non-commit
-/// operation uses, and what the executor's own tests call.
-async fn run_mutation(root: &Path, argv: &[String]) -> Result<MutationOutput, JsonRpcError> {
-    run_mutation_with_env(root, argv, None).await
-}
-
-/// Build the error for a failed mutation: the combined output VERBATIM,
-/// bounded, with an explicit truncation count.
-///
-/// Hook rejections and plain git failures are surfaced the same way — the
-/// caller needs the words the hook printed, not a paraphrase.
-fn failure_error(
-    argv: &[String],
-    stdout: &str,
-    stderr: &str,
-    truncated_chars: usize,
-) -> JsonRpcError {
-    let mut combined = String::new();
-    if !stdout.trim().is_empty() {
-        combined.push_str(stdout.trim_end());
-        combined.push('\n');
-    }
-    if !stderr.trim().is_empty() {
-        combined.push_str(stderr.trim_end());
-    }
-    let mut message = format!("git {} failed", argv.join(" "));
-    if !combined.trim().is_empty() {
-        // Git surfaces remote output verbatim — including `push` progress and
-        // hook chatter, which can carry URL-embedded credentials
-        // (`https://user:token@host/…`) or `Bearer` tokens from a CI hook.
-        // The same scrubber the log pipeline uses runs here so a mutation
-        // failure can never leak a secret into an MCP response.
-        let redacted = crate::observability::LogScrubber::redact(&combined);
-        let mut body: String = redacted.chars().take(FAILURE_CHARS).collect();
-        if body.chars().count() == FAILURE_CHARS {
-            body.push('…');
-        }
-        message.push_str(":\n");
-        message.push_str(&body);
-        let total = redacted.chars().count();
-        let shown = total.min(FAILURE_CHARS);
-        if total > shown || truncated_chars > 0 {
-            message.push_str(&format!(
-                "\n[output truncated: showing {shown} of {total} chars, {} dropped by the capture cap]",
-                total - shown + truncated_chars
-            ));
-        }
-    }
-    JsonRpcError::internal_error(message)
+    Ok((commit, warnings))
 }
 
 // ---------------------------------------------------------------------------
@@ -1777,7 +1727,7 @@ pub(crate) async fn handle(op: &str, root: &Path, args: &Value) -> Result<Value,
     // between them), which would report a different staged list than the one
     // staged.
     let (argv, staging) = if op == "add" {
-        let outcome = staging_outcome(root, args)?;
+        let outcome = staging_outcome_async(root, args).await?;
         (add_argv(&outcome), Some(outcome))
     } else {
         (plan_argv_for(op, root, args)?, None)
@@ -1817,12 +1767,29 @@ pub(crate) async fn handle(op: &str, root: &Path, args: &Value) -> Result<Value,
     // be snapshotted (a linked worktree whose git dir cannot be read): there
     // is deliberately no fallback to a plain `git commit`, because that reads
     // the live index and runs hooks — the exact window this closes.
-    let published = if commits_whole_index(op, &argv) {
+    let mut published: Option<String> = None;
+    let mut publish_warnings: Vec<String> = Vec::new();
+    if commits_whole_index(op, &argv) {
         let plan = validated_tree_commit(root, &argv)?;
-        Some(run_validated_commit(root, &plan).await?)
-    } else {
-        None
-    };
+        // The token was re-verified BEFORE the capture; a `git merge --quit`
+        // in that gap would have been invisible to it and the capture would
+        // then build a single-parent commit (CodeRabbit round 11, id
+        // 4698955164). The state now includes the merge parents, so one more
+        // comparison immediately after the capture closes that window.
+        if let Some(supplied) = args.get("preview_token").and_then(Value::as_str)
+            && supplied != token_now(root, op, &argv)?
+        {
+            return Err(JsonRpcError::invalid_params_with_suggestion(
+                "preview_token no longer matches: the repository state changed between \
+                 validation and publication"
+                    .to_string(),
+                "Request a fresh plan and review it before applying".to_string(),
+            ));
+        }
+        let (oid, warnings) = run_validated_commit(root, &plan).await?;
+        publish_warnings = warnings;
+        published = Some(oid);
+    }
     let output = match &published {
         Some(_) => MutationOutput {
             stdout: String::new(),
@@ -1878,6 +1845,12 @@ pub(crate) async fn handle(op: &str, root: &Path, args: &Value) -> Result<Value,
     }
     if output.truncated_chars > 0 {
         payload["output_truncated_chars"] = json!(output.truncated_chars);
+    }
+    // Post-publish cleanup that failed is reported, never hidden: the
+    // mutation succeeded, but the caller needs to know the repository is
+    // not in the state a successful commit normally leaves it in.
+    if !publish_warnings.is_empty() {
+        payload["warnings"] = json!(publish_warnings);
     }
     Ok(payload)
 }

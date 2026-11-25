@@ -141,6 +141,16 @@ fn integration_target_name(file: &str) -> Option<String> {
 /// does not satisfy `handshake`, and a line inside a string or comment that
 /// merely contains the word does not count. Attributes and visibility
 /// prefixes before `mod` are tolerated.
+///
+/// This is a LINE-ORIENTED scan, not a Rust parser (Kilo round 11, id
+/// 4698809204): it recognises `#[...]` / `#[path = "..."]` / `pub`,
+/// `pub(crate)`, `pub(super)`, `pub(in path)` on one line, and an attribute
+/// that spans several lines (`#[\n    path = "x"\n]`) only by skipping forward
+/// to its closing `]`. Anything exotic — a `mod` inside a macro body, or a
+/// `#[cfg_attr(...)]` that expands to `mod` — is beyond it. A false
+/// negative here is safe (the caller falls back to `--tests`, which still
+/// runs the test); a false positive would select a target without the test,
+/// and that is the direction the exact-identifier match guards.
 trait DeclaresModule {
     fn declares_module(&self, name: &str) -> bool;
 }
@@ -1588,8 +1598,12 @@ mod tests {
     /// on drop, including on panic.
     #[test]
     fn test_a_directory_integration_target_is_found_from_any_cwd() {
-        static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = CWD_LOCK
+        // `set_current_dir` is process-global, and the lock is the CRATE-WIDE
+        // one (CodeRabbit round 11, id 4698955238): a module-local `CWD_LOCK`
+        // only excluded this module's tests, so `registry_test`'s CWD read
+        // could still observe this change and compare against the wrong
+        // directory. Same lock as every other process-global mutation.
+        let _guard = crate::test_env::EnvLock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 

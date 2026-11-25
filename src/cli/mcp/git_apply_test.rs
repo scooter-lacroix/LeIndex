@@ -1,3 +1,6 @@
+use super::super::git_apply_exec::{
+    MAX_MUTATION_OUTPUT_BYTES, count_chars_streaming, drain_capped, failure_error,
+};
 use super::*;
 
 /// A git child whose environment is ISOLATED from whatever launched the test
@@ -1927,4 +1930,63 @@ fn test_a_shared_helper_not_declared_by_main_is_not_claimed_for_the_target() {
         None,
         "`mod shared_tests;` does not declare `shared`"
     );
+}
+
+/// CodeRabbit round 11 (id 4698955164): a merge that DISAPPEARS between the
+/// capture and the publish must not produce a single-parent commit. The
+/// review's example is `git merge --quit`, which forgets MERGE_HEAD while
+/// leaving HEAD and the index untouched — invisible to the token — and the
+/// old capture then published "the merge" with only HEAD as a parent.
+///
+/// A DIRECTORY named MERGE_HEAD reproduces exactly that state change with no
+/// race: `merge_parent_ids` can no longer read it, so the re-check before
+/// `update-ref` sees zero pending parents where the plan captured one.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_a_merge_that_vanishes_after_capture_is_refused() {
+    let repo = scratch();
+    let root = repo.path();
+    git(root, &["checkout", "-q", "-b", "side"]);
+    std::fs::write(root.join("side.txt"), "side\n").unwrap();
+    git(root, &["add", "side.txt"]);
+    git(root, &["commit", "-q", "-m", "side"]);
+    git(root, &["checkout", "-q", "master"]);
+    std::fs::write(root.join("master.txt"), "master\n").unwrap();
+    git(root, &["add", "master.txt"]);
+    git(root, &["commit", "-q", "-m", "master"]);
+    let merge = isolated_git(root)
+        .args(["merge", "--no-commit", "--no-ff", "side"])
+        .output()
+        .expect("git available");
+    assert!(merge.status.success(), "precondition: {:?}", merge.status);
+    let merge_head = isolated_git(root)
+        .args(["rev-parse", "--git-path", "MERGE_HEAD"])
+        .output()
+        .expect("git available");
+    let merge_head = root.join(String::from_utf8_lossy(&merge_head.stdout).trim());
+    assert!(merge_head.is_file(), "precondition: a merge is pending");
+
+    let args = json!({ "message": "merge side" });
+    let argv = plan_argv_for("commit", root, &args).unwrap();
+    let plan = validated_tree_commit(root, &argv).expect("plan captures both parents");
+    assert_eq!(plan.parents.len(), 2, "precondition: HEAD + MERGE_HEAD");
+    let head_before = head_oid(root).unwrap();
+
+    // The merge state vanishes, exactly as `git merge --quit` leaves it.
+    std::fs::remove_file(&merge_head).unwrap();
+    std::fs::create_dir(&merge_head).unwrap();
+
+    let error = run_validated_commit(root, &plan)
+        .await
+        .expect_err("publishing a merge commit whose merge is gone must be refused");
+    assert!(
+        error.message_with_hint().contains("pending merge changed"),
+        "the refusal must name the cause: {error}"
+    );
+    assert_eq!(
+        head_oid(root).unwrap(),
+        head_before,
+        "nothing may be published when the parents no longer describe the repository"
+    );
+    std::fs::remove_dir(&merge_head).unwrap();
 }
