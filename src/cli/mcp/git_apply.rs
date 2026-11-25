@@ -43,6 +43,11 @@ pub(crate) const SAFE_TO_CONFIRM: [&str; 3] = ["add", "commit", "push"];
 /// Operations that only a prior plan's token may apply.
 const TOKEN_ONLY: [&str; 5] = ["checkout", "stash", "tag", "merge", "rebase"];
 
+/// Deadline for the `check-ignore` probe. It is a rules lookup, not a tree
+/// walk, so it is fast; the deadline exists so a wedged git cannot hang a
+/// staging request with no timeout running at all.
+const IGNORE_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Char budget for a surfaced failure before truncation is counted.
 const FAILURE_CHARS: usize = 4_000;
 
@@ -159,49 +164,119 @@ fn lexical_relative(raw: &str) -> String {
 /// answer, not a failure. Any other non-zero exit yields an empty set: the
 /// bulk add then proceeds un-filtered, which is the pre-fix behaviour, instead
 /// of failing the whole add because the ignore query itself broke.
-fn ignored_paths(root: &Path, candidates: &[String]) -> std::collections::BTreeSet<String> {
+/// Paths among `candidates` that git's ignore rules match.
+///
+/// `Err` means the ignore answer is UNKNOWN (git failed, or timed out): the
+/// caller must refuse the staging request rather than proceed un-filtered.
+/// Treating an unknown as "nothing is ignored" was itself a hole — it let a
+/// broken probe stage exactly the files the filter exists to exclude.
+///
+/// Both directions are pumped CONCURRENTLY under one deadline (CodeRabbit
+/// round 10, id 4697090116): `check-ignore` writes matches to stdout while it
+/// is still reading stdin, so writing a multi-hundred-KB payload to
+/// completion before reading stdout deadlocks once both pipes fill — and it
+/// deadlocks BEFORE any timeout would start.
+///
+/// NUL-delimited both ways, so a path containing a newline cannot be read as
+/// two records. Exit 1 means "none of these are ignored" — a normal answer.
+fn ignored_paths(
+    root: &Path,
+    candidates: &[String],
+) -> Result<std::collections::BTreeSet<String>, JsonRpcError> {
     use std::io::Write;
-    use std::process::{Command, Stdio};
 
     let mut ignored = std::collections::BTreeSet::new();
     if candidates.is_empty() {
-        return ignored;
+        return Ok(ignored);
     }
-    let Ok(mut child) = Command::new("git")
-        .args(["check-ignore", "-z", "--stdin"])
-        .current_dir(root)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return ignored;
-    };
     let mut payload = Vec::new();
     for candidate in candidates {
         payload.extend_from_slice(candidate.as_bytes());
         payload.push(0);
     }
-    if let Some(mut stdin) = child.stdin.take() {
-        // A short write still leaves every complete record answered, so a
-        // closed pipe cannot turn a partial answer into a wrong one.
-        let _ = stdin.write_all(&payload);
-    }
-    let Ok(output) = child.wait_with_output() else {
-        return ignored;
+    // The spawn uses the SAME scrubbed builder as every other git child, so an
+    // inherited GIT_DIR/GIT_WORK_TREE cannot redirect the probe.
+    let mut command = git_command_sync(root);
+    command
+        .args(["check-ignore", "-z", "--stdin"])
+        // stdin MUST be piped: `check-ignore --stdin` blocks reading it until
+        // EOF. Without this the child inherited a null/terminal stdin, the
+        // feeder thread had nothing to write to, and every staging call sat
+        // for the full deadline before failing.
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = command.spawn().map_err(|error| {
+        JsonRpcError::internal_error(format!("failed to spawn git check-ignore: {error}"))
+    })?;
+    let mut stdin = child.stdin.take();
+    let stdout_pipe = child.stdout.take();
+
+    // Feed the request on a helper thread while THIS thread drains the reply:
+    // the two directions run concurrently, so neither pipe can fill and
+    // deadlock the other. Dropping the handle closes stdin -> `check-ignore`
+    // sees EOF and exits. The reply is read uncapped — it is bounded by the
+    // request (one record per ignored candidate), and capping it would
+    // silently drop ignored paths and then stage them.
+    let feeder = std::thread::spawn(move || {
+        if let Some(mut input) = stdin.take() {
+            let _ = input.write_all(&payload);
+        }
+    });
+    let reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stdout_pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+
+    // One deadline for the WHOLE exchange. A wedged git is killed and the
+    // request refused: an unknown ignore answer must never stage anything.
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < IGNORE_QUERY_TIMEOUT => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(JsonRpcError::internal_error(
+                    "git check-ignore exceeded its deadline; the staging request was \
+                     refused because the ignore answer is unknown"
+                        .to_string(),
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(JsonRpcError::internal_error(format!(
+                    "git check-ignore wait failed: {error}"
+                )));
+            }
+        }
     };
-    if !output.status.success() && output.status.code() != Some(1) {
-        return ignored;
+    let _ = feeder.join();
+    let stdout: String = reader.join().unwrap_or_default();
+
+    if !status.success() && status.code() != Some(1) {
+        return Err(JsonRpcError::internal_error(format!(
+            "git check-ignore failed ({}); the staging request was refused because the \
+             ignore answer is unknown",
+            status.code().unwrap_or(-1)
+        )));
     }
-    for record in output.stdout.split(|byte| *byte == 0) {
+    for record in stdout.as_bytes().split(|byte: &u8| *byte == 0) {
         if let Ok(text) = std::str::from_utf8(record)
             && !text.is_empty()
         {
             ignored.insert(text.replace('\\', "/"));
         }
     }
-    ignored
+    Ok(ignored)
 }
 
 /// Expand the requested `paths` into concrete files.
@@ -258,7 +333,7 @@ fn expand_paths(
     // dump does NOT (it omits ignored entries unless `--ignored` is passed),
     // so the filter asks the rules directly.
     if !dirs.is_empty() {
-        let ignored = ignored_paths(root, &files);
+        let ignored = ignored_paths(root, &files)?;
         files.retain(|file| !ignored.contains(&lexical_relative(file)));
         // The filesystem walk can only see files that exist. A tracked file
         // deleted from the worktree is invisible to it, so a bulk
@@ -628,11 +703,66 @@ pub(crate) fn state_binding(
         head_oid(root).unwrap_or_else(|| "none".to_string()),
         index_digest(root)?
     );
+    // The SYMBOLIC target of HEAD is bound too (CodeRabbit round 10, id
+    // 4697090161). Two branches can name the SAME commit, so HEAD's OID alone
+    // cannot tell them apart: switching `main` -> `topic` at one commit left
+    // every other part of the state identical, the token still matched, and
+    // the commit advanced whichever branch HEAD pointed at by publish time.
+    // Binding the branch name makes the switch itself invalidate the token.
+    // Detached HEAD has no branch to bind; it is recorded as `detached` so it
+    // is still distinguishable from "attached to some branch".
+    state.push('\u{0}');
+    state.push_str(&head_symbolic_ref(root));
     for oid in resolved_target_oids(root, op, argv) {
         state.push('\u{0}');
         state.push_str(&oid);
     }
     Ok(state)
+}
+
+/// Resolve a revision name to the commit it names, as a full oid.
+///
+/// Scrubbed like every other probe: an inherited `GIT_DIR` would otherwise
+/// resolve the name in a DIFFERENT repository. Fails loudly (not `None`) so a
+/// bad target is the caller's error, not a silently-empty response.
+pub(crate) fn resolve_to_oid(root: &Path, target: &str) -> Result<String, JsonRpcError> {
+    let (text, _) = git_read(
+        root,
+        &[
+            "rev-parse".to_string(),
+            "--verify".to_string(),
+            "--quiet".to_string(),
+            format!("{target}^{{commit}}"),
+        ],
+    )?;
+    let oid = text.trim();
+    if oid.len() == 40 && oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(oid.to_string())
+    } else {
+        Err(JsonRpcError::invalid_params(format!(
+            "'{target}' does not name a commit"
+        )))
+    }
+}
+
+/// The branch HEAD is attached to, as a full ref — or `detached` when it is
+/// not attached to one.
+///
+/// Bound into the token state so that checking out a different branch — even
+/// one pointing at the same commit — invalidates the plan.
+fn head_symbolic_ref(root: &Path) -> String {
+    git_read(
+        root,
+        &[
+            "symbolic-ref".to_string(),
+            "--quiet".to_string(),
+            "HEAD".to_string(),
+        ],
+    )
+    .ok()
+    .map(|(text, _)| text.trim().to_string())
+    .filter(|r| r.starts_with("refs/"))
+    .unwrap_or_else(|| "detached".to_string())
 }
 
 /// The oids a plan has to bind beyond HEAD and the index, in a stable order.
@@ -940,77 +1070,184 @@ fn count_chars_streaming(carry: &mut Vec<u8>, piece: &[u8]) -> usize {
     count
 }
 
+/// Everything the publish step is allowed to know, captured ONCE at
+/// validation time. Nothing here is re-read later.
+#[derive(Debug)]
+pub(super) struct ValidatedCommit {
+    /// Frozen copy of the validated index (removed on drop).
+    pub index: tempfile::TempPath,
+    /// Message with trailers composed in git's trailer-block form.
+    pub message: String,
+    /// The ref the commit must advance: `refs/heads/<branch>` when HEAD is
+    /// attached, or `HEAD` when detached. Never re-resolved.
+    pub target_ref: String,
+    /// The OID `target_ref` must still name. `None` only when the branch is
+    /// unborn AND validation saw it unborn.
+    pub expected_old: Option<String>,
+    /// Parents for `commit-tree`: HEAD plus every `MERGE_HEAD`, so a merge
+    /// commit keeps both parents and the merge is COMPLETED, not bypassed.
+    pub parents: Vec<String>,
+    /// `Some(..)` when a merge was in progress, so the publish step clears it.
+    pub merge_head: Option<PathBuf>,
+}
+
 /// Whether this apply is a commit that reads the WHOLE index.
 ///
 /// `commit -- <paths>` commits the worktree contents of exactly those paths
 /// and ignores what is staged for others, so the index is not what it
 /// consumes. Only the pathspec-free form commits the staged set, and only
 /// that form needs the validated-tree commit.
-fn commits_whole_index(op: &str, argv: &[String]) -> bool {
+pub(super) fn commits_whole_index(op: &str, argv: &[String]) -> bool {
     op == "commit" && !argv.iter().any(|arg| arg == "--")
+}
+
+/// The `MERGE_HEAD` path for `root`'s repository, when a merge is pending.
+///
+/// Resolved through git rather than assumed to be `.git/MERGE_HEAD`: in a
+/// linked worktree `.git` is a FILE, and the real git dir lives elsewhere.
+fn merge_head_path(root: &Path) -> Option<PathBuf> {
+    let (text, _) = git_read(
+        root,
+        &[
+            "rev-parse".to_string(),
+            "--git-path".to_string(),
+            "MERGE_HEAD".to_string(),
+        ],
+    )
+    .ok()?;
+    // `--git-path` answers RELATIVE to the repository root (`.git/MERGE_HEAD`),
+    // so it must be anchored on `root` before it is tested: a bare `exists()`
+    // resolves against the process CWD and silently reported "no merge" from
+    // any other directory, which dropped the merge's second parent.
+    let path = PathBuf::from(text.trim());
+    let path = if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    };
+    path.exists().then_some(path)
 }
 
 /// Turn a planned whole-index `git commit` into a commit of an IMMUTABLE tree.
 ///
-/// CodeRabbit round 8 (id 4691119067): the token check compares an index
-/// digest and only then spawns git, so content staged between the two was
-/// committed under a token that never reviewed it.
+/// Every mutable thing the publish step would otherwise re-read is captured
+/// here, while the token's state is the state being validated:
 ///
-/// The obvious fix — run the commit with `GIT_INDEX_FILE` pointing at a
-/// snapshot — does NOT close the window, and this was verified against git
-/// 2.56.1 rather than assumed:
+/// * the HEAD OID — used BOTH as the parent and as the compare-and-swap old
+///   value, so a HEAD that moved between validation and publish is rejected
+///   instead of silently re-parented (4697090139);
+/// * the symbolic target of HEAD — so the branch that gets advanced is the
+///   branch that was reviewed, not whichever branch HEAD points at by the
+///   time the update runs (4697090161);
+/// * `MERGE_HEAD` — a pending merge is either completed with all its parents
+///   or refused; a single-parent commit during a merge is never published
+///   (4697090148);
+/// * unborn-ness — when the branch has no commit yet, the update carries
+///   git's must-not-exist expectation instead of no expectation (4697090175).
 ///
-/// * `git commit` builds the tree AFTER the `pre-commit` hook runs, and the
-///   hook inherits the commit's environment. A hook that runs `git add`
-///   therefore writes into the snapshot and its content IS committed
-///   (`f.txt g.txt` in a clean repo).
-/// * A read-only snapshot does not help: git locks via `<index>.lock` and
-///   REPLACES the file, so file permissions never stop it.
-///
-/// The primitive that does hold is the tree object: `git write-tree` run
-/// against the validated snapshot produces an immutable object, and a commit
-/// made from that tree cannot contain anything that was not in it. So the
-/// whole-index commit becomes three steps —
-///
-/// 1. `write-tree` from the validated index snapshot → `<tree>`,
-/// 2. `commit-tree <tree> -p HEAD` with the reviewed message, trailers and
-///    signing, → `<commit>`,
-/// 3. `update-ref HEAD <commit> <old-HEAD>` — the compare-and-swap makes the
-///    final step itself conditional on HEAD not having moved.
-///
-/// Trailers are appended to the message in git's own trailer-block form,
-/// because `commit-tree` has no `--trailer` flag. The live index is never
-/// touched: whatever was staged during the commit stays staged.
-///
-/// Returns `None` when the step cannot be planned (no index to read yet), in
-/// which case the caller falls back to the ordinary `git commit`.
-fn validated_tree_commit(
+/// The index is resolved THROUGH GIT (`rev-parse --git-path index`), so a
+/// linked worktree works; and a whole-index commit that cannot snapshot its
+/// index is REFUSED rather than falling back to a plain `git commit`, because
+/// that fallback reads the live index and runs hooks — the exact window this
+/// path exists to close (4697090130).
+pub(super) fn validated_tree_commit(
     root: &Path,
     argv: &[String],
-) -> Result<Option<ValidatedCommit>, JsonRpcError> {
+) -> Result<ValidatedCommit, JsonRpcError> {
     let Some((message, trailers)) = commit_message_and_trailers(argv) else {
-        return Ok(None);
+        return Err(JsonRpcError::internal_error(
+            "whole-index commit plan carried no message".to_string(),
+        ));
     };
-    let index_path = index_root(root).join(".git").join("index");
-    let Ok(bytes) = std::fs::read(&index_path) else {
-        return Ok(None);
-    };
+
+    // Resolve the real index through git: `.git/index` is wrong in a linked
+    // worktree, where `.git` is a file pointing at the real git dir.
+    let index_path = git_index_path(root)?;
+    let bytes = std::fs::read(&index_path).map_err(|error| {
+        JsonRpcError::invalid_params_with_suggestion(
+            format!(
+                "cannot snapshot the index at '{}': {error} — a whole-index commit \
+                 must commit exactly the validated content",
+                index_path.display()
+            ),
+            "Commit with explicit `paths` (a pathspec commit reads the worktree), or \
+             repair the repository and re-plan"
+                .to_string(),
+        )
+    })?;
     let mut snapshot = tempfile::NamedTempFile::new()
         .map_err(|error| JsonRpcError::internal_error(format!("index snapshot failed: {error}")))?;
     std::io::Write::write_all(&mut snapshot, &bytes)
         .map_err(|error| JsonRpcError::internal_error(format!("index snapshot failed: {error}")))?;
-    // Keep the path; close our handle so git can open the file freely.
-    let (_, path) = snapshot.into_parts();
-    Ok(Some(ValidatedCommit {
-        index: path,
-        message: compose_message(&message, &trailers),
-    }))
-}
+    let (_, index) = snapshot.into_parts();
 
-/// A whole-index commit planned against a frozen index.
-struct ValidatedCommit {
-    index: tempfile::TempPath,
-    message: String,
+    // Capture the publication facts NOW, against the validated state.
+    let head = git_read(
+        root,
+        &[
+            "rev-parse".to_string(),
+            "--verify".to_string(),
+            "--quiet".to_string(),
+            "HEAD".to_string(),
+        ],
+    )
+    .ok()
+    .map(|(text, _)| text.trim().to_string())
+    .filter(|oid| is_oid(oid));
+    let symbolic = git_read(
+        root,
+        &[
+            "symbolic-ref".to_string(),
+            "--quiet".to_string(),
+            "HEAD".to_string(),
+        ],
+    )
+    .ok()
+    .map(|(text, _)| text.trim().to_string())
+    .filter(|r| r.starts_with("refs/"));
+    let merge_head = merge_head_path(root);
+
+    // A failed HEAD probe is NOT the same as an unborn branch: a repository
+    // that cannot answer is refused, not treated as empty.
+    let (target_ref, expected_old) = match (&symbolic, &head) {
+        (Some(branch), Some(oid)) => (branch.clone(), Some(oid.clone())),
+        // Unborn: HEAD names a branch that has no commit yet.
+        (Some(branch), None) => (branch.clone(), None),
+        // Detached: no branch to bind, so the OID itself is the target.
+        (None, Some(oid)) => ("HEAD".to_string(), Some(oid.clone())),
+        (None, None) => {
+            return Err(JsonRpcError::invalid_params_with_suggestion(
+                "cannot determine where this commit would be published: HEAD is neither \
+                 a branch nor a commit"
+                    .to_string(),
+                "Repair HEAD (e.g. `git checkout <branch>`) and re-plan".to_string(),
+            ));
+        }
+    };
+
+    // Parents: HEAD, then every MERGE_HEAD line — the same parents
+    // `git commit` would record, so a merge is completed rather than lost.
+    let mut parents = head.into_iter().collect::<Vec<_>>();
+    if let Some(merge) = &merge_head {
+        let text = std::fs::read_to_string(merge).map_err(|error| {
+            JsonRpcError::internal_error(format!("cannot read MERGE_HEAD: {error}"))
+        })?;
+        for line in text.lines() {
+            let oid = line.trim();
+            if is_oid(oid) {
+                parents.push(oid.to_string());
+            }
+        }
+    }
+
+    Ok(ValidatedCommit {
+        index,
+        message: compose_message(&message, &trailers),
+        target_ref,
+        expected_old,
+        parents,
+        merge_head,
+    })
 }
 
 /// The message and trailer lines a planned commit argv carries.
@@ -1042,6 +1279,202 @@ fn compose_message(message: &str, trailers: &[String]) -> String {
     composed
 }
 
+fn is_oid(text: &str) -> bool {
+    text.len() == 40 && text.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The repository's real index path, resolved through git.
+fn git_index_path(root: &Path) -> Result<PathBuf, JsonRpcError> {
+    let (text, _) = git_read(
+        root,
+        &[
+            "rev-parse".to_string(),
+            "--git-path".to_string(),
+            "index".to_string(),
+        ],
+    )
+    .map_err(|error| {
+        JsonRpcError::invalid_params_with_suggestion(
+            format!("cannot locate the git index: {error}"),
+            "Run from inside the repository, or commit with explicit `paths`".to_string(),
+        )
+    })?;
+    let raw = text.trim();
+    // `--git-path` may return a path relative to `root`; anchor it.
+    let path = PathBuf::from(raw);
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    })
+}
+
+/// Read-only git invocation under the scrubbed environment, capped.
+///
+/// Synchronous and bounded: these are the small probes the validated-commit
+/// planner uses (HEAD, symbolic-ref, --git-path), not mutations.
+fn git_read(root: &Path, argv: &[String]) -> Result<(String, bool), JsonRpcError> {
+    // The probes the validated-commit planner uses (`rev-parse --git-path`,
+    // `symbolic-ref`, `rev-parse HEAD`) must be scrubbed too: an inherited
+    // GIT_DIR would otherwise redirect them, and the plan would be built
+    // against a DIFFERENT repository than the one being committed to. The
+    // shared runner does not clear those, so this goes through the scrubbed
+    // builder directly.
+    let mut command = git_command_sync(root);
+    command
+        .args(argv)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let output = command
+        .output()
+        .map_err(|error| JsonRpcError::internal_error(format!("git probe failed: {error}")))?;
+    if !output.status.success() {
+        // A failed probe is reported by the caller through the `Ok`/`Err`
+        // distinction it already makes; surface git's own exit as a soft
+        // failure so "unborn branch" is distinguishable from "broken repo".
+        return Ok((String::new(), false));
+    }
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let truncated = text.len() > 4096;
+    Ok((text, truncated))
+}
+
+/// Run one mutating git command under the hardened environment and return
+/// its captured output. `index_snapshot` pins the index a `write-tree` reads.
+///
+/// This is the executor the validated-commit steps go through, so every
+/// publication command gets the same env scrubbing and timeout as any other
+/// mutation.
+async fn git_run(
+    root: &Path,
+    argv: &[String],
+    index_snapshot: Option<&Path>,
+) -> Result<MutationOutput, JsonRpcError> {
+    run_mutation_with_env(root, argv, index_snapshot).await
+}
+
+/// Publish the validated commit and return the OID that was published.
+///
+/// Three steps, each a separate process, so the tree is an immutable object
+/// before anything else can touch it:
+///
+/// 1. `write-tree` from the frozen index;
+/// 2. `commit-tree` with the captured parents (HEAD + MERGE_HEAD);
+/// 3. `update-ref <target_ref> <new> <old>` — the CAS. When the branch was
+///    unborn the old value is the empty OID, git's "must not exist" form, so a
+///    first commit created concurrently cannot be replaced.
+///
+/// On success the published OID is RETURNED (4697090186): the summary must
+/// describe this commit, not whatever HEAD happens to be by the time it is
+/// read. A pending merge is then cleared so the operation is complete.
+pub(super) async fn run_validated_commit(
+    root: &Path,
+    plan: &ValidatedCommit,
+) -> Result<String, JsonRpcError> {
+    // 1. Freeze the validated index as a tree object.
+    let tree_output = git_run(root, &["write-tree".to_string()], Some(&plan.index)).await?;
+    let tree = tree_output.stdout.trim();
+    if !is_oid(tree) {
+        return Err(JsonRpcError::internal_error(format!(
+            "git write-tree did not return a tree id: {tree:?}"
+        )));
+    }
+
+    // 2. Commit that tree with exactly the captured parents.
+    let mut commit_argv = vec!["commit-tree".to_string(), tree.to_string()];
+    for parent in &plan.parents {
+        commit_argv.push("-p".to_string());
+        commit_argv.push(parent.clone());
+    }
+    // `--no-gpg-sign` matches the planned argv: the plan promised an
+    // unsigned commit, so the commit must not quietly sign.
+    commit_argv.push("--no-gpg-sign".to_string());
+    commit_argv.push("-m".to_string());
+    commit_argv.push(plan.message.clone());
+    let commit_output = git_run(root, &commit_argv, None).await?;
+    let commit = commit_output.stdout.trim().to_string();
+    if !is_oid(&commit) {
+        return Err(JsonRpcError::internal_error(format!(
+            "git commit-tree did not return a commit id: {commit:?}"
+        )));
+    }
+
+    // 3. Advance the CAPTURED ref, conditional on it still naming the
+    //    CAPTURED oid. An unborn branch uses the all-zero "must not exist"
+    //    expectation, so the update cannot replace a first commit that
+    //    appeared after validation.
+    let old = plan.expected_old.clone().unwrap_or_else(|| "0".repeat(40));
+    let update = vec![
+        "update-ref".to_string(),
+        plan.target_ref.clone(),
+        commit.clone(),
+        old,
+    ];
+    let published = git_run(root, &update, None).await?;
+    let _ = published;
+
+    // A merge is complete only once MERGE_HEAD is cleared, exactly as
+    // `git commit` would. Clearing AFTER the ref moved keeps a failed
+    // publish from leaving a half-finished merge state.
+    if let Some(merge) = &plan.merge_head {
+        let _ = std::fs::remove_file(merge);
+    }
+    Ok(commit)
+}
+
+/// Every git child this module spawns starts here: `current_dir(root)` AND
+/// the inherited repository-location overrides removed.
+///
+/// `current_dir(root)` alone does NOT redirect a git child that inherited
+/// `GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE` — from a hook that launched
+/// the MCP process, for instance. Those variables win over the working
+/// directory, so a request for repository B could inspect or mutate
+/// repository A (CodeRabbit round 10, id 4697090106). They are cleared here
+/// for every probe and mutation; the validated index snapshot is then set
+/// EXPLICITLY and nothing else is.
+fn git_command(root: &Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("git");
+    command
+        .current_dir(root)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_CEILING_DIRECTORIES")
+        .env_remove("GIT_COMMON_DIR")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "echo")
+        .env("GIT_EDITOR", "true")
+        .env("GIT_PAGER", "cat")
+        .env("PAGER", "cat")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null());
+    command
+}
+
+/// The std-process twin of [`git_command`], for the one blocking probe
+/// (`check-ignore`) that runs on a plain thread.
+fn git_command_sync(root: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    command
+        .current_dir(root)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_CEILING_DIRECTORIES")
+        .env_remove("GIT_COMMON_DIR")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "echo")
+        .env("GIT_EDITOR", "true")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    command
+}
+
 /// Run one mutating git command under the hardened environment.
 ///
 /// stdin is closed so hooks cannot block on input; credential prompts are
@@ -1053,17 +1486,9 @@ async fn run_mutation_with_env(
     argv: &[String],
     index_snapshot: Option<&Path>,
 ) -> Result<MutationOutput, JsonRpcError> {
-    let mut command = tokio::process::Command::new("git");
+    let mut command = git_command(root);
     command
         .args(argv)
-        .current_dir(root)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "echo")
-        .env("GIT_EDITOR", "true")
-        .env("GIT_PAGER", "cat")
-        .env("PAGER", "cat")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     if let Some(snapshot) = index_snapshot {
@@ -1123,70 +1548,6 @@ async fn run_mutation(root: &Path, argv: &[String]) -> Result<MutationOutput, Js
     run_mutation_with_env(root, argv, None).await
 }
 
-/// Commit a validated tree: `write-tree` → `commit-tree` → `update-ref`.
-///
-/// Each step is a separate git process, so the tree is frozen as an object
-/// BEFORE anything else can touch it, and the final step is a compare-and-swap
-/// on HEAD (`update-ref HEAD <new> <old>`): git refuses the update if HEAD
-/// moved between the plan and this moment, which keeps the token's HEAD
-/// binding true even across the three steps.
-///
-/// The parent is `HEAD` at the moment the tree was validated, and an unborn
-/// branch (no HEAD yet) yields a root commit — `update-ref` then names no old
-/// value, which is the only shape where the CAS cannot apply.
-async fn run_validated_commit(
-    root: &Path,
-    plan: &ValidatedCommit,
-) -> Result<MutationOutput, JsonRpcError> {
-    // 1. Freeze the validated index as a tree object.
-    let tree_output =
-        run_mutation_with_env(root, &["write-tree".to_string()], Some(&plan.index)).await?;
-    let tree = tree_output.stdout.trim();
-    if tree.len() != 40 || !tree.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(JsonRpcError::internal_error(format!(
-            "git write-tree did not return a tree id: {tree:?}"
-        )));
-    }
-
-    // 2. Commit that tree, carrying the reviewed message (trailers composed
-    //    into it) and the same parent rule `git commit` uses.
-    let parent = head_oid(root);
-    let mut commit_argv = vec!["commit-tree".to_string(), tree.to_string()];
-    if let Some(parent) = &parent {
-        commit_argv.push("-p".to_string());
-        commit_argv.push(parent.clone());
-    }
-    // `--no-gpg-sign` matches the planned argv: the plan promised an
-    // unsigned commit, so the commit must not quietly sign.
-    commit_argv.push("--no-gpg-sign".to_string());
-    commit_argv.push("-m".to_string());
-    commit_argv.push(plan.message.clone());
-    let commit_output = run_mutation_with_env(root, &commit_argv, None).await?;
-    let commit = commit_output.stdout.trim();
-    if commit.len() != 40 || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(JsonRpcError::internal_error(format!(
-            "git commit-tree did not return a commit id: {commit:?}"
-        )));
-    }
-
-    // 3. Move HEAD to the new commit, conditional on it not having moved.
-    //    Passing the old value makes this a compare-and-swap: a HEAD that
-    //    moved since the plan is rejected by git instead of overwritten.
-    let mut update = vec![
-        "update-ref".to_string(),
-        "HEAD".to_string(),
-        commit.to_string(),
-    ];
-    if let Some(parent) = &parent {
-        update.push(parent.clone());
-    }
-    let output = run_mutation_with_env(root, &update, None).await?;
-    // The payload's `stdout` is what the push parser reads; a commit's
-    // summary is built from the repository instead, so the (empty) update-ref
-    // output is fine here.
-    Ok(output)
-}
-
 /// Build the error for a failed mutation: the combined output VERBATIM,
 /// bounded, with an explicit truncation count.
 ///
@@ -1237,7 +1598,14 @@ fn failure_error(
 // ---------------------------------------------------------------------------
 
 /// `<shorthash> <oneline>` plus the files-changed count for the new commit.
-async fn commit_summary(root: &Path) -> Result<Value, JsonRpcError> {
+/// `<shorthash> <oneline>` plus the files-changed count for ONE commit.
+///
+/// `oid` is the commit this apply published — never re-read from HEAD. If
+/// HEAD advances between publish and summary, re-reading it would describe
+/// somebody else's commit (CodeRabbit round 10, id 4697090186). The same
+/// resolved object feeds both probes, so the short hash, subject and file
+/// count always describe the same commit.
+async fn commit_summary(root: &Path, oid: &str) -> Result<Value, JsonRpcError> {
     let (log, _) = super::git_diff_handler::git_output_capped(
         root,
         &[
@@ -1245,6 +1613,7 @@ async fn commit_summary(root: &Path) -> Result<Value, JsonRpcError> {
             "-1".to_string(),
             "--no-color".to_string(),
             "--format=%h%x09%s".to_string(),
+            oid.to_string(),
         ],
         4096,
     )
@@ -1259,7 +1628,7 @@ async fn commit_summary(root: &Path) -> Result<Value, JsonRpcError> {
             "--no-commit-id".to_string(),
             "--name-only".to_string(),
             "-r".to_string(),
-            "HEAD".to_string(),
+            oid.to_string(),
         ],
         MAX_DIFF_BYTES,
     )
@@ -1270,6 +1639,7 @@ async fn commit_summary(root: &Path) -> Result<Value, JsonRpcError> {
         "subject": subject,
         "files_changed": files_changed,
         "oneline": format!("{short} {subject}"),
+        "oid": oid,
     }))
 }
 
@@ -1433,14 +1803,22 @@ pub(crate) async fn handle(op: &str, root: &Path, args: &Value) -> Result<Value,
     // validated index (`validated_tree_commit` explains why a snapshot alone
     // does not suffice). A pathspec commit (`commit -- <paths>`) reads the
     // WORKTREE for its paths, not the index, so it keeps the ordinary command.
-    let validated = if commits_whole_index(op, &argv) {
-        validated_tree_commit(root, &argv)?
+    // A whole-index commit publishes from the immutable tree and reports the
+    // OID it published. `validated_tree_commit` REFUSES when the index cannot
+    // be snapshotted (a linked worktree whose git dir cannot be read): there
+    // is deliberately no fallback to a plain `git commit`, because that reads
+    // the live index and runs hooks — the exact window this closes.
+    let published = if commits_whole_index(op, &argv) {
+        let plan = validated_tree_commit(root, &argv)?;
+        Some(run_validated_commit(root, &plan).await?)
     } else {
         None
     };
-
-    let output = match &validated {
-        Some(plan) => run_validated_commit(root, plan).await?,
+    let output = match &published {
+        Some(_) => MutationOutput {
+            stdout: String::new(),
+            truncated_chars: 0,
+        },
         None => run_mutation(root, &argv).await?,
     };
 
@@ -1465,7 +1843,21 @@ pub(crate) async fn handle(op: &str, root: &Path, args: &Value) -> Result<Value,
             payload["warnings"] = json!(outcome.warnings);
         }
         "commit" => {
-            payload["commit"] = commit_summary(root).await?;
+            // The commit is already published; the summary is ENRICHMENT. A
+            // failed probe must not turn a successful mutation into an error
+            // (the caller would retry a commit that already landed). For the
+            // validated-tree path the summary describes the published OID,
+            // not whatever HEAD is by now.
+            let described = published
+                .clone()
+                .unwrap_or_else(|| head_oid(root).unwrap_or_default());
+            match commit_summary(root, &described).await {
+                Ok(summary) => payload["commit"] = summary,
+                Err(error) => {
+                    payload["commit"] = json!({ "oid": described });
+                    payload["commit_summary_error"] = Value::String(error.to_string());
+                }
+            }
         }
         "push" => {
             payload["push"] = push_payload(&output.stdout, root).await;

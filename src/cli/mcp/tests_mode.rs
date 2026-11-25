@@ -71,22 +71,31 @@ impl TestTarget {
     }
 }
 
-/// The Cargo integration-target name for a file under `tests/`, when one owns
-/// it.
+/// The Cargo integration-target name for a file under `tests/`, when exactly
+/// one target can be PROVEN to compile it.
 ///
-/// Cargo derives one target per top-level entry of `tests/`:
-/// * `tests/foo.rs` → `foo` (any `.rs` file there is a target);
-/// * `tests/foo/main.rs`, and every module beside it → `foo`.
+/// Cargo has no per-file ownership: a file is compiled into every target
+/// whose module tree reaches it. That was verified against real cargo
+/// (round 11, 4697090278) rather than assumed — with `tests/api/main.rs`
+/// declaring `mod shared_test;` and `tests/other_test.rs` importing the same
+/// file via `#[path]`, BOTH targets compiled it and BOTH ran its tests.
 ///
-/// Only the immediate-parent form used to be recognised, and the selector was
-/// always the FILE stem, so `tests/api/main.rs` produced `--test main`, which
-/// matches no target and exits 0 having run nothing (Codex round 8, id
-/// 4691102595).
+/// So the claim `--test <dir>` is only safe when the directory's `main.rs`
+/// genuinely declares THIS file as a module. Two things can make that false:
 ///
-/// `None` is the honest answer for a file under `tests/<dir>/` when that
-/// directory has no `main.rs`: such a file is a HELPER module compiled into
-/// whichever targets `mod` it, not a target of its own. Naming `--test <dir>`
-/// there would name a target that does not exist.
+/// * `tests/<dir>/main.rs` does not exist — the directory is not a target at
+///   all (Codex round 8, id 4691102595);
+/// * `main.rs` exists but never `mod`s this file — it is a shared helper that
+///   some OTHER target imports, so `--test <dir>` selects a target that does
+///   not contain the test.
+///
+/// In both cases `None` is the honest answer, and the caller falls back to
+/// `--tests` + a name filter, which runs the test wherever it was compiled in
+/// instead of naming a target that may not have it.
+///
+/// The filter is deliberately a SUBSTRING: a test in a module registers as
+/// `<module>::<fn>`, so `-- --exact` on the bare fn name matches nothing and
+/// exits 0 having run zero tests.
 fn integration_target_name(file: &str) -> Option<String> {
     let lowered = file.replace('\\', "/");
     let segments: Vec<&str> = lowered.split('/').collect();
@@ -95,22 +104,96 @@ fn integration_target_name(file: &str) -> Option<String> {
         // `tests/<name>.rs`
         [name] => Some(name.strip_suffix(".rs").unwrap_or(name).to_string()),
         // `tests/<dir>/…` — the DIRECTORY is the target name, and only when
-        // `tests/<dir>/main.rs` exists to make it one.
-        [dir, ..] => {
-            let manifest = format!("{}/main.rs", segments[..tests_at + 2].join("/"));
-            // `manifest` is built from `file`'s own segments, so it carries
+        // its `main.rs` exists AND declares this file as a module.
+        [dir, rest @ ..] => {
+            let main_path = format!("{}/main.rs", segments[..tests_at + 2].join("/"));
+            // `main_path` is built from `file`'s own segments, so it carries
             // `file`'s anchoring: the PDG stores ABSOLUTE paths (and
-            // `call_sites` joins `root` for any relative one), which makes
-            // this check CWD-independent with no extra resolution. A purely
-            // relative path would be CWD-anchored here, but nothing could
-            // recover the crate root from it anyway (verified: a relative
-            // `tests/api/handshake.rs` resolves only while the CWD IS the
-            // project). Pinned by test, not papered over.
-            //   (Kilo round 10, id 4696869415)
-            Path::new(&manifest).is_file().then(|| (*dir).to_string())
+            // `call_sites` joins `root` for any relative one), which makes this
+            // check CWD-independent. A purely relative path would be
+            // CWD-anchored, but nothing could recover the crate root from it
+            // anyway. Pinned by test, not papered over. (Kilo round 10)
+            let main = std::fs::read_to_string(&main_path).ok()?;
+            // The ENTRY POINT is always part of its own target: `main.rs` IS
+            // the crate root, so it never needs a `mod main;` declaration.
+            if rest.last().copied() == Some("main.rs") {
+                return Some((*dir).to_string());
+            }
+            // Otherwise the file's module path relative to the directory:
+            // `handshake.rs` is `mod handshake;`, `sub/mod.rs` is `mod sub;`.
+            let stem = rest.last()?.strip_suffix(".rs").unwrap_or(rest.last()?);
+            let stem = if stem == "mod" {
+                // `sub/mod.rs` is declared as `mod sub;`.
+                rest.get(rest.len().checked_sub(2)?).copied()?
+            } else {
+                stem
+            };
+            main.declares_module(stem).then(|| (*dir).to_string())
         }
         [] => None,
     }
+}
+
+/// Whether a crate root declares `mod <name>;` (or `pub mod <name>;`), i.e.
+/// whether `name.rs` / `name/mod.rs` is compiled into THIS target.
+///
+/// Matched on the `mod` item's own identifier so a `mod handshake_tests;`
+/// does not satisfy `handshake`, and a line inside a string or comment that
+/// merely contains the word does not count. Attributes and visibility
+/// prefixes before `mod` are tolerated.
+trait DeclaresModule {
+    fn declares_module(&self, name: &str) -> bool;
+}
+
+impl DeclaresModule for str {
+    fn declares_module(&self, name: &str) -> bool {
+        self.lines().any(|line| {
+            let line = line.trim_start();
+            // Skip attributes (`#[path = "..."]`) and visibility (`pub`, `pub(crate)`).
+            let mut rest = line;
+            while let Some(after) = rest.strip_prefix('#') {
+                rest = after.trim_start();
+                // drop the `[...]` group
+                match rest.find(']') {
+                    Some(end) => rest = &rest[end + 1..],
+                    None => return false,
+                }
+            }
+            let rest = rest.trim_start();
+            let rest = if let Some(after) = rest.strip_prefix("pub") {
+                let after = after.trim_start();
+                match after.strip_prefix('(') {
+                    Some(inner) => match inner.find(')') {
+                        Some(end) => &inner[end + 1..],
+                        None => return false,
+                    },
+                    None => after,
+                }
+            } else {
+                rest
+            };
+            let Some(after) = rest.trim_start().strip_prefix("mod") else {
+                return false;
+            };
+            // `mod` must be a word boundary, not a prefix of `module`.
+            if after.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+                return false;
+            }
+            let after = after.trim_start();
+            // The declared name, up to `;` or `{`.
+            let end = after
+                .find(|c: char| c == ';' || c == '{' || c.is_whitespace())
+                .unwrap_or(after.len());
+            after[..end] == *name
+        })
+    }
+}
+
+/// Test-only seam: `integration_target_name` is private and takes the raw
+/// path the PDG stores, so the regression tests reach it directly.
+#[cfg(test)]
+pub(crate) fn integration_target_name_for_test(file: &str) -> Option<String> {
+    integration_target_name(file)
 }
 
 /// The test framework a target runs under, inferred from path and language.

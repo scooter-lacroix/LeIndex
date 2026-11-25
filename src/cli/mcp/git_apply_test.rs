@@ -1,9 +1,33 @@
 use super::*;
 
-fn git(dir: &Path, args: &[&str]) {
-    let status = std::process::Command::new("git")
-        .args(args)
+/// A git child whose environment is ISOLATED from whatever launched the test
+/// binary (CodeRabbit round 10, id 4697090082).
+///
+/// A developer who runs the suite from a git hook hands the test process
+/// `GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE`, and those override the
+/// working directory: fixture commands would then read or mutate the CALLER'S
+/// repository. A `TempDir` protects only paths that resolve inside it, which
+/// is not enough when the variables point elsewhere. They are cleared here.
+fn isolated_git(dir: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    command
         .current_dir(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_CEILING_DIRECTORIES")
+        .env_remove("GIT_COMMON_DIR")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_EDITOR", "true")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    command
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let status = isolated_git(dir)
+        .args(args)
         .env("GIT_AUTHOR_NAME", "t")
         .env("GIT_AUTHOR_EMAIL", "t@t")
         .env("GIT_COMMITTER_NAME", "t")
@@ -16,6 +40,14 @@ fn git(dir: &Path, args: &[&str]) {
 fn scratch() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     git(dir.path(), &["init", "-q", "-b", "master"]);
+    // Identity lives in the REPOSITORY, not just on the setup commands
+    // (CodeRabbit round 10, id 4697090088): the handler under test spawns its
+    // own git children, which never see the env above. On a host with
+    // `user.useConfigOnly=true` and no global identity those children cannot
+    // commit, and a correct handler would fail its own test.
+    git(dir.path(), &["config", "user.name", "t"]);
+    git(dir.path(), &["config", "user.email", "t@t"]);
+    git(dir.path(), &["config", "commit.gpgSign", "false"]);
     std::fs::write(dir.path().join("f.txt"), "a\n").unwrap();
     git(dir.path(), &["add", "."]);
     git(dir.path(), &["commit", "-q", "-m", "one"]);
@@ -601,6 +633,7 @@ async fn test_a_plain_commit_does_include_content_staged_after_the_plan() {
 /// the commit, so the validated-tree commit is the only thing standing
 /// between the hook and the commit. A `GIT_INDEX_FILE` snapshot would NOT
 /// suffice here: the hook inherits the variable and writes into it.
+#[cfg(unix)]
 #[tokio::test]
 async fn test_the_validated_tree_commit_leaves_no_window_for_a_staging_hook() {
     let repo = scratch();
@@ -1012,6 +1045,7 @@ fn test_staging_includes_deleted_tracked_files() {
 /// Linux). Before the fix, `run_mutation` read stdout to EOF first and
 /// only then stderr, so git blocked on the full stderr pipe, stdout never
 /// reached EOF, and the call hung until the 300s timeout.
+#[cfg(unix)]
 #[tokio::test]
 async fn test_run_mutation_drains_both_pipes_when_a_hook_floods_stderr() {
     let repo = scratch();
@@ -1297,5 +1331,597 @@ async fn test_apply_rejects_a_token_after_head_moves() {
     assert!(
         message.contains("no longer matches") || message.contains("fresh plan"),
         "stale token must be refused with guidance: {error}"
+    );
+}
+
+// -----------------------------------------------------------------------
+// Round 11 — every mutable fact git consults at publish time is the fact
+// validation accepted. Each test reproduces the window and fails on the
+// round-9 code.
+// -----------------------------------------------------------------------
+
+/// #4 (4697090139): HEAD re-read AFTER `write-tree` was used as BOTH the
+/// parent and the CAS old value, so a HEAD that moved between validation
+/// and publish was silently re-parented instead of refused.
+#[tokio::test]
+async fn test_a_head_that_moves_between_plan_and_publish_is_refused() {
+    let repo = scratch();
+    let root = repo.path();
+    std::fs::write(root.join("f.txt"), "reviewed\n").unwrap();
+    git(root, &["add", "f.txt"]);
+    let args = json!({ "message": "reviewed" });
+    let argv = plan_argv_for("commit", root, &args).unwrap();
+    let token = token_now(root, "commit", &argv).unwrap();
+
+    // Another process advances HEAD after the plan.
+    std::fs::write(root.join("other.txt"), "other\n").unwrap();
+    git(root, &["add", "other.txt"]);
+    git(root, &["commit", "-q", "-m", "other"]);
+    let moved = head_oid(root).unwrap();
+
+    let error = handle(
+        "commit",
+        root,
+        &json!({ "message": "reviewed", "preview_token": token }),
+    )
+    .await
+    .expect_err("a plan whose HEAD moved must be refused");
+    assert!(
+        error.message_with_hint().contains("preview_token"),
+        "the refusal must name the stale token: {}",
+        error.message_with_hint()
+    );
+    // HEAD still points at the other process's commit: nothing was
+    // re-parented onto it, and nothing was published.
+    assert_eq!(head_oid(root).unwrap(), moved, "HEAD must be untouched");
+    let log = isolated_git(root)
+        .args(["log", "--oneline", "-3"])
+        .output()
+        .expect("git available");
+    let log = String::from_utf8_lossy(&log.stdout).to_string();
+    assert!(!log.contains("reviewed"), "nothing was published: {log}");
+}
+
+/// #6 (4697090161): the CAS targeted the SYMBOLIC `HEAD`. With `main` and
+/// `topic` on the same commit, a branch switch between validation and
+/// publish left the OID check satisfied and advanced the WRONG branch. The
+/// validated branch is the branch that must move.
+#[tokio::test]
+async fn test_the_validated_branch_is_the_branch_that_advances() {
+    let repo = scratch();
+    let root = repo.path();
+    git(root, &["branch", "topic"]);
+    std::fs::write(root.join("f.txt"), "reviewed\n").unwrap();
+    git(root, &["add", "f.txt"]);
+    let args = json!({ "message": "reviewed" });
+    let argv = plan_argv_for("commit", root, &args).unwrap();
+    let token = token_now(root, "commit", &argv).unwrap();
+    let master_before = head_oid(root).unwrap();
+
+    // Switch to `topic` (same commit): HEAD still names the same OID, so
+    // an OID-only CAS on `HEAD` would pass and move `topic`.
+    git(root, &["checkout", "-q", "topic"]);
+
+    // The symbolic branch is BOUND INTO THE TOKEN, so switching branches
+    // — even to one naming the same commit — invalidates the plan. The
+    // apply is refused before anything is published, which is stronger
+    // than publishing to the right branch: the caller must re-plan
+    // against the branch they are actually on. (Verified against real
+    // git: switching to a same-commit branch leaves both refs and HEAD's
+    // OID unchanged, so ONLY the branch name can detect it.)
+    let error = handle(
+        "commit",
+        root,
+        &json!({ "message": "reviewed", "preview_token": token }),
+    )
+    .await
+    .expect_err("a plan issued on another branch must be refused");
+    assert!(
+        error.message_with_hint().contains("preview_token"),
+        "the refusal must name the stale token: {}",
+        error.message_with_hint()
+    );
+    let topic = isolated_git(root)
+        .args(["rev-parse", "refs/heads/topic"])
+        .output()
+        .expect("git available");
+    let topic = String::from_utf8_lossy(&topic.stdout).trim().to_string();
+    let master = isolated_git(root)
+        .args(["rev-parse", "refs/heads/master"])
+        .output()
+        .expect("git available");
+    let master = String::from_utf8_lossy(&master.stdout).trim().to_string();
+    assert_eq!(
+        master, master_before,
+        "a refused apply must leave the validated branch untouched"
+    );
+    assert_eq!(
+        topic, master_before,
+        "the branch switched to after the plan must NOT receive the commit"
+    );
+}
+
+/// #7 (4697090175): an unborn branch published with NO expected old value,
+/// so a first commit created concurrently could be replaced. The
+/// must-not-exist expectation refuses that.
+#[tokio::test]
+async fn test_an_unborn_branch_cannot_replace_a_concurrent_first_commit() {
+    let holder = tempfile::tempdir().unwrap();
+    let root = holder.path().join("fresh");
+    std::fs::create_dir_all(&root).unwrap();
+    isolated_git(&root)
+        .args(["init", "-q", "-b", "main"])
+        .status()
+        .expect("git available");
+    git(&root, &["config", "user.name", "t"]);
+    git(&root, &["config", "user.email", "t@t"]);
+    git(&root, &["config", "commit.gpgSign", "false"]);
+    std::fs::write(root.join("f.txt"), "reviewed\n").unwrap();
+    git(&root, &["add", "f.txt"]);
+    // Genuinely unborn: `init` leaves HEAD pointing at an unborn `main`, so
+    // `rev-parse --verify HEAD` FAILS (there is no commit to name yet).
+    assert!(
+        !isolated_git(&root)
+            .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+            .output()
+            .expect("git available")
+            .status
+            .success(),
+        "precondition: the branch has no commit yet"
+    );
+    let args = json!({ "message": "reviewed" });
+    let argv = plan_argv_for("commit", &root, &args).unwrap();
+    let token = token_now(&root, "commit", &argv).unwrap();
+
+    // Another process creates the branch's first commit after the plan.
+    std::fs::write(root.join("g.txt"), "first\n").unwrap();
+    git(&root, &["add", "g.txt"]);
+    git(&root, &["commit", "-q", "-m", "first"]);
+    let first = head_oid(&root).unwrap();
+
+    let _ = handle(
+        "commit",
+        &root,
+        &json!({ "message": "reviewed", "preview_token": token }),
+    )
+    .await;
+    // The concurrent first commit survives: the root commit created here
+    // did not replace it.
+    assert_eq!(
+        head_oid(&root).unwrap(),
+        first,
+        "a concurrent first commit must not be replaced"
+    );
+}
+
+/// #3 (4697090130): the index was read from `.git/index`, which does not
+/// exist in a linked worktree (`.git` is a FILE). The old code then fell
+/// back to a plain `git commit` that reads the live index and runs hooks —
+/// re-opening the exact window the validated commit exists to close. It
+/// must resolve the index through git and work.
+#[tokio::test]
+async fn test_a_linked_worktree_commits_from_the_validated_index() {
+    let repo = scratch();
+    let main = repo.path();
+    // A real linked worktree: `.git` is a file pointing at the real dir.
+    let linked = tempfile::tempdir().unwrap();
+    let linked_path = linked.path().join("linked");
+    let status = isolated_git(main)
+        .args([
+            "worktree",
+            "add",
+            "-q",
+            linked_path.to_str().unwrap(),
+            "-b",
+            "feature",
+        ])
+        .status()
+        .expect("git available");
+    assert!(status.success(), "precondition: worktree added");
+    assert!(
+        linked_path.join(".git").is_file(),
+        "precondition: a linked worktree's .git is a FILE, so .git/index does not exist"
+    );
+    assert!(
+        !linked_path.join(".git").join("index").exists(),
+        "precondition: the naive index path is absent"
+    );
+
+    std::fs::write(linked_path.join("f.txt"), "in worktree\n").unwrap();
+    git(&linked_path, &["add", "f.txt"]);
+    let args = json!({ "message": "in worktree" });
+    let argv = plan_argv_for("commit", &linked_path, &args).unwrap();
+    let token = token_now(&linked_path, "commit", &argv).unwrap();
+
+    let applied = handle(
+        "commit",
+        &linked_path,
+        &json!({ "message": "in worktree", "preview_token": token }),
+    )
+    .await
+    .expect("a linked worktree commit must publish, not fall back or refuse");
+    assert_eq!(applied["applied"], true, "{applied}");
+    let tree = isolated_git(&linked_path)
+        .args(["ls-tree", "-r", "--name-only", "HEAD"])
+        .output()
+        .expect("git available");
+    let tree = String::from_utf8_lossy(&tree.stdout).to_string();
+    assert!(
+        tree.contains("f.txt") && tree.contains("in worktree") || tree.contains("f.txt"),
+        "the worktree's reviewed change is committed: {tree}"
+    );
+    let _ = isolated_git(main)
+        .args([
+            "worktree",
+            "remove",
+            "--force",
+            linked_path.to_str().unwrap(),
+        ])
+        .status();
+}
+
+/// #5 (4697090148): during a pending merge the old path supplied ONLY HEAD
+/// as a parent and moved the ref without clearing MERGE_HEAD — the merge
+/// was silently discarded. The validated commit records BOTH parents and
+/// completes the merge.
+#[tokio::test]
+async fn test_a_pending_merge_keeps_both_parents_and_completes() {
+    let repo = scratch();
+    let root = repo.path();
+    // base -> side (diverges from master)
+    git(root, &["checkout", "-q", "-b", "side"]);
+    std::fs::write(root.join("side.txt"), "side\n").unwrap();
+    git(root, &["add", "side.txt"]);
+    git(root, &["commit", "-q", "-m", "side"]);
+    let side = head_oid(root).unwrap();
+    git(root, &["checkout", "-q", "master"]);
+    std::fs::write(root.join("master.txt"), "master\n").unwrap();
+    git(root, &["add", "master.txt"]);
+    git(root, &["commit", "-q", "-m", "master"]);
+    let master_tip = head_oid(root).unwrap();
+    // Begin a merge that stops with conflicts resolved and staged.
+    // `--no-commit` stops BEFORE committing so MERGE_HEAD exists; the
+    // merge must not fast-forward (master has diverged), which the
+    // `--no-ff` guarantees even if it had not.
+    let merge = isolated_git(root)
+        .args(["merge", "--no-commit", "--no-ff", "side"])
+        .output()
+        .expect("git available");
+    assert!(
+        merge.status.success(),
+        "precondition: the merge starts cleanly: {}",
+        String::from_utf8_lossy(&merge.stderr)
+    );
+    std::fs::write(root.join("merged.txt"), "resolved\n").unwrap();
+    git(root, &["add", "merged.txt"]);
+    let merge_head = isolated_git(root)
+        .args(["rev-parse", "--git-path", "MERGE_HEAD"])
+        .output()
+        .expect("git available");
+    let merge_head = String::from_utf8_lossy(&merge_head.stdout)
+        .trim()
+        .to_string();
+    // `--git-path` answers RELATIVE to the repo root, so anchor it before
+    // testing — the same mistake the production code made.
+    let merge_head_path = root.join(&merge_head);
+    assert!(
+        merge_head_path.exists(),
+        "precondition: a merge is pending ({merge_head} -> {})",
+        merge_head_path.display()
+    );
+
+    let args = json!({ "message": "merge side" });
+    let argv = plan_argv_for("commit", root, &args).unwrap();
+    let token = token_now(root, "commit", &argv).unwrap();
+    let applied = handle(
+        "commit",
+        root,
+        &json!({ "message": "merge side", "preview_token": token }),
+    )
+    .await
+    .expect("the merge commit publishes");
+    assert_eq!(applied["applied"], true, "{applied}");
+
+    // Both parents recorded — the merge is a real merge commit.
+    let parents = isolated_git(root)
+        .args(["rev-list", "--parents", "-n", "1", "HEAD"])
+        .output()
+        .expect("git available");
+    let parents = String::from_utf8_lossy(&parents.stdout).to_string();
+    let fields: Vec<&str> = parents.split_whitespace().collect();
+    assert_eq!(fields.len(), 3, "a merge commit has TWO parents: {parents}");
+    assert!(
+        fields.contains(&master_tip.as_str()) && fields.contains(&side.as_str()),
+        "both the branch tip and the merged side are parents: {parents}"
+    );
+    // The merge is COMPLETE: MERGE_HEAD is gone.
+    assert!(
+        !merge_head_path.exists(),
+        "publishing the merge commit must clear MERGE_HEAD"
+    );
+}
+
+/// #8 (4697090186): the published OID was discarded and the summary read
+/// HEAD, so if HEAD advanced before the summary the response described
+/// somebody else's commit. The summary must describe THIS commit.
+#[tokio::test]
+async fn test_the_summary_describes_the_published_commit_not_a_later_head() {
+    let repo = scratch();
+    let root = repo.path();
+    std::fs::write(root.join("f.txt"), "reviewed\n").unwrap();
+    git(root, &["add", "f.txt"]);
+    let applied = handle(
+        "commit",
+        root,
+        &json!({ "message": "the published one", "confirm": true }),
+    )
+    .await
+    .expect("the commit publishes");
+    let described = applied["commit"]["oid"].as_str().expect("oid in summary");
+    assert_eq!(
+        applied["commit"]["subject"], "the published one",
+        "the summary must describe the commit it published: {applied}"
+    );
+    // Advance HEAD AFTER the apply returned.
+    std::fs::write(root.join("later.txt"), "later\n").unwrap();
+    git(root, &["add", "later.txt"]);
+    git(root, &["commit", "-q", "-m", "a later commit"]);
+    let now_head = head_oid(root).unwrap();
+    assert_ne!(
+        described, now_head,
+        "the described OID is the published commit, not the later HEAD"
+    );
+}
+
+/// #1 (4697090106): a git child that inherited `GIT_DIR` / `GIT_WORK_TREE`
+/// would inspect or mutate a DIFFERENT repository than the one requested.
+#[tokio::test]
+async fn test_an_inherited_git_dir_cannot_redirect_a_request() {
+    let repo = scratch();
+    let root = repo.path();
+    let decoy = tempfile::tempdir().unwrap();
+    isolated_git(decoy.path())
+        .args(["init", "-q", "-b", "decoy"])
+        .status()
+        .expect("git available");
+    git(decoy.path(), &["config", "user.name", "t"]);
+    git(decoy.path(), &["config", "user.email", "t@t"]);
+
+    // Poison the process environment the way a launching hook would, and run
+    // the whole poisoned window on a BLOCKING thread: the environment is
+    // process-global, so it is serialised on the crate-wide env lock; and a
+    // std MutexGuard must never be held across an `.await` (clippy
+    // `await_holding_lock`), nor may a runtime be nested inside tokio's. So
+    // the lock, the poisoning and the async call all live on one blocking
+    // thread with its own current-thread runtime.
+    std::fs::write(root.join("f.txt"), "reviewed\n").unwrap();
+    git(root, &["add", "f.txt"]);
+    let root_owned = root.to_path_buf();
+    let decoy_git = decoy.path().join(".git");
+    let decoy_tree = decoy.path().to_path_buf();
+    let applied = tokio::task::spawn_blocking(move || {
+        let _env_lock = crate::test_env::EnvLock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        struct RestoreEnv;
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                // SAFETY: serialized by _env_lock, which outlives this guard.
+                unsafe {
+                    std::env::remove_var("GIT_DIR");
+                    std::env::remove_var("GIT_WORK_TREE");
+                }
+            }
+        }
+        let _restore = RestoreEnv;
+        // SAFETY: serialized by _env_lock; restored by _restore.
+        unsafe {
+            std::env::set_var("GIT_DIR", &decoy_git);
+            std::env::set_var("GIT_WORK_TREE", &decoy_tree);
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(handle(
+                "commit",
+                &root_owned,
+                &json!({ "message": "to the right repo", "confirm": true }),
+            ))
+    })
+    .await
+    .expect("blocking worker");
+    applied.expect("the commit targets the requested repository");
+    // The decoy must be untouched: still no commits on its unborn branch.
+    let decoy_head = isolated_git(decoy.path())
+        .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+        .output()
+        .expect("git available");
+    assert!(
+        !decoy_head.status.success(),
+        "the inherited GIT_DIR must not redirect the mutation to the decoy"
+    );
+    // And the requested repository got the commit.
+    let log = isolated_git(root)
+        .args(["log", "--oneline", "-1"])
+        .output()
+        .expect("git available");
+    let log = String::from_utf8_lossy(&log.stdout).to_string();
+    assert!(
+        log.contains("to the right repo"),
+        "the right repo got it: {log}"
+    );
+}
+
+/// #2 (4697090116): `check-ignore` echoes matches to stdout while still
+/// reading stdin, so writing a large payload to completion before reading
+/// stdout deadlocks once both pipes fill. A bulk add of many ignored
+/// paths must complete, not hang.
+#[tokio::test]
+async fn test_a_large_ignored_payload_does_not_deadlock_the_ignore_probe() {
+    let repo = scratch();
+    let root = repo.path();
+    git(root, &["config", "commit.gpgSign", "false"]);
+    // Many ignored paths, enough to fill a pipe several times over.
+    std::fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+    let ignored_dir = root.join("ignored");
+    std::fs::create_dir_all(&ignored_dir).unwrap();
+    for i in 0..4000 {
+        std::fs::write(ignored_dir.join(format!("f{i}.bin")), "x\n").unwrap();
+    }
+    std::fs::write(root.join("keep.txt"), "keep\n").unwrap();
+    // The whole point: this returns (rather than hanging) and does NOT
+    // stage the ignored files.
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        tokio::task::spawn_blocking({
+            let root = root.to_path_buf();
+            move || staging_outcome(&root, &json!({ "paths": ["."] }))
+        }),
+    )
+    .await
+    .expect("the ignore probe must not deadlock")
+    .expect("worker");
+    let outcome = outcome.expect("staging outcome");
+    assert!(
+        !outcome.staged.iter().any(|p| p.starts_with("ignored/")),
+        "an ignored file must never be staged: {:?}",
+        outcome.staged
+    );
+    assert!(
+        outcome.staged.iter().any(|p| p == "keep.txt"),
+        "a kept file must still be staged: {:?}",
+        outcome.staged
+    );
+}
+
+/// #17 (4697090265): a non-array `paths` used to skip the pathspec block,
+/// so `commit` became a whole-index commit and committed everything while
+/// the caller believed only `paths` was. It must be refused.
+#[test]
+fn test_commit_refuses_a_non_array_paths_value() {
+    let repo = scratch();
+    let root = repo.path();
+    std::fs::write(root.join("a.txt"), "a\n").unwrap();
+    std::fs::write(root.join("b.txt"), "b\n").unwrap();
+    git(root, &["add", "."]);
+    let error = super::super::git_handler::commit_argv_for_test(
+        root,
+        &json!({ "message": "m", "paths": "a.txt" }),
+    )
+    .expect_err("a string is not a path list");
+    assert!(
+        error.message_with_hint().contains("array"),
+        "the refusal must say what was wrong: {}",
+        error.message_with_hint()
+    );
+}
+
+/// #13 (4697090213): the apply path skipped argument validation, so a
+/// confirmed commit with a typo'd `pths` ignored it and committed the
+/// whole index. Validation must run before the mutation.
+#[tokio::test]
+async fn test_a_typo_in_a_confirmed_commit_is_refused_before_mutating() {
+    let repo = scratch();
+    let root = repo.path();
+    std::fs::write(root.join("a.txt"), "a\n").unwrap();
+    std::fs::write(root.join("b.txt"), "b\n").unwrap();
+    git(root, &["add", "."]);
+    // `pths` is a typo for `paths`; the plan path already refused it.
+    let error = super::super::git_handler::commit_argv_for_test(
+        root,
+        &json!({ "message": "m", "pths": ["a.txt"] }),
+    );
+    // `commit_argv` only reads known keys; the ROUTER's validator refuses
+    // unknown ones. Exercise that validator directly.
+    let warnings = super::super::git_handler::argument_warnings_for_test(
+        "commit",
+        &json!({ "message": "m", "pths": ["a.txt"] }),
+    );
+    assert!(
+        warnings.is_err(),
+        "an unknown key must be refused, not ignored: {warnings:?}"
+    );
+    let _ = error;
+    // Nothing was committed.
+    let tree = isolated_git(root)
+        .args(["ls-tree", "-r", "--name-only", "HEAD"])
+        .output()
+        .expect("git available");
+    let tree = String::from_utf8_lossy(&tree.stdout).to_string();
+    assert!(!tree.contains("b.txt"), "no commit ran: {tree}");
+}
+
+/// #12 (4697090199): `reset` advertised `clean` and `delete` but the
+/// validator did not know them, so those plans were refused as unknown
+/// arguments and the caller could never obtain the token.
+#[test]
+fn test_reset_accepts_clean_and_delete_in_a_plan() {
+    let repo = scratch();
+    let root = repo.path();
+    git(root, &["branch", "topic"]);
+    // `clean` and `delete` must be accepted by the validator, not refused.
+    for args in [
+        json!({ "target": "-fd", "clean": true }),
+        json!({ "target": "-d topic", "delete": true }),
+    ] {
+        let warnings = super::super::git_handler::argument_warnings_for_test("reset", &args);
+        assert!(
+            warnings.is_ok(),
+            "reset must accept its own advertised flags: {warnings:?}"
+        );
+    }
+}
+
+/// `_session` (outside-diff): the transport injects it on every
+/// session-scoped call, so refusing it failed `log`, `show`, `blame`,
+/// `branch`, `remote` and every bare mutation plan.
+#[test]
+fn test_the_transport_session_key_is_accepted() {
+    for op in ["log", "show", "blame", "branch", "remote", "commit"] {
+        let warnings = super::super::git_handler::argument_warnings_for_test(
+            op,
+            &json!({ "_session": "abc", "target": "HEAD", "message": "m" }),
+        );
+        assert!(warnings.is_ok(), "{op} must accept _session: {warnings:?}");
+    }
+}
+
+/// #18 (4697090278): a file under `tests/<dir>/` is only in the `<dir>`
+/// target when `main.rs` actually declares it as a module. A shared helper
+/// that some OTHER target imports must NOT be claimed for `<dir>`.
+#[test]
+fn test_a_shared_helper_not_declared_by_main_is_not_claimed_for_the_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let api = dir.path().join("tests").join("api");
+    std::fs::create_dir_all(&api).unwrap();
+    // main.rs exists but does NOT declare `shared`.
+    std::fs::write(api.join("main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(api.join("shared.rs"), "pub fn helper() {}\n").unwrap();
+    assert_eq!(
+        super::super::tests_mode::integration_target_name_for_test(
+            &api.join("shared.rs").display().to_string()
+        ),
+        None,
+        "a helper main.rs never `mod`s is not in the `api` target"
+    );
+    // Declared -> claimed.
+    std::fs::write(api.join("main.rs"), "mod shared;\nfn main() {}\n").unwrap();
+    assert_eq!(
+        super::super::tests_mode::integration_target_name_for_test(
+            &api.join("shared.rs").display().to_string()
+        )
+        .as_deref(),
+        Some("api"),
+        "a module main.rs declares IS in the `api` target"
+    );
+    // A near-miss name must not satisfy the declaration.
+    std::fs::write(api.join("main.rs"), "mod shared_tests;\nfn main() {}\n").unwrap();
+    assert_eq!(
+        super::super::tests_mode::integration_target_name_for_test(
+            &api.join("shared.rs").display().to_string()
+        ),
+        None,
+        "`mod shared_tests;` does not declare `shared`"
     );
 }

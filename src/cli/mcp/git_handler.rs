@@ -162,7 +162,12 @@ const OPS: [Op; 17] = [
     Op {
         name: "reset",
         summary: "Move the current branch to a commit (--hard needs hard:true and a preview_token)",
-        args: &["target", "hard"],
+        // `clean` and `delete` are advertised in the schema and accepted by
+        // `plan_argv`, so the validator must know them too: without them here
+        // `argument_warnings` refused the very flags the operation needs, and
+        // the caller could never obtain the token (CodeRabbit round 10, id
+        // 4697090199).
+        args: &["target", "hard", "clean", "delete"],
         mutating: true,
     },
     Op {
@@ -352,6 +357,13 @@ impl GitHandler {
         let root = resolve_root(registry, &args).await?;
 
         if op.mutating {
+            // Validate arguments BEFORE either branch (CodeRabbit round 10,
+            // id 4697090213). `argument_warnings` used to run only on the plan
+            // path, so a confirmed commit carrying `pths:["a.txt"]` ignored the
+            // typo and committed the ENTIRE index — the same key was refused on
+            // the plan path. The plan path re-runs this to collect the warnings
+            // it reports; the apply path runs it purely to refuse.
+            argument_warnings(op, &args)?;
             return if args.get("preview_token").and_then(Value::as_str).is_some()
                 || args
                     .get("confirm")
@@ -393,7 +405,14 @@ impl GitHandler {
 
 /// Keys the router or transport legitimately adds, so an operation must accept
 /// them even when it does not read them.
-const SHARED_KEYS: [&str; 2] = ["project_path", "max_latency_ms"];
+///
+/// `_session` is injected by the transport on every `tools/call` that carries
+/// a session id and forwarded here untouched. Treating it as an unknown
+/// operation argument failed `log`, `show`, `blame`, `branch`, `remote` and
+/// every bare mutation plan for any session-scoped caller (CodeRabbit round
+/// 10, outside-diff comment at git_handler.rs:394-400). The transport owns it;
+/// it is accepted and never read.
+const SHARED_KEYS: [&str; 3] = ["project_path", "max_latency_ms", "_session"];
 
 /// Keys hoisted to the top level of the router's advertised schema from a
 /// sub-tool's schema, and therefore seen by every git operation.
@@ -417,6 +436,24 @@ fn any_op_reads(key: &str) -> bool {
     OPS.iter().any(|op| op.args.contains(&key))
 }
 
+/// Test-only seam: `commit_argv` is private to the handler.
+#[cfg(test)]
+pub(crate) fn commit_argv_for_test(root: &Path, args: &Value) -> Result<Vec<String>, JsonRpcError> {
+    commit_argv(root, args)
+}
+
+/// Test-only seam: the argument validator takes a parsed [`Op`], which is
+/// module-private, so the regression tests reach it by operation name.
+#[cfg(test)]
+pub(crate) fn argument_warnings_for_test(
+    op_name: &str,
+    args: &Value,
+) -> Result<Vec<String>, JsonRpcError> {
+    let op = Op::parse(op_name)
+        .ok_or_else(|| JsonRpcError::internal_error(format!("unknown op {op_name}")))?;
+    argument_warnings(op, args)
+}
+
 /// Refuse unknown keys, and name the known-but-ignored ones.
 ///
 /// Nothing used to look at unrecognized arguments: `{"max_chars": 10}` on
@@ -438,8 +475,15 @@ fn argument_warnings(op: &Op, args: &Value) -> Result<Vec<String>, JsonRpcError>
     // Transport/router keys are consumed by the server before the operation
     // ever runs, so they are never "ignored" — warning about them would train
     // the caller to ignore warnings.
+    // `preview_token` and `confirm` are the APPLY authorization fields: the
+    // plan path never sees them, but the apply path always does, so the
+    // validator — now run on both — must accept them or refuse every apply.
+    const AUTHORIZATION_KEYS: [&str; 2] = ["preview_token", "confirm"];
     let is_transport = |key: &str| {
-        SHARED_KEYS.contains(&key) || ROUTER_KEYS.contains(&key) || SILENTLY_HONORED.contains(&key)
+        SHARED_KEYS.contains(&key)
+            || ROUTER_KEYS.contains(&key)
+            || SILENTLY_HONORED.contains(&key)
+            || AUTHORIZATION_KEYS.contains(&key)
     };
     let mut warnings = Vec::new();
     for key in object.keys() {
@@ -478,7 +522,17 @@ fn with_warnings(mut payload: Value, warnings: &[String]) -> Value {
         return payload;
     }
     if let Some(object) = payload.as_object_mut() {
-        object.insert("warnings".to_string(), json!(warnings));
+        // MERGE with any warnings already attached (CodeRabbit round 10, id
+        // 4697090251). A bulk add that stopped at the walk limit carries an
+        // INCOMPLETE staging warning; a recognised-but-ignored argument adds
+        // another. Replacing dropped the first, so the plan looked complete
+        // while it omitted files.
+        match object.get_mut("warnings").and_then(Value::as_array_mut) {
+            Some(existing) => existing.extend(warnings.iter().cloned().map(Value::String)),
+            None => {
+                object.insert("warnings".to_string(), json!(warnings));
+            }
+        }
     }
     payload
 }
@@ -550,16 +604,27 @@ fn git_log(root: &Path, args: &Value) -> Result<Value, JsonRpcError> {
     for line in text.lines() {
         let mut fields = line.splitn(4, '\t');
         let oid = fields.next().unwrap_or_default();
-        if oid.len() == 40 && oid.chars().all(|c| c.is_ascii_hexdigit()) {
+        // A commit header is `<oid>\t<date>\t<author>\t<subject>`, so the
+        // oid is ALWAYS followed by a tab. `--name-only` emits bare file
+        // records, and a file whose name is exactly 40 hex characters is
+        // legal — matching on shape alone invented a phantom commit for it
+        // (CodeRabbit round 10, id 4697090225). Require the separator.
+        let is_header = fields.next().is_some()
+            && oid.len() == 40
+            && oid.bytes().all(|b| b.is_ascii_hexdigit());
+        if is_header {
+            // `fields` was advanced by the probe above; rebuild the remaining
+            // fields in order.
+            let rest: Vec<&str> = line.splitn(4, '\t').skip(2).collect();
             if let Some(commit) = commits.last_mut() {
                 commit["files_changed"] = json!(files);
             }
             files = 0;
             commits.push(json!({
                 "oid": oid,
-                "date": fields.next().unwrap_or_default(),
-                "author": fields.next().unwrap_or_default(),
-                "subject": fields.next().unwrap_or_default(),
+                "date": rest.first().copied().unwrap_or_default(),
+                "author": rest.get(1).copied().unwrap_or_default(),
+                "subject": rest.get(2).copied().unwrap_or_default(),
             }));
         } else if !line.trim().is_empty() {
             files += 1;
@@ -584,6 +649,11 @@ fn git_show(root: &Path, args: &Value) -> Result<Value, JsonRpcError> {
         .get("include_patch")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    // Resolve the target to ONE object id and use it for BOTH probes
+    // (CodeRabbit round 10, id 4697090236). Resolving `HEAD` separately per
+    // probe let HEAD advance between the stat and the patch, presenting the
+    // stat of commit A with the patch of commit B.
+    let resolved = super::git_apply::resolve_to_oid(root, &target)?;
     let (stat, stat_truncated) = run_text(
         root,
         &[
@@ -591,7 +661,7 @@ fn git_show(root: &Path, args: &Value) -> Result<Value, JsonRpcError> {
             "--no-color".to_string(),
             "--format=medium".to_string(),
             "--stat".to_string(),
-            target.clone(),
+            resolved.clone(),
         ],
     )?;
     let mut payload = json!({
@@ -608,7 +678,7 @@ fn git_show(root: &Path, args: &Value) -> Result<Value, JsonRpcError> {
                 "show".to_string(),
                 "--no-color".to_string(),
                 "--format=fuller".to_string(),
-                target.clone(),
+                resolved.clone(),
             ],
         )?;
         payload["patch"] = Value::String(patch);
@@ -994,7 +1064,18 @@ fn commit_argv(root: &Path, args: &Value) -> Result<Vec<String>, JsonRpcError> {
             argv.push(line.to_string());
         }
     }
-    if let Some(paths) = args.get("paths").and_then(Value::as_array) {
+    if let Some(value) = args.get("paths") {
+        // A string (or any non-array) used to skip this block entirely, so the
+        // argv carried no `--`, `commits_whole_index` saw a whole-index commit,
+        // and ALL staged content was committed while the caller believed only
+        // `paths` was (CodeRabbit round 10, id 4697090265). `add` already
+        // refuses this shape; `commit` must too.
+        let paths = value.as_array().ok_or_else(|| {
+            JsonRpcError::invalid_params_with_suggestion(
+                "'paths' must be an array of project-relative files, or be omitted".to_string(),
+                "Pass paths:[\"a.txt\"] — a single string is not a path list".to_string(),
+            )
+        })?;
         if paths.is_empty() {
             return Err(JsonRpcError::invalid_params(
                 "'paths' must name at least one file, or be omitted".to_string(),
