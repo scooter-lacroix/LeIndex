@@ -329,8 +329,15 @@ impl EditCache {
         Ok(primary)
     }
 
-    /// Store a token-alias entry without charging its bytes against the
-    /// hot-cache budget (the primary entry already paid for this payload).
+    /// Store a token-alias entry WITHOUT the pre-charge shortcut.
+    ///
+    /// The alias is a deep clone of the primary entry — its own `String`
+    /// copies of the original and modified text and its own `changes` — so it
+    /// occupies real memory of its own. It must therefore be charged against
+    /// the hot-cache budget and be evictable like any other entry (Codex
+    /// round 7, id 4690978432). Leaving it uncharged let a long series of
+    /// previews retain N x entry_size while `total_bytes` only ever counted
+    /// the primaries, so the advertised 8 MiB cap did not bound memory.
     async fn set_alias(
         &self,
         project_storage: &Path,
@@ -362,12 +369,20 @@ impl EditCache {
             let mut guard = self.entries.lock().await;
             let (ref mut entries, ref mut total_bytes) = *guard;
             // A stale alias for the same token (e.g. stored before this
-            // change) may still hold budget bytes — release them, then
-            // insert without re-charging.
+            // change) may still hold budget bytes — release them, then charge
+            // this alias like any other entry so it is bounded and evictable.
             if let Some(existing) = entries.pop(&abs_path) {
                 *total_bytes = total_bytes.saturating_sub(existing.estimated_size());
             }
+            while *total_bytes + entry_size > EDIT_CACHE_TOTAL_CAP_BYTES {
+                if let Some((_, removed)) = entries.pop_lru() {
+                    *total_bytes = total_bytes.saturating_sub(removed.estimated_size());
+                } else {
+                    break;
+                }
+            }
             entries.put(abs_path, entry);
+            *total_bytes = total_bytes.saturating_add(entry_size);
         }
         Ok(())
     }
@@ -684,6 +699,48 @@ mod tests {
         assert!(
             cache.get_by_token(&storage, "tok-newer").await.is_none(),
             "alias must clear"
+        );
+    }
+
+    /// Codex round 7 (id 4690978432): the token alias is a DEEP CLONE of the
+    /// entry (its own original/modified text and changes), yet `set_alias`
+    /// stored it without charging `total_bytes`. A long series of previews
+    /// therefore retained N x entry_size while the budget only ever saw the
+    /// primaries, so the 8 MiB cap bounded nothing. Every alias must be
+    /// charged, and must therefore be evictable.
+    #[tokio::test]
+    async fn test_token_aliases_are_charged_against_the_hot_cache_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().to_path_buf();
+        let cache = EditCache::new();
+        let file = storage.join("f.rs");
+        std::fs::write(&file, "fn f() {}\n").unwrap();
+
+        let mut entry = EditCacheEntry::single_file(
+            file.clone(),
+            "tok-alias-budget".to_string(),
+            "x".repeat(64 * 1024),
+            "y".repeat(64 * 1024),
+            Vec::new(),
+        );
+        entry.original_hashes =
+            HashMap::from([(file.to_string_lossy().to_string(), "h".to_string())]);
+        let entry_size = entry.estimated_size();
+        cache
+            .set_with_token_alias(&storage, entry)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let hot = cache.hot_cache_bytes().await;
+        assert!(
+            hot >= entry_size * 2,
+            "the alias must be charged too: hot={hot}, entry={entry_size} \
+             (one entry means the alias was free)"
+        );
+        assert!(
+            hot <= EDIT_CACHE_TOTAL_CAP_BYTES,
+            "the budget must still hold: hot={hot}"
         );
     }
 }

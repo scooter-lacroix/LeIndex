@@ -560,6 +560,12 @@ fn trim_read_file(data: &Value) -> Value {
     );
     // §4.1 (lane E): stable read handle, session-dedup verdict fields, and
     // the elided-view projection. Only present when the handler set them.
+    //
+    // `diagnostics` rides here too: the read overlay attaches the scoped
+    // check's findings to the payload, and the L1 transport trims BEFORE
+    // rendering, so a field dropped here never reaches
+    // `render_read_diagnostics` (Codex round 7, id 4690978440 — the overlay
+    // silently disappeared on every normal MCP read).
     for key in [
         "handle",
         "status",
@@ -576,6 +582,7 @@ fn trim_read_file(data: &Value) -> Value {
         "anchor_symbol",
         "anchor_line_start",
         "anchor_line_end",
+        "diagnostics",
     ] {
         if let Some(v) = data.get(key) {
             out.insert(key.to_string(), v.clone());

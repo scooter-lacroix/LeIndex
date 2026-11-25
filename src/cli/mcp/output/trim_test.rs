@@ -1234,3 +1234,32 @@ fn test_trim_edit_keeps_validation_artifact() {
     assert_eq!(t["syntax"], "ok");
     assert_eq!(t["check"], "passed");
 }
+
+/// Codex round 7 (id 4690978440): the read overlay attaches the scoped
+/// check's findings as `diagnostics`, but `trim_read_file` built a fresh
+/// object from an allowlist that did not include it. The MCP L1 transport
+/// trims BEFORE rendering, so `render_read_diagnostics` never saw a
+/// diagnostic and the overlay disappeared on every normal read.
+#[test]
+fn test_trim_read_file_keeps_the_diagnostics_overlay() {
+    let input = serde_json::json!({
+        "file_path": "src/lib.rs",
+        "start_line": 1,
+        "end_line": 2,
+        "content": "fn f() {}\n",
+        "handle": "src/lib.rs",
+        "diagnostics": [
+            { "file": "src/lib.rs", "line": 1, "severity": "error", "code": "E0308", "message": "mismatched types" }
+        ]
+    });
+    let trimmed = trim_read_file(&input);
+    let diagnostics = trimmed
+        .get("diagnostics")
+        .and_then(|v| v.as_array())
+        .expect("the overlay must survive trimming");
+    assert_eq!(diagnostics.len(), 1, "{trimmed}");
+    assert_eq!(diagnostics[0]["code"], "E0308");
+    // Still absent when the handler attached none — never an empty array.
+    let plain = serde_json::json!({ "file_path": "a.rs", "content": "x" });
+    assert!(trim_read_file(&plain).get("diagnostics").is_none());
+}
