@@ -154,9 +154,22 @@ fn display_path(file_path: &Path, project_root: Option<&Path>) -> String {
 
 /// Render `content` lines as `N code` starting at `start_line` (1-based).
 /// The number appears exactly once — this is the §3.1 contract.
+///
+/// Splits on `'\n'`, NOT `str::lines()`. `lines()` silently drops a trailing
+/// empty line, and this function numbers a SLICE that has already been
+/// line-selected: if the selected range ends in blank lines, `lines()`
+/// swallowed them and the caller got fewer lines than it asked for, with the
+/// numbers no longer matching the file (PR #117 review finding #116). A blank
+/// line inside the selection is content and must be rendered as one.
+///
+/// Empty input still renders as the empty string, so "no lines" does not
+/// become one phantom numbered line.
 pub(crate) fn number_lines(content: &str, start_line: usize) -> String {
+    if content.is_empty() {
+        return String::new();
+    }
     let mut out = String::with_capacity(content.len() + 16);
-    for (index, line) in content.lines().enumerate() {
+    for (index, line) in content.split('\n').enumerate() {
         if index > 0 {
             out.push('\n');
         }

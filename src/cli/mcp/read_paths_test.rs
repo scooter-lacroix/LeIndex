@@ -52,6 +52,44 @@ fn test_number_lines_is_unpadded_for_wide_files() {
     assert_eq!(out, "1 x", "line 1 is not padded to a fixed gutter width");
 }
 
+/// PR #117 finding #116: a selected range that ENDS in blank lines used to
+/// lose them, because `str::lines()` drops a trailing empty line. The caller
+/// then got fewer lines than it asked for and every number after the gap
+/// pointed at the wrong line of the file.
+///
+/// The slice arrives here already line-selected and joined with `'\n'`, so a
+/// trailing `""` element is a REAL line of the selection.
+#[test]
+fn test_number_lines_preserves_trailing_blank_lines_in_a_selected_range() {
+    // Lines 2..=5 of `alpha\n\nbeta\n\n\ngamma\n`: "", "beta", "", "".
+    let selected = ["", "beta", "", ""].join("\n");
+    let out = number_lines(&selected, 2);
+    assert_eq!(
+        out, "2 \n3 beta\n4 \n5 ",
+        "all four selected lines are rendered, still on their real line numbers"
+    );
+    assert_eq!(
+        out.split('\n').count(),
+        4,
+        "a blank line at the end of the range is not swallowed"
+    );
+}
+
+/// …and the interior-blank case, so a fix for the trailing case cannot
+/// regress the middle one.
+#[test]
+fn test_number_lines_preserves_interior_blank_lines() {
+    let out = number_lines("a\n\nb", 7);
+    assert_eq!(out, "7 a\n8 \n9 b");
+}
+
+/// No lines in, no phantom line out: an empty selection must not render as
+/// one numbered empty line.
+#[test]
+fn test_number_lines_renders_an_empty_selection_as_empty() {
+    assert_eq!(number_lines("", 600), "");
+}
+
 // =============================================================================
 // Handles: path#symbol, path#L600-800
 // =============================================================================
