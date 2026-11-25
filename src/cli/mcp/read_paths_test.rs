@@ -268,6 +268,53 @@ fn test_top_level_spans_filter_nested_items() {
     assert_eq!(top[0].name, "outer");
 }
 
+/// PR #117 finding #122: the parent filter skipped containers that share the
+/// child's NAME, so a legitimately same-named nested item (`fn foo` inside
+/// `fn foo`) was reported as top level and the elided body rendered it twice.
+/// Containment is the only criterion now.
+#[test]
+fn test_top_level_spans_filters_same_name_nested_items_by_containment() {
+    let spans = vec![
+        SymbolSpan {
+            name: "foo".into(),
+            start_byte: 0,
+            end_byte: 200,
+            start_line: 1,
+            end_line: 20,
+        },
+        // Same name, strictly inside the first: NOT top level.
+        SymbolSpan {
+            name: "foo".into(),
+            start_byte: 40,
+            end_byte: 90,
+            start_line: 5,
+            end_line: 9,
+        },
+    ];
+    let top = top_level_spans(&spans);
+    assert_eq!(
+        top.len(),
+        1,
+        "the nested same-name item is not top level: {top:?}"
+    );
+    assert_eq!((top[0].start_byte, top[0].end_byte), (0, 200));
+}
+
+/// A duplicated symbol at IDENTICAL bytes is not its own parent: strict
+/// containment, so it survives instead of both copies vanishing.
+#[test]
+fn test_top_level_spans_treats_identical_ranges_as_siblings_not_nesting() {
+    let span = || SymbolSpan {
+        name: "dup".into(),
+        start_byte: 10,
+        end_byte: 50,
+        start_line: 2,
+        end_line: 6,
+    };
+    let top = top_level_spans(&[span(), span()]);
+    assert_eq!(top.len(), 2, "identical ranges do not nest: {top:?}");
+}
+
 #[test]
 fn test_find_span_suffix_fallback() {
     let spans = vec![SymbolSpan {

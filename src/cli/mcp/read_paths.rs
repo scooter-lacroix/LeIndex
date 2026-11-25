@@ -276,11 +276,19 @@ pub(crate) fn top_level_spans(spans: &[SymbolSpan]) -> Vec<SymbolSpan> {
     spans
         .iter()
         .filter(|span| {
+            // Purely by CONTAINMENT (PR #117 finding #122). The name must not
+            // participate: a nested item can legally share its parent's name
+            // (`fn foo` inside `fn foo`, or a free `fn foo` beside
+            // `impl X { fn foo }`), and skipping same-name containers let the
+            // nested span through as "top level", so the elided body rendered
+            // it twice. Strictness is on the RANGE, not the name: a span is
+            // nested only when another span strictly contains it, so a
+            // duplicated symbol at identical bytes is not treated as its own
+            // parent.
             !spans.iter().any(|other| {
-                other.name != span.name
-                    && other.start_byte <= span.start_byte
+                other.start_byte <= span.start_byte
                     && other.end_byte >= span.end_byte
-                    && (other.end_byte - other.start_byte) > (span.end_byte - span.start_byte)
+                    && (other.start_byte < span.start_byte || other.end_byte > span.end_byte)
             })
         })
         .cloned()
