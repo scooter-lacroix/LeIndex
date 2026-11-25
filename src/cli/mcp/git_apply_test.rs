@@ -1,6 +1,3 @@
-use super::super::git_apply_exec::{
-    MAX_MUTATION_OUTPUT_BYTES, count_chars_streaming, drain_capped, failure_error,
-};
 use super::*;
 
 /// A git child whose environment is ISOLATED from whatever launched the test
@@ -1043,109 +1040,6 @@ fn test_staging_includes_deleted_tracked_files() {
             .contains("not a path inside this project")
     );
 }
-
-/// A hook that floods stderr well past the OS pipe buffer (64 KiB on
-/// Linux). Before the fix, `run_mutation` read stdout to EOF first and
-/// only then stderr, so git blocked on the full stderr pipe, stdout never
-/// reached EOF, and the call hung until the 300s timeout.
-#[cfg(unix)]
-#[tokio::test]
-async fn test_run_mutation_drains_both_pipes_when_a_hook_floods_stderr() {
-    let repo = scratch();
-    let hooks = repo.path().join(".git/hooks");
-    std::fs::write(
-        hooks.join("pre-commit"),
-        "#!/bin/sh\nhead -c 300000 /dev/zero | tr '\\0' 'x' >&2\necho hook-stderr >&2\nexit 0\n",
-    )
-    .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(
-        hooks.join("pre-commit"),
-        std::fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
-    std::fs::write(repo.path().join("f.txt"), "b\n").unwrap();
-    // `git commit` refuses an empty commit (nothing staged), which is
-    // what the hook-flood commit would be without this. Stage through the
-    // executor under test so the setup is itself exercised end-to-end.
-    run_mutation(repo.path(), &["add".to_string(), "f.txt".to_string()])
-        .await
-        .expect("staging the fixture must succeed");
-
-    // Well under MUTATION_TIMEOUT: a regression hangs here, and the
-    // assertion fails the test instead of stalling the suite for 300s.
-    let started = std::time::Instant::now();
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        run_mutation(
-            repo.path(),
-            &[
-                "commit".to_string(),
-                "-q".to_string(),
-                "-m".to_string(),
-                "two".to_string(),
-            ],
-        ),
-    )
-    .await
-    .expect("run_mutation must not deadlock on a hook that floods stderr")
-    .expect("commit with a passing hook succeeds");
-    assert!(started.elapsed() < std::time::Duration::from_secs(30));
-    // git routes hook output to ITS stderr, so the marker never reaches
-    // stdout; what the success path proves is that the 300 KB flood was
-    // drained concurrently (no deadlock) and that the overflow past the
-    // per-stream cap was counted rather than lost.
-    assert!(output.stdout.trim().is_empty(), "{}", output.stdout);
-    // 300,000 bytes in, 262,144 kept: the difference is the drop.
-    assert!(
-        output.truncated_chars >= 300_000 - MAX_MUTATION_OUTPUT_BYTES,
-        "stderr past the cap must be reported as dropped, got {}",
-        output.truncated_chars
-    );
-}
-
-#[tokio::test]
-async fn test_drain_capped_keeps_the_cap_and_reports_dropped_characters() {
-    // A 64-byte duplex forces many small reads, so the cap is crossed
-    // mid-stream rather than in one shot.
-    let (mut tx, rx) = tokio::io::duplex(64);
-    let payload: Vec<u8> = std::iter::repeat_n(b'x', MAX_MUTATION_OUTPUT_BYTES + 1000).collect();
-    let write = async move {
-        use tokio::io::AsyncWriteExt;
-        tx.write_all(&payload).await.unwrap();
-        tx.shutdown().await.unwrap();
-    };
-    let ((text, dropped), ()) = tokio::join!(drain_capped(Some(rx)), write);
-    assert_eq!(text.len(), MAX_MUTATION_OUTPUT_BYTES, "kept text is capped");
-    assert_eq!(
-        dropped, 1000,
-        "exactly the characters past the cap are counted"
-    );
-}
-
-#[test]
-fn test_count_chars_streaming_is_exact_for_multibyte_split_across_reads() {
-    // 2-byte characters ("é" is U+00E9 = 0xC3 0xA9), so a split can land
-    // in the middle of one.
-    let bytes = "éééééééééé".as_bytes();
-    for cut in 1..bytes.len() {
-        let (a, b) = bytes.split_at(cut);
-        let mut carry = Vec::new();
-        let counted = count_chars_streaming(&mut carry, a)
-            + count_chars_streaming(&mut carry, b)
-            + usize::from(!carry.is_empty());
-        assert_eq!(
-            counted, 10,
-            "split at byte {cut} must still count 10 characters"
-        );
-    }
-    // An invalid byte is one replacement character and is consumed, so
-    // the following valid byte is counted on its own.
-    let mut carry = Vec::new();
-    assert_eq!(count_chars_streaming(&mut carry, &[0xFF, b'a']), 2);
-    assert!(carry.is_empty());
-}
-
 #[test]
 fn test_secret_names_are_classified() {
     assert!(is_secret_path(".env"));
@@ -1257,35 +1151,6 @@ fn test_large_and_binary_files_are_warned() {
             .any(|w| w.contains("MiB") && w.contains("big.bin"))
     );
     assert!(outcome.warnings.iter().any(|w| w.contains("binary")));
-}
-
-#[test]
-fn test_failure_error_redacts_credentials_from_git_output() {
-    // F3: git echoes remote URLs and hook chatter verbatim. A push that
-    // fails against `https://user:token@host/…` must not put the token in
-    // an MCP error message.
-    let error = failure_error(
-        &["push".to_string()],
-        "",
-        "fatal: unable to access 'https://scooter:s3cr3t-token@github.com/o/r.git/': 403\n\
-         remote: Authorization: Bearer abcdef123456\n",
-        0,
-    );
-    let message = error.message_with_hint();
-    assert!(
-        !message.contains("s3cr3t-token"),
-        "URL credentials must be redacted: {message}"
-    );
-    assert!(
-        !message.contains("abcdef123456"),
-        "bearer tokens must be redacted: {message}"
-    );
-    assert!(
-        message.contains("[REDACTED]"),
-        "the redaction is visible, not silently dropped: {message}"
-    );
-    // The words the hook printed that matter are still there.
-    assert!(message.contains("403"), "{message}");
 }
 
 /// The token binds repository state: once HEAD moves, a plan's token must
@@ -1932,15 +1797,15 @@ fn test_a_shared_helper_not_declared_by_main_is_not_claimed_for_the_target() {
     );
 }
 
-/// CodeRabbit round 11 (id 4698955164): a merge that DISAPPEARS between the
-/// capture and the publish must not produce a single-parent commit. The
-/// review's example is `git merge --quit`, which forgets MERGE_HEAD while
-/// leaving HEAD and the index untouched — invisible to the token — and the
-/// old capture then published "the merge" with only HEAD as a parent.
+/// CodeRabbit round 12 (id 4700055376): the publish re-check compared merge
+/// parent IDs by COUNT, so quitting merge A and starting a merge of B left one
+/// entry either way and the check passed — the commit then published with A's
+/// parent while B was what the repository had pending.
 ///
-/// A DIRECTORY named MERGE_HEAD reproduces exactly that state change with no
-/// race: `merge_parent_ids` can no longer read it, so the re-check before
-/// `update-ref` sees zero pending parents where the plan captured one.
+/// A directory named MERGE_HEAD reproduces the observable state change without
+/// a race: the ids can no longer be read, so `<captured>` vs `<empty>` differ
+/// even though the count is "one entry vs none" rather than "one vs one".
+/// The count-only check is what this test would have passed under.
 #[cfg(unix)]
 #[tokio::test]
 async fn test_a_merge_that_vanishes_after_capture_is_refused() {
@@ -1989,4 +1854,117 @@ async fn test_a_merge_that_vanishes_after_capture_is_refused() {
         "nothing may be published when the parents no longer describe the repository"
     );
     std::fs::remove_dir(&merge_head).unwrap();
+}
+
+/// CodeRabbit round 12 (id 4700055376), the case the COUNT check could not see:
+/// one merge is quit and another started, so `MERGE_HEAD` still holds exactly
+/// one id — a different one. The plan captured A; the repository now says B.
+/// The commit must not be published with A's parent.
+#[tokio::test]
+async fn test_a_merge_replaced_by_another_with_the_same_parent_count_is_refused() {
+    let repo = scratch();
+    let root = repo.path();
+    // Two mergeable branches, so MERGE_HEAD can name either.
+    for (branch, file) in [("side_a", "a.txt"), ("side_b", "b.txt")] {
+        git(root, &["checkout", "-q", "-b", branch, "master"]);
+        std::fs::write(root.join(file), "x\n").unwrap();
+        git(root, &["add", file]);
+        git(root, &["commit", "-q", "-m", branch]);
+    }
+    git(root, &["checkout", "-q", "master"]);
+    std::fs::write(root.join("master.txt"), "m\n").unwrap();
+    git(root, &["add", "master.txt"]);
+    git(root, &["commit", "-q", "-m", "master moved"]);
+
+    let merge = isolated_git(root)
+        .args(["merge", "--no-commit", "--no-ff", "side_a"])
+        .output()
+        .expect("git available");
+    assert!(merge.status.success(), "precondition: {:?}", merge.status);
+    let merge_head = isolated_git(root)
+        .args(["rev-parse", "--git-path", "MERGE_HEAD"])
+        .output()
+        .expect("git available");
+    let merge_head = root.join(String::from_utf8_lossy(&merge_head.stdout).trim());
+    let first = std::fs::read_to_string(&merge_head).unwrap();
+    let side_b = isolated_git(root)
+        .args(["rev-parse", "side_b"])
+        .output()
+        .expect("git available");
+    let side_b = String::from_utf8_lossy(&side_b.stdout).trim().to_string();
+    assert_ne!(first.trim(), side_b, "precondition: two different merges");
+
+    let args = json!({ "message": "merge" });
+    let argv = plan_argv_for("commit", root, &args).unwrap();
+    let plan = validated_tree_commit(root, &argv).expect("plan captures merge A");
+    assert_eq!(plan.merge_parents, vec![first.trim().to_string()]);
+
+    // Same COUNT (one id), different id: exactly what a count check misses.
+    std::fs::write(&merge_head, format!("{side_b}\n")).unwrap();
+    let head_before = head_oid(root).unwrap();
+
+    let error = run_validated_commit(root, &plan)
+        .await
+        .expect_err("a different pending merge must not reuse the captured parent");
+    assert!(
+        error.message_with_hint().contains("pending merge changed"),
+        "the refusal must name the cause: {error}"
+    );
+    assert_eq!(
+        head_oid(root).unwrap(),
+        head_before,
+        "nothing may be published when the parent id no longer matches"
+    );
+}
+
+/// CodeRabbit round 12 (id 4700055354): a publish whose outcome cannot be
+/// established must say so and tell the caller to inspect the ref — not
+/// surface a bare git failure that reads like "the commit did not happen".
+///
+/// This covers the `not landed` branch deterministically: deleting the target
+/// ref makes the compare-and-swap fail while leaving the ref naming nothing.
+///
+/// NOT covered by a test, and stated rather than implied: the `landed` branch
+/// (update-ref succeeds then reports failure) needs the
+/// `reference-transaction` hook to STALL past the 300s mutation timeout. A
+/// hook that merely exits non-zero in the `committed` state does not work —
+/// verified against git 2.56.1: git has already completed the transaction and
+/// ignores that exit code, so the command still exits 0.
+#[tokio::test]
+async fn test_a_publish_that_cannot_be_confirmed_directs_the_caller_to_the_ref() {
+    let repo = scratch();
+    let root = repo.path();
+    let args = json!({ "message": "unconfirmable" });
+    let argv = plan_argv_for("commit", root, &args).unwrap();
+    let plan = validated_tree_commit(root, &argv).expect("plan");
+    let head_before = head_oid(root).unwrap();
+
+    // The CAS expects `head_before` on the branch; deleting the ref makes the
+    // old value absent, so update-ref refuses and nothing moves.
+    let git_dir = isolated_git(root)
+        .args(["rev-parse", "--git-path", "refs/heads/master"])
+        .output()
+        .expect("git available");
+    let ref_file = root.join(String::from_utf8_lossy(&git_dir.stdout).trim());
+    std::fs::remove_file(&ref_file).expect("the branch ref exists");
+
+    let error = run_validated_commit(root, &plan)
+        .await
+        .expect_err("an unconfirmed publish must not report success");
+    let text = error.message_with_hint();
+    assert!(
+        text.contains("could not be confirmed") && text.contains("inspect the ref"),
+        "the error must name the uncertainty and point at the ref: {text}"
+    );
+    assert!(
+        !text.contains("was published"),
+        "an unconfirmed publish must not claim the commit landed: {text}"
+    );
+    // The commit object exists (commit-tree ran) but the branch never moved.
+    assert_ne!(
+        resolve_oid(root, "HEAD"),
+        resolve_oid(root, &plan.target_ref),
+        "precondition still holds: the ref is gone, HEAD is the reflog's memory"
+    );
+    let _ = head_before;
 }

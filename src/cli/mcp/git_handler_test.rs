@@ -873,7 +873,11 @@ fn test_with_warnings_deduplicates() {
 /// documented `-d` / `-fd` are buildable now.
 #[test]
 fn test_clean_only_accepts_the_documented_targets() {
-    let repo = scratch_repo();
+    // A plain tempdir, NOT `scratch_repo()`: this test only inspects argv and
+    // validation, never the repository, and `scratch_repo()` runs `git add` +
+    // `git commit` — which an inherited `GIT_INDEX_FILE` would redirect at a
+    // caller's index (CodeRabbit round 12, id 4700055381).
+    let repo = tempfile::tempdir().unwrap();
     for bad in ["-n", "-x", "-X", "-fdx", "-f", "HEAD", "clean"] {
         let error = plan_argv(
             Op::parse("reset").unwrap(),

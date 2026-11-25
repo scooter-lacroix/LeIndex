@@ -15,7 +15,7 @@ use std::time::Duration;
 const MUTATION_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Ceiling on captured stdout/stderr of a mutation, per stream.
-pub(super) const MAX_MUTATION_OUTPUT_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_MUTATION_OUTPUT_BYTES: usize = 256 * 1024;
 
 /// Char budget for a surfaced failure before truncation is counted.
 const FAILURE_CHARS: usize = 4_000;
@@ -24,10 +24,10 @@ const FAILURE_CHARS: usize = 4_000;
 // Execution
 // ---------------------------------------------------------------------------
 
-pub(super) struct MutationOutput {
-    pub(super) stdout: String,
+pub(crate) struct MutationOutput {
+    pub(crate) stdout: String,
     /// Characters dropped from the combined output by the byte cap.
-    pub(super) truncated_chars: usize,
+    pub(crate) truncated_chars: usize,
 }
 
 /// Read a child's pipe to EOF, keeping at most [`MAX_MUTATION_OUTPUT_BYTES`]
@@ -39,7 +39,7 @@ pub(super) struct MutationOutput {
 /// discarded tail. The tail is decoded chunk by chunk with a carry for a
 /// multibyte character split across two reads, so the count is exact and the
 /// discarded text is never held in memory.
-pub(super) async fn drain_capped<R: tokio::io::AsyncRead + Unpin>(
+pub(crate) async fn drain_capped<R: tokio::io::AsyncRead + Unpin>(
     pipe: Option<R>,
 ) -> (String, usize) {
     use tokio::io::AsyncReadExt;
@@ -74,7 +74,7 @@ pub(super) async fn drain_capped<R: tokio::io::AsyncRead + Unpin>(
 /// Count the characters in one piece of a UTF-8 stream, carrying an
 /// unfinished multibyte sequence (up to 3 bytes) into the next call so a
 /// character split across two reads is counted once.
-pub(super) fn count_chars_streaming(carry: &mut Vec<u8>, piece: &[u8]) -> usize {
+pub(crate) fn count_chars_streaming(carry: &mut Vec<u8>, piece: &[u8]) -> usize {
     let mut stream = std::mem::take(carry);
     stream.extend_from_slice(piece);
     let mut rest = stream.as_slice();
@@ -171,7 +171,7 @@ pub(super) fn git_command_sync(root: &Path) -> std::process::Command {
 /// disabled by `GIT_TERMINAL_PROMPT=0` (and `GIT_ASKPASS=echo` as a second
 /// latch); `GIT_EDITOR=true` keeps `merge --no-edit`-class operations from
 /// opening an editor even where a hook or git path tries.
-pub(super) async fn run_mutation_with_env(
+pub(crate) async fn run_mutation_with_env(
     root: &Path,
     argv: &[String],
     index_snapshot: Option<&Path>,
@@ -234,7 +234,7 @@ pub(super) async fn run_mutation_with_env(
 
 /// Run a mutation with no index pin — the plain form every non-commit
 /// operation uses, and what the executor's own tests call.
-pub(super) async fn run_mutation(
+pub(crate) async fn run_mutation(
     root: &Path,
     argv: &[String],
 ) -> Result<MutationOutput, JsonRpcError> {
@@ -246,7 +246,7 @@ pub(super) async fn run_mutation(
 ///
 /// Hook rejections and plain git failures are surfaced the same way — the
 /// caller needs the words the hook printed, not a paraphrase.
-pub(super) fn failure_error(
+pub(crate) fn failure_error(
     argv: &[String],
     stdout: &str,
     stderr: &str,
@@ -285,3 +285,7 @@ pub(super) fn failure_error(
     }
     JsonRpcError::internal_error(message)
 }
+
+#[cfg(test)]
+#[path = "git_apply_exec_test.rs"]
+mod test;

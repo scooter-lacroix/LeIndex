@@ -22,9 +22,7 @@
 //! `allow_sensitive: true`.
 
 // The process-execution half of this module now lives in `git_apply_exec`
-// (this file passed the 2000-line limit). These are the items THIS file uses;
-// the test module imports the rest straight from `git_apply_exec`, so nothing
-// here is a re-export kept alive only for a sibling.
+// (this file passed the 2000-line limit).
 use super::git_apply_exec::{
     MutationOutput, git_command_sync, run_mutation, run_mutation_with_env,
 };
@@ -1053,6 +1051,13 @@ pub(super) struct ValidatedCommit {
     /// Parents for `commit-tree`: HEAD plus every `MERGE_HEAD`, so a merge
     /// commit keeps both parents and the merge is COMPLETED, not bypassed.
     pub parents: Vec<String>,
+    /// The `MERGE_HEAD` ids captured at validation, in file order.
+    ///
+    /// Kept SEPARATELY from `parents` so the publish step can compare ids, not
+    /// a count (CodeRabbit round 12, id 4700055376): quitting merge A and
+    /// starting merge B leaves `MERGE_HEAD` with one entry, so a count check
+    /// passes and the commit is published with A while B is what is pending.
+    pub merge_parents: Vec<String>,
     /// `Some(..)` when a merge was in progress, so the publish step clears it.
     pub merge_head: Option<PathBuf>,
 }
@@ -1210,8 +1215,11 @@ pub(super) fn validated_tree_commit(
                  must commit exactly the validated content",
                 index_path.display()
             ),
-            "Commit with explicit `paths` (a pathspec commit reads the worktree). If the \
-             index itself is damaged, `git fsck` and `git gc` can repair it; then re-plan"
+            "Check that the index is readable and owned by you (a stale lock or a \
+             permission change shows up here). To recover the staged set, stash and \
+             re-stage, or restore the index from a backup; then re-plan. Committing with \
+             explicit `paths` reads the WORKTREE instead, so it does not recover \
+             staged-only changes"
                 .to_string(),
         )
     })?;
@@ -1268,6 +1276,7 @@ pub(super) fn validated_tree_commit(
     // Parents: HEAD, then every MERGE_HEAD line — the same parents
     // `git commit` would record, so a merge is completed rather than lost.
     let mut parents = head.into_iter().collect::<Vec<_>>();
+    let mut merge_parents: Vec<String> = Vec::new();
     if let Some(merge) = &merge_head {
         // An AUTOSTASH merge is refused rather than silently mishandled
         // (CodeRabbit round 11, id 4698955200). Plain `git commit` applies the
@@ -1289,9 +1298,14 @@ pub(super) fn validated_tree_commit(
         let text = std::fs::read_to_string(merge).map_err(|error| {
             JsonRpcError::internal_error(format!("cannot read MERGE_HEAD: {error}"))
         })?;
+        // The merge ids are kept as their OWN list as well as folded into
+        // `parents`: the publish step compares the ids, and a count comparison
+        // cannot tell "merge A" from "merge B replaced it" (CodeRabbit round
+        // 12, id 4700055376).
         for line in text.lines() {
             let oid = line.trim();
             if is_oid(oid) {
+                merge_parents.push(oid.to_string());
                 parents.push(oid.to_string());
             }
         }
@@ -1303,6 +1317,7 @@ pub(super) fn validated_tree_commit(
         target_ref,
         expected_old,
         parents,
+        merge_parents,
         merge_head,
     })
 }
@@ -1495,12 +1510,13 @@ pub(super) async fn run_validated_commit(
     //    expectation, so the update cannot replace a first commit that
     //    appeared after validation.
     //
-    //    A merge that vanished between the capture and here would publish a
-    //    merge commit whose second parent nothing records any more, so the
-    //    parents are re-read and must still match what was captured
-    //    (CodeRabbit round 11, id 4698955164).
-    let merge_parents_captured = plan.parents.len().saturating_sub(1);
-    if merge_parent_ids(root).len() != merge_parents_captured {
+    //    A merge that vanished or was REPLACED between the capture and here
+    //    would publish a merge commit whose recorded parents no longer
+    //    describe the repository, so the ids are re-read and compared
+    //    EXACTLY — a count comparison lets "quit merge A, start merge B"
+    //    through, since both leave one entry (CodeRabbit round 12, ids
+    //    4698955164 and 4700055376).
+    if merge_parent_ids(root) != plan.merge_parents {
         return Err(JsonRpcError::invalid_params_with_suggestion(
             "the pending merge changed after validation; the captured parents no longer \
              describe the repository"
@@ -1515,8 +1531,38 @@ pub(super) async fn run_validated_commit(
         commit.clone(),
         old,
     ];
-    let published = git_run(root, &update, None).await?;
-    let _ = published;
+    // `update-ref` can run a `reference-transaction` hook AFTER the ref has
+    // already moved (CodeRabbit round 12, id 4700055354). A timeout there
+    // returns an error for a commit that IS reachable, so the caller would
+    // skip merge cleanup and never learn the published oid. The ref itself is
+    // the authority: reconcile a failed publish against it before deciding.
+    //
+    // `warnings` is declared BEFORE this block so the late-publish notice can
+    // be recorded on the SAME list the caller receives; a separate list would
+    // have been dropped on the floor.
+    let mut warnings: Vec<String> = Vec::new();
+    if let Err(error) = git_run(root, &update, None).await {
+        // The ref is read back: if it names THIS commit, the transaction
+        // landed and only its hook is unhappy. A publish whose outcome cannot
+        // be established is reported as unknown rather than as a failure, so
+        // the caller inspects the ref instead of retrying blind.
+        match resolve_oid(root, &plan.target_ref) {
+            landed if landed == commit => warnings.push(format!(
+                "commit {commit} was published, but `git update-ref` did not report success \
+                 ({error}); the ref already names it, so do NOT retry — inspect \
+                 `{}` if the repository looks inconsistent",
+                plan.target_ref
+            )),
+            _ => {
+                return Err(JsonRpcError::internal_error(format!(
+                    "publishing {} could not be confirmed: `git update-ref` failed ({error}) \
+                     and the ref does not name the new commit — inspect the ref before \
+                     retrying, the write may have been partially applied",
+                    plan.target_ref
+                )));
+            }
+        }
+    }
 
     // A merge is complete only once MERGE_HEAD is cleared, exactly as
     // `git commit` would. Clearing AFTER the ref moved keeps a failed
@@ -1527,7 +1573,6 @@ pub(super) async fn run_validated_commit(
     // But a MERGE_HEAD left behind makes git think the merge is still pending,
     // so the failure is REPORTED to the caller instead of discarded (Kilo
     // round 11, id 4698809233).
-    let mut warnings = Vec::new();
     if let Some(merge) = &plan.merge_head
         && let Err(error) = std::fs::remove_file(merge)
         && error.kind() != std::io::ErrorKind::NotFound
