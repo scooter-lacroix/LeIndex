@@ -707,53 +707,6 @@ fn relative_to(root: &Path, raw: &str) -> String {
 mod shape;
 use shape::{exists_result, looks_like_regex, parse_resume_cursors, retry_note, shape_text_result};
 
-fn filter_callsites_rows(files: &mut [Value], pattern: &str, limit: Option<usize>) -> usize {
-    let name = pattern.trim_end_matches('(');
-    let definition_marker = format!("{name}(");
-    const DEFINITION_KEYWORDS: [&str; 7] =
-        ["fn", "function", "def", "func", "class", "struct", "impl"];
-    let mut callsites = 0usize;
-    for file in files.iter_mut() {
-        let kept = file
-            .get_mut("hits")
-            .and_then(Value::as_array_mut)
-            .map_or(0, |hits| {
-                hits.retain(|hit| {
-                    let Some(text) = hit.get("text").and_then(Value::as_str) else {
-                        return true;
-                    };
-                    let trimmed = text.trim_start();
-                    let Some(marker_pos) = trimmed.find(&definition_marker) else {
-                        return true;
-                    };
-                    !trimmed[..marker_pos]
-                        .split_whitespace()
-                        .any(|token| DEFINITION_KEYWORDS.contains(&token))
-                });
-                hits.len()
-            });
-        file["matches"] = json!(kept);
-        callsites += kept;
-    }
-    if let Some(limit) = limit {
-        let mut remaining = limit;
-        for file in files.iter_mut() {
-            let Some(hits) = file.get_mut("hits").and_then(Value::as_array_mut) else {
-                continue;
-            };
-            if hits.len() > remaining {
-                hits.truncate(remaining);
-            }
-            remaining -= hits.len();
-            file["matches"] = json!(hits.len());
-            if remaining == 0 {
-                break;
-            }
-        }
-    }
-    callsites
-}
-
 /// §4.2f `output=callsites`: the engine searched `name(` as a literal
 /// pattern; drop the rows that are the definition itself (the
 /// `fn`/`function`/`def` line naming the pattern) so what remains is the
@@ -1910,6 +1863,63 @@ mod tests {
             .collect();
         assert!(!hits.is_empty(), "a call must appear on page 1");
         assert!(hits.iter().all(|t| !t.trim_start().starts_with("pub fn")));
+    }
+
+    /// Codex round 5 (id 4688435750): the page limit truncates hits the engine
+    /// already fetched, and the old callsite filter then reported `has_more`
+    /// from the ENGINE's flag — which is false when the fetched slack window
+    /// was not exceeded. With `limit: 1` and exactly two call lines in one
+    /// file, the second call was dropped and the page said `has_more: false`,
+    /// so no continuation could ever reach it.
+    #[tokio::test]
+    async fn test_find_callsites_truncated_by_the_limit_stay_reachable() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two CALL lines (no definition at all), so nothing is removed by the
+        // definition filter: the only cut is the page limit.
+        std::fs::write(
+            dir.path().join("two_calls.rs"),
+            "fn a() {\n    parse_config();\n    parse_config();\n}\n",
+        )
+        .unwrap();
+        let first = run(
+            dir.path(),
+            json!({"pattern": "parse_config", "output": "callsites", "limit": 1}),
+        )
+        .await;
+        let first_hits: Vec<u64> = first["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|f| f["hits"].as_array().into_iter().flatten())
+            .filter_map(|h| h["line"].as_u64())
+            .collect();
+        assert_eq!(first_hits.len(), 1, "the limit shows one call: {first}");
+        assert_eq!(
+            first["has_more"], true,
+            "a call was fetched and cut, so the page is not final: {first}"
+        );
+        let token = first["next"]
+            .as_str()
+            .expect("a truncated callsite page must issue a continuation");
+
+        // Following the token must reach the second call.
+        let second = run(dir.path(), json!({ "next": token, "limit": 1 })).await;
+        let second_hits: Vec<u64> = second["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|f| f["hits"].as_array().into_iter().flatten())
+            .filter_map(|h| h["line"].as_u64())
+            .collect();
+        assert_eq!(
+            second_hits.len(),
+            1,
+            "the withheld call must be delivered next: {second}"
+        );
+        assert_ne!(
+            first_hits, second_hits,
+            "the second page must show the OTHER call, not the same one again"
+        );
     }
 
     /// #089: the ignore regression runs against a REAL Git worktree, so the

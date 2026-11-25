@@ -26,7 +26,7 @@ use super::git_handler::{plan_argv_for, preview_token};
 use super::helpers::validate_file_within_project;
 use super::protocol::JsonRpcError;
 use serde_json::{Value, json};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Hard timeout for one mutating git command. A hung credential prompt or a
@@ -405,9 +405,17 @@ pub(crate) fn add_argv(outcome: &StagingOutcome) -> Vec<String> {
 ///
 /// Covers both "the index hash" and "the staged set" from the brief in one
 /// deterministic digest; any stage/unstage/rm changes it.
+///
+/// The inventory is taken at the WORKTREE ROOT, not at `root`. `git ls-files`
+/// run from a subdirectory lists only that subtree, yet a `commit` with no
+/// `paths` commits the whole staged set — so staging a sibling after the plan
+/// left HEAD and this digest untouched and let the old token authorize a
+/// commit containing changes the plan never showed. Verified: from a member
+/// directory the listing is byte-identical before and after staging a sibling,
+/// while `git diff --cached` there names that sibling.
 fn index_digest(root: &Path) -> Result<String, JsonRpcError> {
     let (text, _) = super::git_diff_handler::git_output_capped(
-        root,
+        &index_root(root),
         &["ls-files".to_string(), "-s".to_string()],
         MAX_DIFF_BYTES,
     )
@@ -418,6 +426,21 @@ fn index_digest(root: &Path) -> Result<String, JsonRpcError> {
         digest.update(b"\n");
     }
     Ok(digest.finalize().to_hex().to_string())
+}
+
+/// The directory whose index `index_digest` must hash: the worktree root that
+/// `git` resolves for `root`, or `root` itself when git cannot say (not a
+/// repository, or `rev-parse` unavailable).
+fn index_root(root: &Path) -> PathBuf {
+    super::git_diff_handler::git_output_capped(
+        root,
+        &["rev-parse".to_string(), "--show-toplevel".to_string()],
+        4096,
+    )
+    .ok()
+    .map(|(text, _)| PathBuf::from(text.trim()))
+    .filter(|toplevel| !toplevel.as_os_str().is_empty() && toplevel.is_dir())
+    .unwrap_or_else(|| root.to_path_buf())
 }
 
 /// HEAD commit oid, when the repository has one.
@@ -979,6 +1002,52 @@ mod test {
         git(dir.path(), &["add", "."]);
         git(dir.path(), &["commit", "-q", "-m", "one"]);
         dir
+    }
+
+    /// Codex round 5 (id 4688435762): the token's index digest was taken with
+    /// `git ls-files` run from whatever `root` the caller named. When that
+    /// root is a SUBDIRECTORY of the repository, the listing covers only that
+    /// subtree — yet a `commit` with no `paths` commits the repository-wide
+    /// staged set. Staging a sibling after the plan therefore left HEAD and
+    /// the digest untouched, and the reviewed token authorized a commit
+    /// containing changes the plan never showed.
+    ///
+    /// The digest must cover the whole worktree index.
+    #[test]
+    fn test_index_digest_covers_the_worktree_not_just_the_named_subdirectory() {
+        let repo = scratch();
+        let toplevel = repo.path();
+        let member = toplevel.join("member");
+        std::fs::create_dir_all(&member).unwrap();
+        git(toplevel, &["config", "commit.gpgSign", "false"]);
+        std::fs::write(member.join("a.txt"), "a\n").unwrap();
+        std::fs::write(toplevel.join("sibling.txt"), "s\n").unwrap();
+        git(toplevel, &["add", "."]);
+        git(toplevel, &["commit", "-q", "-m", "two"]);
+
+        let before = index_digest(&member).expect("digest from the subdirectory");
+        // The digest of the subdirectory and of the worktree root agree on a
+        // clean tree: both name the same repository state.
+        assert_eq!(
+            before,
+            index_digest(toplevel).expect("digest from the root"),
+            "a subdirectory's digest must be the worktree's digest"
+        );
+
+        // Stage a SIBLING of the subdirectory. A commit issued from `member`
+        // with no `paths` would include it, so the digest MUST move.
+        std::fs::write(toplevel.join("sibling.txt"), "changed\n").unwrap();
+        git(toplevel, &["add", "sibling.txt"]);
+        let after = index_digest(&member).expect("digest after staging the sibling");
+        assert_ne!(
+            before, after,
+            "staging a sibling changed what a commit would carry, so the token's state must change too"
+        );
+        assert_eq!(
+            after,
+            index_digest(toplevel).expect("root digest after staging"),
+            "the subdirectory digest tracks the worktree index"
+        );
     }
 
     /// A tracked file deleted from the worktree is invisible to the

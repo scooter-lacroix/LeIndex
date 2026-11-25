@@ -22,7 +22,7 @@ pub(super) fn shape_text_result(
     // `callsites` is a hit page with definition lines dropped afterwards;
     // it shares the `matches` shaping end to end.
     let hit_page = output_mode == "matches" || output_mode == "callsites";
-    let (mut files_json, symbol_totals, file_rows, cursor_keys) =
+    let (files_json, symbol_totals, file_rows, cursor_keys) =
         collect_file_rows(&result, primary, output_mode, window.include_tests);
     let zero_hit = stats.match_lines == 0;
 
@@ -56,22 +56,30 @@ pub(super) fn shape_text_result(
     let zero_hit_ended = hit_page && result.has_more && result.returned == 0 && !ceiling_ended;
     match output_mode {
         "matches" | "callsites" => {
-            if output_mode == "callsites" {
-                // §4.2f: select callsites BEFORE the result limit applies — a
-                // definition that consumes a page slot must not crowd out a
-                // call. The engine fetched a slack window (see `run`), so the
-                // calls that remain still fill the requested page.
-                filter_callsites_rows(
-                    &mut files_json,
-                    pattern,
-                    Some(window.limit.unwrap_or(MAX_LIMIT)),
-                );
-            }
             // §4.2c: test files rank after source files on every page.
             let mut zipped: Vec<(Value, String)> =
                 files_json.into_iter().zip(cursor_keys).collect();
             if window.include_tests {
                 zipped.sort_by_key(|(file, _)| is_test_path(file_path_of(file)));
+            }
+            // §4.2f: select callsites BEFORE the result limit applies — a
+            // definition that consumes a page slot must not crowd out a
+            // call. The engine fetched a slack window (see `run`), so the
+            // calls that remain still fill the requested page.
+            //
+            // The page limit can cut hits the engine already fetched and
+            // counted. Those hits are NOT delivered, so the page must say
+            // there is more (an engine `has_more` of false only means its own
+            // slack window was not exceeded) and the per-file cursor must not
+            // claim them (a cursor that claims delivery makes the next page
+            // skip them: the silent drop this map exists to prevent).
+            let mut truncated: BTreeMap<String, usize> = BTreeMap::new();
+            if output_mode == "callsites" {
+                truncated = filter_callsites_rows(
+                    &mut zipped,
+                    pattern,
+                    Some(window.limit.unwrap_or(MAX_LIMIT)),
+                );
             }
             let (files_json, cursor_keys): (Vec<Value>, Vec<String>) = zipped.into_iter().unzip();
             let visible_returned = (output_mode == "callsites").then(|| {
@@ -80,6 +88,10 @@ pub(super) fn shape_text_result(
                     .filter_map(|file| file.get("hits").and_then(Value::as_array).map(Vec::len))
                     .sum()
             });
+            let delivered = Delivered {
+                truncated,
+                visible: visible_returned,
+            };
             shape_matches_page(
                 &mut value,
                 &result,
@@ -90,7 +102,7 @@ pub(super) fn shape_text_result(
                 cursor_keys,
                 window.token_budget.unwrap_or(0),
                 query_args,
-                visible_returned,
+                &delivered,
             );
         }
         "files" => shape_rows_page(
@@ -381,6 +393,107 @@ pub(super) fn parse_resume_cursors(args: &Value) -> BTreeMap<String, usize> {
         .unwrap_or_default()
 }
 
+/// Drop definition rows from a callsites page and apply the page limit.
+///
+/// Returns, per engine cursor key, how many hits this page CUT that the engine
+/// had already fetched. Those hits were not delivered, so the caller must keep
+/// advertising a continuation for them and must not let the cursor claim them
+/// (Codex round 5, id 4688435750: with `limit: 1` and exactly two calls in a
+/// file, the second was truncated while `has_more` stayed false — unreachable
+/// through any continuation).
+pub(super) fn filter_callsites_rows(
+    rows: &mut [(Value, String)],
+    pattern: &str,
+    limit: Option<usize>,
+) -> BTreeMap<String, usize> {
+    let mut truncated: BTreeMap<String, usize> = BTreeMap::new();
+    let name = pattern.trim_end_matches('(');
+    let definition_marker = format!("{name}(");
+    // A definition line names the function after one of these keywords
+    // ("pub fn", "async def", "export function", ...). A bare modifier is
+    // not enough, and a call at line start has an empty prefix, which is a
+    // call — not a vacuous definition.
+    const DEFINITION_KEYWORDS: [&str; 7] =
+        ["fn", "function", "def", "func", "class", "struct", "impl"];
+    let mut kept_per_row: Vec<usize> = Vec::with_capacity(rows.len());
+    for (file, _) in rows.iter_mut() {
+        let kept = file
+            .get_mut("hits")
+            .and_then(Value::as_array_mut)
+            .map_or(0, |hits| {
+                hits.retain(|hit| {
+                    let Some(text) = hit.get("text").and_then(Value::as_str) else {
+                        return true;
+                    };
+                    let trimmed = text.trim_start();
+                    let Some(marker_pos) = trimmed.find(&definition_marker) else {
+                        return true;
+                    };
+                    !trimmed[..marker_pos]
+                        .split_whitespace()
+                        .any(|token| DEFINITION_KEYWORDS.contains(&token))
+                });
+                hits.len()
+            });
+        file["matches"] = json!(kept);
+        kept_per_row.push(kept);
+    }
+    let Some(limit) = limit else {
+        return truncated;
+    };
+    // The budget is spent in rank order. Once it runs out, every later row is
+    // fetched-but-not-delivered, so its cursor must not advance past hits the
+    // client never saw — track where that happens.
+    let mut spent_at: Option<usize> = None;
+    let mut remaining = limit;
+    for (index, (file, _)) in rows.iter_mut().enumerate() {
+        if remaining == 0 {
+            spent_at = Some(index);
+            break;
+        }
+        let Some(hits) = file.get_mut("hits").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        if hits.len() > remaining {
+            hits.truncate(remaining);
+        }
+        remaining -= hits.len();
+        file["matches"] = json!(hits.len());
+    }
+    for (index, ((file, key), kept)) in rows.iter_mut().zip(kept_per_row).enumerate() {
+        if spent_at.is_some_and(|spent| index > spent) {
+            // Nothing from this row was delivered: its whole tail is withheld.
+            if kept > 0 && !key.is_empty() {
+                truncated.insert(key.clone(), kept);
+            }
+            continue;
+        }
+        let shown = file
+            .get("hits")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        let dropped = kept.saturating_sub(shown);
+        if dropped > 0 && !key.is_empty() {
+            truncated.insert(key.clone(), dropped);
+        }
+    }
+    truncated
+}
+
+/// What a page ACTUALLY delivered, when that differs from what the engine
+/// fetched: hits the page limit cut (`truncated`, per cursor key) and, for
+/// callsites, the count of call lines left after definitions were dropped.
+///
+/// Both values exist because the engine's own numbers cannot express them: it
+/// counts what it fetched, and a callsites page drops definitions after that.
+#[derive(Default)]
+pub(super) struct Delivered {
+    /// Per engine cursor key: hits fetched but CUT by the page limit.
+    pub truncated: BTreeMap<String, usize>,
+    /// Call lines the page shows, when a later filter (not the engine) decided.
+    pub visible: Option<usize>,
+}
+
 /// The `matches` response page: hit lists plus the paging/truncation signals.
 pub(super) fn shape_matches_page(
     value: &mut Value,
@@ -392,19 +505,24 @@ pub(super) fn shape_matches_page(
     cursor_keys: Vec<String>,
     token_budget: usize,
     query_args: &Value,
-    visible_returned: Option<usize>,
+    delivered: &Delivered,
 ) {
     let offered = files.len();
     trim_to_budget(&mut files, token_budget);
     let shown = files.len();
     let budget_ended = shown < offered;
     let stream_ended = ceiling_ended || zero_hit_ended;
+    let truncated = &delivered.truncated;
     value["returned"] = json!(result.returned);
     value["offset"] = json!(offset);
     value["files"] = Value::Array(files);
     let more = result.has_more && !stream_ended;
-    value["has_more"] = json!(more || budget_ended);
-    if more || budget_ended {
+    // A page the caller's own limit cut is not final even when the engine's
+    // slack window was not exceeded: the hits exist, were fetched, and were
+    // dropped here. Say so, or the continuation is never issued.
+    let limit_truncated = !truncated.is_empty();
+    value["has_more"] = json!(more || budget_ended || limit_truncated);
+    if more || budget_ended || limit_truncated {
         // §4.2d/§6.8: the token carries per-file resume cursors, and they
         // must reflect ONLY what this page actually delivered. Rows the
         // token budget trimmed away were NOT delivered, so their resume
@@ -431,7 +549,15 @@ pub(super) fn shape_matches_page(
                 .filter(|(key, _)| {
                     kept_keys.contains(key.as_str()) || !offered_keys.contains(key.as_str())
                 })
-                .map(|(key, value)| (key.clone(), json!(value)))
+                .map(|(key, value)| {
+                    // A hit the page limit cut was FETCHED (so the engine
+                    // counted it as delivered) but never SHOWN, so the cursor
+                    // has to step back over it or the next page skips it.
+                    let withheld = truncated.get(key).copied().unwrap_or(0);
+                    let delivered = value.saturating_sub(withheld);
+                    (key.clone(), json!(delivered))
+                })
+                .filter(|(_, value)| value.as_u64().is_some_and(|shown| shown > 0))
                 .collect();
             if map.is_empty() {
                 Value::Null
@@ -442,7 +568,7 @@ pub(super) fn shape_matches_page(
         // The stream moves by the hits actually delivered. For callsites the
         // engine's returned count includes definitions that were dropped, so
         // the handler's own filtered count rules there.
-        let delivered = visible_returned.unwrap_or(result.returned);
+        let delivered = delivered.visible.unwrap_or(result.returned);
         let next_offset = if budget_ended {
             offset + shown
         } else {
