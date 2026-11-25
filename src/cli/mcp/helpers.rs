@@ -58,7 +58,16 @@ pub(crate) fn validate_file_within_project(
     let canonical = candidate.canonicalize().map_err(|e| {
         JsonRpcError::invalid_params(format!("Cannot resolve file path '{}': {}", file_path, e))
     })?;
-    if !canonical.starts_with(project_root) {
+    // Compare CANONICAL against CANONICAL. `canonical` has already had its
+    // symlinks resolved, but `project_root` had not: when the root itself is a
+    // symlink (a linked workspace, `/tmp` on macOS, a symlinked home) every
+    // legitimate file inside it was refused as "outside the project boundary".
+    // Resolving the root first keeps the containment check exact without
+    // rejecting the project's own files.
+    let canonical_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    if !canonical.starts_with(&canonical_root) {
         return Err(JsonRpcError::invalid_params(format!(
             "File '{}' is outside the project boundary '{}'",
             file_path,
@@ -1069,6 +1078,35 @@ mod tests {
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
         assert!(err_msg.contains("outside the project boundary"));
+    }
+
+    /// A symlinked project root must not reject its OWN files. The boundary
+    /// check canonicalises the candidate but used to compare it against the
+    /// RAW root, so `canonical=/real/src/a.rs` never started with
+    /// `/link` and every legitimate edit through a linked workspace was
+    /// refused as "outside the project boundary".
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_file_within_project_accepts_a_symlinked_root() {
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        std::fs::write(real.join("src/a.rs"), "fn a() {}\n").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let result = validate_file_within_project("src/a.rs", &link);
+        assert!(
+            result.is_ok(),
+            "a file inside a symlinked project root is INSIDE the project: {result:?}"
+        );
+        // …and the escape hatch the check exists for still closes.
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "s").unwrap();
+        assert!(
+            validate_file_within_project("../secret.txt", &real).is_err(),
+            "a path escaping the root must still be refused"
+        );
     }
 
     #[test]
