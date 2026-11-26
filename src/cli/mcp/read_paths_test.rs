@@ -622,3 +622,90 @@ fn test_elide_reports_only_the_focus_lines_actually_served() {
     let none = elide_around(ELIDE_SRC, &symbols, "focus", "fixture.rs", 4).unwrap();
     assert_eq!((none.served_start_line, none.served_end_line), (0, 0));
 }
+
+// =============================================================================
+// Handles for filenames that contain the fragment separator
+// =============================================================================
+
+/// A filename with a literal `#` must produce a handle that parses back to
+/// that file.
+///
+/// Rendered naively, `a#b.rs` yields `a#b.rs#L1-2`; `parse_read_handle` splits
+/// at the FIRST `#`, so it resolves file `a` with symbol `b.rs#L1-2` and the
+/// re-read fails on a path that does not exist — although the plain read that
+/// produced the handle succeeded. The handle is only useful if it round-trips.
+#[test]
+fn test_handle_for_range_round_trips_a_hash_in_the_filename() {
+    let root = Path::new("/proj");
+    let file = root.join("a#b.rs");
+    let handle = handle_for_range(&file, Some(root), 1, 2);
+    assert_eq!(handle, "a%23b.rs#L1-2", "the file part must be escaped");
+
+    let parsed = parse_read_handle(&handle, Some(root));
+    assert_eq!(parsed.file_path, "/proj/a#b.rs");
+    assert_eq!(parsed.line_range, Some((1, 2)));
+    assert_eq!(parsed.symbol, None, "a filename `#` is not a symbol marker");
+}
+
+/// A literal `%` must survive too, and must not be mistaken for the start of
+/// an escape — including the pathological `%23` sequence, which a
+/// decode-before-split would turn into a `#` and cut the path in half.
+#[test]
+fn test_handle_for_range_round_trips_a_percent_in_the_filename() {
+    let root = Path::new("/proj");
+    for name in ["100%.rs", "a%23b.rs", "a%20b.rs"] {
+        let file = root.join(name);
+        let handle = handle_for_range(&file, Some(root), 3, 9);
+        let parsed = parse_read_handle(&handle, Some(root));
+        assert_eq!(
+            parsed.file_path,
+            format!("/proj/{name}"),
+            "handle {handle} must resolve back to {name}"
+        );
+        assert_eq!(parsed.line_range, Some((3, 9)));
+    }
+}
+
+/// A path with no `%` or `#` must render EXACTLY as before, so the escape
+/// does not churn every existing handle.
+#[test]
+fn test_escape_handle_path_leaves_ordinary_paths_untouched() {
+    for raw in ["src/lib.rs", "/tmp/log.txt", "a b/c.ts", "weird$name!.rs"] {
+        assert_eq!(escape_handle_path(raw), raw);
+    }
+}
+
+/// The expand handles inside an elided read carry the SAME escaping as the
+/// served range handle: both are offered to the caller as re-readable.
+#[test]
+fn test_elided_expand_handles_escape_the_file_label() {
+    // A sibling is included so the body actually CONTAINS `[expand: …]`
+    // markers to check; a file with only the focus emits none.
+    let symbols = vec![
+        symbol_at(ELIDE_SRC, "sibling", "pub fn sibling"),
+        symbol_at(ELIDE_SRC, "focus", "pub fn focus"),
+    ];
+    let out = elide_around(ELIDE_SRC, &symbols, "focus", "a#b.rs", 200).unwrap();
+    assert_eq!(
+        out.expand, "a%23b.rs#focus",
+        "the focus expand handle must escape the file part"
+    );
+    let parsed = parse_read_handle(&out.expand, Some(Path::new("/proj")));
+    assert_eq!(parsed.file_path, "/proj/a#b.rs");
+    assert_eq!(parsed.symbol.as_deref(), Some("focus"));
+    // The body's `[expand: …]` markers agree: exactly one `#` per handle, so
+    // the separator is the only delimiter the parser can find.
+    let mut seen = 0;
+    for line in out.body.lines() {
+        if let Some(rest) = line.split("[expand: ").nth(1) {
+            let handle = rest.trim_end_matches(']');
+            seen += 1;
+            assert_eq!(
+                handle.matches('#').count(),
+                1,
+                "handle {handle} must contain exactly one separator"
+            );
+        }
+    }
+    assert!(seen > 0, "the elided body must still emit expand handles");
+}

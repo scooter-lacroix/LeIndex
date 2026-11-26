@@ -168,6 +168,14 @@ pub(super) fn git_command(root: &Path) -> tokio::process::Command {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(std::process::Stdio::null());
+    // Own process group, so a timed-out mutation can be killed as a TREE.
+    // Without this, `start_kill()` reaches only git itself: a pre-commit hook
+    // (or anything the hook spawned) survives, keeps writing the worktree or
+    // holding `.git/index.lock` while the caller is told the operation was
+    // killed. The pgid is the leader's own pid because `process_group(0)`
+    // makes the child its own group leader.
+    #[cfg(unix)]
+    command.process_group(0);
     command
 }
 
@@ -211,6 +219,11 @@ pub(crate) async fn run_mutation_with_env(
         .map_err(|error| JsonRpcError::internal_error(format!("failed to spawn git: {error}")))?;
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
+    // Captured NOW, not at teardown: `process_group(0)` makes the child its
+    // own group leader, so its pid IS the pgid — but once the child is reaped
+    // `Child::id()` returns None and the group signal would be skipped.
+    #[cfg(unix)]
+    let pgid = child.id().map(|id| id as libc::pid_t);
 
     // Output collection and process execution share ONE deadline. Reading
     // one pipe to EOF before touching the other deadlocks when a hook fills
@@ -234,9 +247,24 @@ pub(crate) async fn run_mutation_with_env(
             )));
         }
         Err(_) => {
+            // Kill the GROUP, not just git. A hook that outlived its parent
+            // keeps writing the worktree and holding `.git/index.lock`, so the
+            // caller is told the mutation was killed while its side effects
+            // continue — and a retry then fails on the stale lock.
+            #[cfg(unix)]
+            if let Some(pgid) = pgid {
+                // SAFETY: plain signal delivery to the group created above by
+                // `process_group(0)`; no memory is touched.
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
+            }
             let _ = child.start_kill();
+            // Reap before returning so no zombie is left behind and the group
+            // signal lands before the pid can be recycled.
+            let _ = child.wait().await;
             return Err(JsonRpcError::internal_error(format!(
-                "git {} was killed after the {}s mutation timeout",
+                "git {} was killed after the {}s mutation timeout (process group signalled)",
                 argv.join(" "),
                 MUTATION_TIMEOUT.as_secs()
             )));

@@ -79,7 +79,15 @@ pub(crate) fn parse_read_handle(raw: &str, project_root: Option<&Path>) -> ReadH
     // (a filename like `a b#c.rs`), never a fragment separator — decoding
     // before the split would cut the file part at the escaped `#`.
     let (file_part, fragment) = split_read_fragment(raw);
-    let decode = |part: &str| part.replace("%20", " ").replace("%23", "#");
+    // Decode in the REVERSE order of [`escape_handle_path`]'s escaping, so a
+    // filename that literally contains `%23` survives the round trip: the
+    // emitted form is `%2523`, which contains no `%23` substring, and only
+    // the final `%25` step turns it back into `%23`.
+    let decode = |part: &str| {
+        part.replace("%23", "#")
+            .replace("%20", " ")
+            .replace("%25", "%")
+    };
     let decoded_file = decode(&file_part);
     let decoded_fragment = fragment.as_deref().map(decode);
 
@@ -140,12 +148,43 @@ pub(crate) fn handle_for_range(
 /// Project-relative display when the file is under the root, absolute path
 /// otherwise. Handles read back identically via [`parse_read_handle`].
 fn display_path(file_path: &Path, project_root: Option<&Path>) -> String {
-    if let Some(root) = project_root
+    let raw = if let Some(root) = project_root
         && let Ok(rel) = file_path.strip_prefix(root)
     {
-        return rel.to_string_lossy().into_owned();
+        rel.to_string_lossy().into_owned()
+    } else {
+        file_path.to_string_lossy().into_owned()
+    };
+    escape_handle_path(&raw)
+}
+
+/// Escape the FILE portion of a handle so it cannot be mistaken for the
+/// fragment separator.
+///
+/// `parse_read_handle` splits at the FIRST `#`, so a file literally named
+/// `a#b.rs` rendered naively as `a#b.rs#L1-2` parses back as file `a` with
+/// symbol `b.rs#L1-2` — the read then fails on a path that does not exist,
+/// even though reading the file BY PATH had succeeded. Every handle this
+/// module emits therefore escapes:
+///
+///   `%` -> `%25`   first, so a literal `%23` in a name is not decoded twice
+///   `#` -> `%23`
+///
+/// Ordinary paths (no `%`, no `#`) are returned unchanged, so existing
+/// handles keep their exact previous form.
+pub(crate) fn escape_handle_path(raw: &str) -> String {
+    if !raw.contains('%') && !raw.contains('#') {
+        return raw.to_string();
     }
-    file_path.to_string_lossy().into_owned()
+    let mut out = String::with_capacity(raw.len() + 8);
+    for ch in raw.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            '#' => out.push_str("%23"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 // =============================================================================
@@ -329,6 +368,11 @@ pub(crate) fn elide_around(
     file_label: &str,
     max_lines: usize,
 ) -> Result<ElidedOutput, String> {
+    // Every handle this function writes embeds the file label, so escape it
+    // ONCE here: a file named `a#b.rs` otherwise emits `a#b.rs#sym`, which
+    // `parse_read_handle` splits at the first `#` into file `a` + symbol
+    // `b.rs#sym` — an unopenable handle the caller was invited to use.
+    let file_label = &escape_handle_path(file_label);
     let spans = spans_with_lines(content, symbols);
     let focus_span = find_span(&spans, focus)
         .ok_or_else(|| format!("focus_symbol '{focus}' not found in file"))?

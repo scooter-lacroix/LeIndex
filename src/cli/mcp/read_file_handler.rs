@@ -615,7 +615,15 @@ Works for any absolute path, including outside the project — no index required
                     "signature": item.signature,
                     "line": item.start_line,
                     "lines": item.line_count,
-                    "expand": format!("{file_label}#{}", item.name),
+                    // Same escaping as the body's `[expand: …]` marker and as
+                    // `ElidedOutput.expand`: a raw label would emit
+                    // `a#b.rs#sym`, which `parse_read_handle` splits at the
+                    // FIRST `#` into file `a` + symbol `b.rs#sym`.
+                    "expand": format!(
+                        "{}#{}",
+                        read_paths::escape_handle_path(&file_label),
+                        item.name
+                    ),
                 })).collect::<Vec<_>>(),
                 "retrieval": serde_json::json!({
                     "tfidf_status": "not_used_exact",

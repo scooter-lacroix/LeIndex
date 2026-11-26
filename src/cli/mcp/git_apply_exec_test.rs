@@ -179,3 +179,144 @@ fn test_failure_error_redacts_credentials_from_git_output() {
     // The words the hook printed that matter are still there.
     assert!(message.contains("403"), "{message}");
 }
+
+/// The mutation child must be its OWN process-group leader, or the timeout
+/// path has nothing to signal as a group.
+///
+/// `run_mutation` used to call `start_kill()` only. On Unix that reaps git and
+/// leaves everything git spawned — a pre-commit hook's descendants — running
+/// after the caller was told the mutation was killed, so a hook could keep
+/// writing the worktree or holding `.git/index.lock` while a retry ran. The
+/// fix puts the child in a new process group (`process_group(0)`) and signals
+/// `-pgid`. This asserts the precondition: without it, `libc::kill(-pgid)`
+/// either fails or hits the TEST runner's own group.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_git_command_child_leads_its_own_process_group() {
+    let repo = scratch();
+    let mut command = git_command(repo.path());
+    command
+        .args(["rev-parse", "--show-toplevel"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = command.spawn().expect("git available");
+    let pid = child.id().expect("child is alive") as libc::pid_t;
+
+    // Field 5 of /proc/<pid>/stat is the process-group id. Read it from the
+    // kernel rather than trusting `Command::process_group`'s own bookkeeping.
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("/proc stat");
+    // The comm field is parenthesised and may contain spaces, so split after
+    // the LAST ')' before counting fields.
+    let after_comm = stat.rsplit_once(')').expect("comm field").1;
+    let pgid: libc::pid_t = after_comm
+        .split_whitespace()
+        .nth(2)
+        .expect("pgid field")
+        .parse()
+        .expect("numeric pgid");
+
+    assert_eq!(
+        pgid, pid,
+        "the mutation child must lead its own group (pgid {pgid}, pid {pid}); a shared group \
+         makes the timeout group-kill either a no-op or a hit on the test runner"
+    );
+    // Our own process must NOT be in that group, or the same kill would take
+    // the whole test binary down with a hook.
+    let own_pgid = unsafe { libc::getpgid(0) };
+    assert_ne!(pgid, own_pgid, "child must not share the parent's group");
+
+    let _ = child.wait().await;
+}
+
+/// Signalling `-pgid` must reap a GRANDCHILD that survived its parent, which
+/// is exactly the case `start_kill()` alone missed: a hook outliving git.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_process_group_kill_reaps_a_grandchild_that_outlives_its_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("hook-writes.log");
+    let child_pid_file = dir.path().join("gc.pid");
+
+    // `sh` spawns a background writer (the "hook descendant") and exits
+    // immediately, so by the time we kill there is no live direct child —
+    // the same shape as a hook that daemonised past its git parent.
+    let mut command = tokio::process::Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg(format!(
+            "sh -c 'while true; do echo tick >> {marker}; sleep 0.05; done' & \
+             echo $! > {pid}; exit 0",
+            marker = marker.display(),
+            pid = child_pid_file.display(),
+        ))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    command.process_group(0);
+    let mut child = command.spawn().expect("sh available");
+    let pgid = child.id().expect("child alive") as libc::pid_t;
+    let _ = child.wait().await;
+
+    // Wait for the grandchild to actually start writing, so a pass cannot be
+    // a false positive from "it never ran".
+    let grandchild: libc::pid_t = (0..100)
+        .find_map(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::fs::read_to_string(&child_pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+        })
+        .expect("grandchild pid recorded");
+    let mut saw_output = false;
+    for _ in 0..100 {
+        if std::fs::metadata(&marker)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false)
+        {
+            saw_output = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(saw_output, "the descendant must be writing before the kill");
+
+    // The production teardown: signal the whole group.
+    // SAFETY: plain signal delivery to the group created by
+    // `process_group(0)` above; no memory is touched.
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
+
+    // The grandchild must be gone (or a zombie awaiting its reaper), and must
+    // have STOPPED writing.
+    let mut stopped = false;
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let alive = std::fs::read_to_string(format!("/proc/{grandchild}/stat"))
+            .map(|s| {
+                let state = s
+                    .rsplit_once(')')
+                    .map(|(_, rest)| rest.split_whitespace().next().unwrap_or("").to_string());
+                // 'Z' is a zombie: killed, awaiting reap. That counts as dead
+                // for our purposes — it cannot write any more.
+                state.as_deref() != Some("Z")
+            })
+            .unwrap_or(false);
+        if !alive {
+            stopped = true;
+            break;
+        }
+    }
+    assert!(
+        stopped,
+        "the descendant (pid {grandchild}) must not survive the group kill; \
+         killing only the direct child leaves it writing the worktree"
+    );
+
+    let size_after = std::fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let size_settled = std::fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
+    assert_eq!(
+        size_after, size_settled,
+        "a killed group must stop writing; the file grew after the signal"
+    );
+}
