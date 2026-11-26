@@ -1200,10 +1200,41 @@ mod tests {
     /// that other repository's HEAD and index — after which every mutation of
     /// the real repository was rejected on a token that could never match.
     ///
-    /// Red-verified: with the scrub removed from `run_git_capped`, the decoy's
-    /// CLEAN tree is what both reads report and both assertions fail.
+    /// Red-verified: with `scrub_std` bodied out to a no-op the CHILD reports
+    /// `left: 0, right: 1` — the diff describes the decoy's CLEAN tree.
+    ///
+    /// The poisoned window runs in a fresh CHILD process. `EnvLock` serialises
+    /// the tests that WRITE the environment; it cannot exclude the threads that
+    /// READ it (this binary's other tests, their git children, Rust's own
+    /// runtime), and Rust 1.88 documents `set_var`/`remove_var` racing such a
+    /// reader as undefined behaviour — not merely a data race. So the parent
+    /// sets the decoy on the CHILD's `Command` and never touches its own
+    /// environment, which also removes the need to restore anything.
     #[test]
     fn test_an_inherited_git_dir_cannot_redirect_a_live_read() {
+        // CHILD: poisoned environment already in place, set by the parent.
+        // Only the assertions run here.
+        if let Some(real) = std::env::var_os(crate::test_env::SELF_TEST_PROJECT_ROOT) {
+            let real = std::path::PathBuf::from(real);
+            let diff = collect_diff(&real, &DiffSpec::WorkingTree, false)
+                .map(|working| working.files.len());
+            assert_eq!(
+                diff.expect("the named repository must stay readable"),
+                1,
+                "the diff must describe the REAL working tree, not the decoy's clean one"
+            );
+            let status = crate::cli::git::status(&real)
+                .expect("the named repository must keep a live status");
+            assert_eq!(
+                status.modified,
+                vec![std::path::PathBuf::from("a.rs")],
+                "the status must report the REAL repository's dirty file"
+            );
+            return;
+        }
+
+        // PARENT: build both repositories with the scrubbed fixture git, then
+        // hand the decoy to a child through `Command::env`.
         let real = tempfile::tempdir().unwrap();
         let decoy = tempfile::tempdir().unwrap();
         git(real.path(), &["init", "-q"]);
@@ -1218,51 +1249,28 @@ mod tests {
         git(decoy.path(), &["add", "."]);
         git(decoy.path(), &["commit", "-q", "-m", "decoy"]);
 
-        let real_root = real.path().to_path_buf();
         let decoy_git = decoy.path().join(".git");
-        let decoy_tree = decoy.path().to_path_buf();
-        // The environment is process-global, so the poisoned window runs on a
-        // blocking thread holding the crate-wide env lock, and is restored on
-        // drop — including on panic.
-        let observed = std::thread::spawn(move || {
-            let _env_lock = crate::test_env::EnvLock
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            struct Restore;
-            impl Drop for Restore {
-                fn drop(&mut self) {
-                    // SAFETY: serialized by _env_lock, which outlives this guard.
-                    unsafe {
-                        std::env::remove_var("GIT_DIR");
-                        std::env::remove_var("GIT_WORK_TREE");
-                    }
-                }
-            }
-            let _restore = Restore;
-            // SAFETY: serialized by _env_lock; restored by _restore.
-            unsafe {
-                std::env::set_var("GIT_DIR", &decoy_git);
-                std::env::set_var("GIT_WORK_TREE", &decoy_tree);
-            }
-            let diff = collect_diff(&real_root, &DiffSpec::WorkingTree, false)
-                .map(|working| working.files.len());
-            (diff, crate::cli::git::status(&real_root))
-        })
-        .join()
-        .expect("read worker");
-
-        assert_eq!(
-            observed.0.expect("the named repository must stay readable"),
-            1,
-            "the diff must describe the REAL working tree, not the decoy's clean one"
+        let child = crate::test_env::run_self_test_with_env(
+            "cli::mcp::git_diff_handler::tests::test_an_inherited_git_dir_cannot_redirect_a_live_read",
+            &[
+                (
+                    crate::test_env::SELF_TEST_PROJECT_ROOT,
+                    real.path().as_os_str(),
+                ),
+                (
+                    crate::test_env::SELF_TEST_DECOY_ROOT,
+                    decoy.path().as_os_str(),
+                ),
+                ("GIT_DIR", decoy_git.as_os_str()),
+                ("GIT_WORK_TREE", decoy.path().as_os_str()),
+            ],
         );
-        let status = observed
-            .1
-            .expect("the named repository must keep a live status");
-        assert_eq!(
-            status.modified,
-            vec![std::path::PathBuf::from("a.rs")],
-            "the status must report the REAL repository's dirty file"
+        assert!(
+            child.status.success(),
+            "the child must observe the REAL repository despite the inherited GIT_DIR\n\
+             stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
         );
     }
 
