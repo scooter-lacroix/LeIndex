@@ -26,7 +26,7 @@ $ProjectName = "LeIndex"
 $ProjectSlug = "leindex"
 $ExpectedVersion = "2.1.5"
 $MinRustMajor = 1
-$MinRustMinor = 88
+$MinRustMinor = 89
 $RepoUrl = "https://github.com/scooter-lacroix/LeIndex"
 $RepoStarEndpoint = "user/starred/scooter-lacroix/LeIndex"
 
