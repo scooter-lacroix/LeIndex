@@ -897,6 +897,20 @@ pub(crate) fn force_lease_oid(root: &Path, argv: &[String]) -> Option<String> {
     is_oid(&oid).then_some(oid)
 }
 
+/// Accept git's `rev-parse` answer as a commit id, or reject it.
+///
+/// The length test MUST come from [`is_oid`], not a literal 40: in a SHA-256
+/// repository every valid object id is 64 hex digits, so a hardcoded 40
+/// rejected all of them and bound the target as `unresolved:<name>`. That is
+/// not a cosmetic label — the binding is what makes a stale preview token
+/// detect a moved target. With the target unresolved, moving the branch left
+/// every hashed input (HEAD, index, argv) unchanged, so `checkout`/`merge`/
+/// `rebase`/`reset` would apply against a commit the caller never previewed.
+fn accepted_oid(text: &str) -> Option<String> {
+    let oid = text.trim();
+    is_oid(oid).then(|| oid.to_string())
+}
+
 /// Resolve a revision name to the commit it names RIGHT NOW.
 ///
 /// `--verify --quiet` makes an unknown name a failure instead of echoing the
@@ -913,14 +927,7 @@ fn resolve_oid(root: &Path, name: &str) -> String {
         4096,
     );
     match resolved {
-        Ok((text, _)) => {
-            let oid = text.trim();
-            if oid.len() == 40 && oid.bytes().all(|b| b.is_ascii_hexdigit()) {
-                oid.to_string()
-            } else {
-                format!("unresolved:{name}")
-            }
-        }
+        Ok((text, _)) => accepted_oid(&text).unwrap_or_else(|| format!("unresolved:{name}")),
         Err(_) => format!("unresolved:{name}"),
     }
 }
@@ -1903,3 +1910,9 @@ pub(crate) async fn handle(op: &str, root: &Path, args: &Value) -> Result<Value,
 #[cfg(test)]
 #[path = "git_apply_test.rs"]
 mod test;
+
+/// Preview-token binding tests (object-id acceptance, target tracking). Split
+/// out of `git_apply_test.rs`, which is at the 2000-line cap.
+#[cfg(test)]
+#[path = "git_apply_binding_test.rs"]
+mod binding_test;
