@@ -374,14 +374,47 @@ async fn test_find_per_file_cap_overflow_reachable_on_next_page() {
     assert_eq!(lib["hits"].as_array().unwrap().len(), 1);
     assert_eq!(lib["cap_line"], "+1 more in this file (next page)");
     assert_eq!(first["withheld_by_cap"], 1);
+    // A handler that ignored `offset` and re-served page one would still
+    // satisfy `total_matches >= 1`, so demand a real numeric offset and then
+    // prove page 2 carries the WITHHELD hit and not the one already shown
+    // (CodeRabbit round 21, id 4704738080).
+    let next_offset = first["next_offset"]
+        .as_u64()
+        .expect("the capped page must advertise a numeric next_offset");
+    assert!(
+        next_offset >= 1,
+        "next_offset must advance, got {next_offset}"
+    );
     let second = run(
         dir.path(),
-        json!({"pattern": "parse_config", "per_file_cap": 1, "offset": first["next_offset"]}),
+        json!({"pattern": "parse_config", "per_file_cap": 1, "offset": next_offset}),
     )
     .await;
+    let second_lib = second["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["file"].as_str().unwrap().ends_with("lib.rs"))
+        .unwrap_or_else(|| panic!("page 2 must still cover lib.rs: {second}"));
+    let second_hits: Vec<&str> = second_lib["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|h| h["text"].as_str())
+        .collect();
+    let first_hits: Vec<&str> = lib["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|h| h["text"].as_str())
+        .collect();
     assert!(
-        second["total_matches"].as_u64().unwrap() >= 1,
-        "past-cap matches must be reachable on the next page"
+        !second_hits.is_empty(),
+        "the withheld lib.rs hit must be reachable on the next page: {second_lib}"
+    );
+    assert!(
+        second_hits.iter().all(|hit| !first_hits.contains(hit)),
+        "page 2 must not re-serve page 1's hit: page1={first_hits:?} page2={second_hits:?}"
     );
 }
 
@@ -962,7 +995,14 @@ async fn test_find_paths_file_honors_include_exclude_globs() {
         dir.path(),
         json!({
             "pattern": "parse_config",
-            "paths": [elsewhere.path().to_string_lossy()],
+            // FILE roots, not the parent directory: the engine skips glob
+            // filtering for individually named files, so passing the
+            // directory would let a handler that dropped the pre-check still
+            // pass by directory scan alone (CodeRabbit round 21, 4704738090).
+            "paths": [
+                elsewhere.path().join("keep.rs").to_string_lossy(),
+                elsewhere.path().join("skip.log").to_string_lossy(),
+            ],
             "exclude_globs": ["*.log"],
         }),
     )
@@ -1074,7 +1114,12 @@ fn test_retry_note_distinguishes_incomplete_scan_from_clean_miss() {
 /// call.
 #[tokio::test]
 async fn test_find_callsites_are_selected_before_the_limit() {
-    let dir = project();
+    // An OTHERWISE EMPTY project: `project()` also adds a README mention and
+    // a second Rust file, so a page that returned only the README line would
+    // pass both assertions below without showing that the DEFINITION was
+    // removed before `limit: 1` applied (CodeRabbit round 21, 4704738101).
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
     std::fs::write(
         dir.path().join("src/calls.rs"),
         "pub fn parse_config() {}\nfn main() {\n    parse_config();\n}\n",
@@ -1092,8 +1137,20 @@ async fn test_find_callsites_are_selected_before_the_limit() {
         .flat_map(|f| f["hits"].as_array().into_iter().flatten())
         .filter_map(|h| h["text"].as_str())
         .collect();
-    assert!(!hits.is_empty(), "a call must appear on page 1");
-    assert!(hits.iter().all(|t| !t.trim_start().starts_with("pub fn")));
+    assert_eq!(
+        hits.len(),
+        1,
+        "limit 1 must yield exactly one row, got {hits:?}"
+    );
+    assert!(
+        hits[0].contains("parse_config();") && !hits[0].trim_start().starts_with("pub fn"),
+        "the page must show the CALL line, not the definition: {hits:?}"
+    );
+    let shown_file = value["files"][0]["file"].as_str().unwrap();
+    assert!(
+        shown_file.ends_with("src/calls.rs"),
+        "the only project file is src/calls.rs, got {shown_file}"
+    );
 }
 
 /// Codex round 5 (id 4688435750): the page limit truncates hits the engine
@@ -1213,35 +1270,28 @@ async fn test_find_ignored_file_omitted_by_inventory_found_via_paths() {
         "the hidden parse_config\n",
     )
     .unwrap();
-    let init_ok = std::process::Command::new("git")
-        .args(["init", "-q"])
-        .current_dir(elsewhere.path())
-        .status()
-        .is_ok_and(|status| status.success());
+    // `current_dir` alone does NOT redirect a git child that inherited
+    // GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE: those win over the working
+    // directory, so on a machine with one exported (a git hook, say) these
+    // commands would read and MUTATE the caller's repository instead of
+    // `elsewhere` — and deleting the tempdir would not undo that. Every git
+    // child goes through the same scrubbed builder the product uses
+    // (CodeRabbit round 21, id 4704738112).
+    let git = |args: &[&str]| {
+        let mut command = std::process::Command::new("git");
+        command.args(args).current_dir(elsewhere.path());
+        super::super::git_apply_exec::scrub_std(&mut command);
+        command.status()
+    };
+    let init_ok = git(&["init", "-q"]).is_ok_and(|status| status.success());
     assert!(
         init_ok,
         "git must be available for the worktree inventory test"
     );
-    std::process::Command::new("git")
-        .args(["config", "user.email", "test@example.com"])
-        .current_dir(elsewhere.path())
-        .status()
-        .unwrap();
-    std::process::Command::new("git")
-        .args(["config", "user.name", "test"])
-        .current_dir(elsewhere.path())
-        .status()
-        .unwrap();
-    std::process::Command::new("git")
-        .args(["add", "-A"])
-        .current_dir(elsewhere.path())
-        .status()
-        .unwrap();
-    std::process::Command::new("git")
-        .args(["commit", "-qm", "init"])
-        .current_dir(elsewhere.path())
-        .status()
-        .unwrap();
+    git(&["config", "user.email", "test@example.com"]).unwrap();
+    git(&["config", "user.name", "test"]).unwrap();
+    git(&["add", "-A"]).unwrap();
+    git(&["commit", "-qm", "init"]).unwrap();
     // The default (git-aware) inventory of the worktree omits the ignored
     // artifact — prove that before proving `paths` bypasses it.
     let omitted = run(elsewhere.path(), json!({"pattern": "parse_config"})).await;

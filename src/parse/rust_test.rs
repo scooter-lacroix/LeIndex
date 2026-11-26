@@ -29,9 +29,10 @@ format!(\"Hello, {}\", name)
 fn test_calls_inside_macros_reach_the_call_list() {
     let source = b"fn callee(x: u32) -> u32 { x }\n\
 fn outer() {\n\
-assert_eq!(callee(1), 2);\n\
+assert_eq!(only_in_assert(1), 2);\n\
 println!(\"{} {}\", callee(3), plain_call());\n\
 }\n\
+fn only_in_assert(x: u32) -> u32 { x }\n\
 fn plain_call() -> u32 { 7 }\n";
 
     let parser = RustParser::new();
@@ -42,8 +43,9 @@ fn plain_call() -> u32 { 7 }\n";
         .find(|sig| sig.name == "outer")
         .expect("outer fn extracted");
     assert!(
-        outer.calls.iter().any(|call| call == "callee"),
-        "call inside assert_eq! must be recorded, calls: {:?}",
+        outer.calls.iter().any(|call| call == "only_in_assert"),
+        "call inside assert_eq! must be recorded (only_in_assert appears nowhere else), \
+         calls: {:?}",
         outer.calls
     );
     assert!(
@@ -546,11 +548,13 @@ x + 1
     let sig = &signatures[0];
     assert_eq!(sig.name, "complex_fn");
 
-    // Verify that cyclomatic_complexity is populated
-    // The function has 1 if expression, so cyclomatic complexity should be 2 (base 1 + 1 if)
-    assert!(
-        sig.cyclomatic_complexity >= 1,
-        "cyclomatic_complexity should be >= 1, got {}",
+    // The function has exactly one `if`, so complexity is base 1 + 1 = 2.
+    // `>= 1` would accept the base value and still pass if signature
+    // construction stopped carrying the calculated number at all
+    // (CodeRabbit round 21, id 4704738121).
+    assert_eq!(
+        sig.cyclomatic_complexity, 2,
+        "cyclomatic_complexity must be the CALCULATED value (base 1 + one if), got {}",
         sig.cyclomatic_complexity
     );
 }
