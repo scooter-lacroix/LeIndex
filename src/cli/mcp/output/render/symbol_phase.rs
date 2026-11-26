@@ -174,6 +174,12 @@ pub(super) fn render_symbol_lookup_single(data: &Value, color: bool) -> String {
     {
         out.push_str(&field("Index freshness", freshness, color));
     }
+    // §6.3 usage sites (`kind: construct|match`) and §6.4 executable tests
+    // (`kind: tests`) replace the relations body. Rendering only the relations
+    // shape showed symbol/file/source for those kinds and hid the actual
+    // answer — the usage sites, or the command that runs each test.
+    out.push_str(&render_usage_sites(data, color));
+    out.push_str(&render_test_targets(data, color));
     out.push_str(&render_symbol_source(data, color));
 
     out.push_str(&render_symbol_relationships(
@@ -192,6 +198,93 @@ pub(super) fn render_symbol_lookup_single(data: &Value, color: bool) -> String {
         "←",
         color,
     ));
+    out
+}
+
+/// §6.4 tests body: each entry carries the exact command that runs it, so it
+/// has to be rendered, not just trimmed through.
+fn render_test_targets(data: &Value, color: bool) -> String {
+    let Some(entries) = data.get("tests").and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    if entries.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("\n  Tests ({}):\n", entries.len());
+    for entry in entries.iter().take(5) {
+        let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+        let file = entry.get("file").and_then(|v| v.as_str()).unwrap_or("");
+        let command = entry.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        out.push_str(&format!(
+            "    → {}{}{} {}{}{}\n        {}{}{}\n",
+            if color { LIGHT_CYAN } else { "" },
+            name,
+            if color { RESET } else { "" },
+            if color { DIM } else { "" },
+            file,
+            if color { RESET } else { "" },
+            if color { DIM } else { "" },
+            command,
+            if color { RESET } else { "" },
+        ));
+    }
+    if data
+        .get("tests_truncated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        out.push_str("    ... (truncated)\n");
+    }
+    out
+}
+
+/// §6.3 usage body: `kind: construct|match` with `sites`. Without this the
+/// alternate kinds rendered as a bare symbol header.
+fn render_usage_sites(data: &Value, color: bool) -> String {
+    let Some(entries) = data.get("sites").and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    let kind = data.get("kind").and_then(|v| v.as_str()).unwrap_or("sites");
+    if entries.is_empty() {
+        return format!("\n  {} (0):\n", kind);
+    }
+    let mut out = format!("\n  {} ({}):\n", kind, entries.len());
+    for entry in entries.iter().take(10) {
+        let file = entry.get("file").and_then(|v| v.as_str()).unwrap_or("");
+        let line = entry.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
+        let text = entry
+            .get("site_line")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let form = entry.get("form").and_then(|v| v.as_str()).unwrap_or("");
+        let enclosing = entry.get("enclosing").and_then(|v| v.as_str());
+        let suffix = match enclosing {
+            Some(owner) => format!("  [{form}]  (in {owner})"),
+            None if form.is_empty() => String::new(),
+            None => format!("  [{form}]"),
+        };
+        out.push_str(&format!(
+            "    {}{}:{}{} {}{}{}\n",
+            if color { DIM } else { "" },
+            file,
+            line,
+            if color { RESET } else { "" },
+            truncate_chars(text, 120),
+            if color { DIM } else { "" },
+            suffix,
+        ));
+    }
+    if data
+        .get("sites_truncated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        let total = data
+            .get("sites_total")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        out.push_str(&format!("    ... (truncated, {total} total)\n"));
+    }
     out
 }
 

@@ -77,6 +77,54 @@ fn test_trim_symbol_lookup_keeps_actual_fields() {
     assert!(t.get("signature").is_none());
 }
 
+/// The §6.3 usage bodies and the §6.4 tests body REPLACE the relations body,
+/// so the L1 trim must carry them or the default tier answers with metadata
+/// only. Red-verified: removing the alternate keys from the allowlist makes
+/// every assertion below fail.
+#[test]
+fn test_trim_symbol_lookup_keeps_the_alternate_usage_and_tests_bodies() {
+    let construct = v(r#"{
+            "symbol": "Shade",
+            "file": "src/shade.rs",
+            "kind": "construct",
+            "sites": [{"file": "src/a.rs", "line": 7, "site_line": "Shade { }", "form": "struct literal"}],
+            "sites_total": 1,
+            "sites_truncated": false,
+            "languages_covered": ["rust"],
+            "files_scanned": 3,
+            "language_coverage": "rust, python",
+            "index_freshness": "fresh"
+        }"#);
+    let t = trim_symbol_lookup(&construct);
+    assert_eq!(t["kind"], "construct");
+    assert_eq!(t["sites"][0]["line"], 7, "usage sites must survive: {t}");
+    assert_eq!(t["sites_total"], 1);
+    assert_eq!(t["sites_truncated"], false);
+    assert_eq!(t["files_scanned"], 3);
+    assert_eq!(t["languages_covered"][0], "rust");
+    assert!(
+        t["language_coverage"].as_str().is_some(),
+        "coverage note must survive: {t}"
+    );
+
+    let tests = v(r#"{
+            "symbol": "helper",
+            "file": "src/lib.rs",
+            "kind": "tests",
+            "tests": [{"name": "test_helper", "file": "tests/h_test.rs", "type": "test", "call_depth": 1, "evidence": "direct call", "command": "cargo test --test h_test test_helper"}],
+            "tests_total": 1,
+            "tests_truncated": false
+        }"#);
+    let t = trim_symbol_lookup(&tests);
+    assert_eq!(t["kind"], "tests");
+    assert_eq!(
+        t["tests"][0]["command"], "cargo test --test h_test test_helper",
+        "the executable command must survive: {t}"
+    );
+    assert_eq!(t["tests_total"], 1);
+    assert_eq!(t["tests_truncated"], false);
+}
+
 #[test]
 fn test_trim_symbol_lookup_keeps_degradation_fields() {
     // N-15: the honest-degradation fields must survive trimming so the LLM

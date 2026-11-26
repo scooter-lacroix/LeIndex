@@ -383,14 +383,22 @@ fn trim_symbol_lookup(data: &Value) -> Value {
 /// Per-symbol trimmer used by both the single-symbol and
 /// batch-result paths of `trim_symbol_lookup`.
 ///
-/// `leindex.symbol-lookup` returns the result built by
-/// `SymbolLookupHandler::lookup_single_symbol` with fields:
-///   symbol, type, file, byte_range, complexity, language,
-///   callers, callees, impact_radius, and optionally source
-/// (when `include_source` is set). The trim must use the same
-/// field names so the LLM-visible payload actually carries the
-/// file path, node type, source excerpt, and impact radius —
-/// not aliases that resolve to `null` from the raw handler.
+/// `leindex.symbol-lookup` returns one of THREE bodies, and all of them must
+/// survive the L1 trim or the default tier answers with metadata only:
+///
+/// * the relations body (`SymbolLookupHandler::lookup_single_symbol`):
+///   symbol, type, file, byte_range, complexity, language, callers, callees,
+///   impact_radius, optionally source;
+/// * the `construct` / `match` usage body (`usage_sites_body`): symbol, file,
+///   `kind`, `sites`, `sites_total`, `sites_truncated`, `languages_covered`,
+///   `files_scanned`, `language_coverage`;
+/// * the `tests` body (`tests_body`): symbol, file, `kind`, `tests`,
+///   `tests_total`, `tests_truncated`.
+///
+/// The alternate keys were previously outside this allowlist, so
+/// `kind:"construct"`, `kind:"match"` and `kind:"tests"` came back as
+/// symbol/file/source with no sites and no test commands — the answer was
+/// trimmed away entirely.
 fn trim_symbol_lookup_single(data: &Value) -> Value {
     let mut out = serde_json::Map::new();
     for k in [
@@ -407,6 +415,18 @@ fn trim_symbol_lookup_single(data: &Value) -> Value {
         "index_freshness",
         "pdg_status",
         "source",
+        // Alternate usage-site / tests bodies (§6.3 / §6.4).
+        "kind",
+        "sites",
+        "sites_total",
+        "sites_truncated",
+        "languages_covered",
+        "files_scanned",
+        "language_coverage",
+        "tests",
+        "tests_total",
+        "tests_truncated",
+        "retrieval",
     ] {
         if let Some(v) = data.get(k) {
             out.insert(k.to_string(), v.clone());

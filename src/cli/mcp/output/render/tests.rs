@@ -89,6 +89,53 @@ fn test_pdg_enrichment_line_survives_the_transport_trim() {
     );
 }
 
+/// The alternate lookup bodies must be RENDERED, not just trimmed through.
+///
+/// `kind:"construct"` / `kind:"match"` answer with `sites`, and
+/// `kind:"tests"` answers with test targets carrying the exact command that
+/// runs each one. The renderer used to read only the relations shape, so those
+/// kinds printed symbol/file/source and none of the actual answer. This goes
+/// through the transport entry point, so a trim regression fails here too.
+#[test]
+fn test_render_symbol_lookup_renders_usage_sites_and_test_commands() {
+    use crate::cli::mcp::output::trim::trim_llm_payload;
+    let args = v(r#"{"symbol": "Shade"}"#);
+
+    let construct = trim_llm_payload(
+        "leindex_symbol_lookup",
+        &v(r#"{
+            "symbol": "Shade",
+            "file": "src/shade.rs",
+            "kind": "construct",
+            "sites": [{"file": "src/a.rs", "line": 7, "site_line": "Shade::Dark { value: 1 }", "form": "struct literal", "enclosing": "build"}],
+            "sites_total": 1,
+            "sites_truncated": false
+        }"#),
+    );
+    let s = render_tool_output("leindex.symbol-lookup", &construct, &args);
+    assert!(s.contains("src/a.rs:7"), "usage site location missing: {s}");
+    assert!(s.contains("struct literal"), "site form missing: {s}");
+    assert!(s.contains("(in build)"), "enclosing fn missing: {s}");
+
+    let tests = trim_llm_payload(
+        "leindex_symbol_lookup",
+        &v(r#"{
+            "symbol": "helper",
+            "file": "src/lib.rs",
+            "kind": "tests",
+            "tests": [{"name": "test_helper", "file": "tests/h_test.rs", "type": "test", "call_depth": 1, "evidence": "direct call", "command": "cargo test --test h_test test_helper"}],
+            "tests_total": 1,
+            "tests_truncated": false
+        }"#),
+    );
+    let s = render_tool_output("leindex.symbol-lookup", &tests, &args);
+    assert!(s.contains("test_helper"), "test name missing: {s}");
+    assert!(
+        s.contains("cargo test --test h_test test_helper"),
+        "the executable command must be rendered: {s}"
+    );
+}
+
 #[test]
 fn test_render_tree_basic() {
     let tree = v(r#"[

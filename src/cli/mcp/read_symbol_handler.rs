@@ -2,7 +2,7 @@ use super::helpers::{
     byte_range_to_line_range, extract_bool, extract_string, extract_usize, get_direct_callees,
 };
 use super::protocol::JsonRpcError;
-use super::read_paths::{self, Fragment};
+use super::read_paths;
 use super::request_meta::WorkBudget;
 use crate::cli::live_project::LiveProject;
 use crate::cli::registry::ProjectRegistry;
@@ -12,6 +12,27 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+
+/// Split the `file_path` argument into `(file hint, symbol)`.
+///
+/// Handle form (§4.1): `path#symbol` — the path becomes the file hint, the
+/// fragment the target symbol. A `#L` range is a read_file concern and is
+/// IGNORED here, but "ignored" means the FRAGMENT is dropped, not that the
+/// handle is passed through whole. Keeping the raw string made
+/// `live.file("src/lib.rs#L10-20")` canonicalize a path containing `#L10-20`
+/// and fail as nonexistent even though the file — and the requested symbol —
+/// both exist. `parse_read_handle` splits off the fragment AND decodes the
+/// same escapes the read path decodes, so an escaped filename resolves
+/// identically here.
+fn split_file_hint(file_hint: Option<&str>, symbol: String) -> (Option<String>, String) {
+    match file_hint {
+        Some(raw) => {
+            let handle = read_paths::parse_read_handle(raw, None);
+            (Some(handle.file_path), handle.symbol.unwrap_or(symbol))
+        }
+        None => (None, symbol),
+    }
+}
 
 /// Handler for LeIndex [read_symbol — targeted symbol source read.
 #[derive(Clone)]
@@ -60,23 +81,7 @@ impl ReadSymbolHandler {
         };
         let started = Instant::now();
 
-        // Handle form (§4.1): `path#symbol` in file_path — the path becomes
-        // the file hint, the fragment the target symbol (a #L range is a
-        // read_file concern and is ignored here).
-        let (file_hint, symbol) = match file_hint.and_then(|raw| {
-            read_paths::split_read_fragment(raw)
-                .1
-                .map(|fragment| (raw.to_string(), fragment))
-        }) {
-            Some((raw, fragment)) => match read_paths::classify_fragment(&fragment) {
-                Fragment::Symbol(target) => {
-                    let (file_part, _) = read_paths::split_read_fragment(&raw);
-                    (Some(file_part), target)
-                }
-                Fragment::LineRange(_) | Fragment::None => (file_hint.map(str::to_string), symbol),
-            },
-            None => (file_hint.map(str::to_string), symbol),
-        };
+        let (file_hint, symbol) = split_file_hint(file_hint, symbol);
         let file_hint = file_hint.as_deref();
 
         let project_path = match args.get("project_path").and_then(|v| v.as_str()) {
@@ -723,6 +728,48 @@ mod tests {
             complexity: 0,
             byte_range,
         }
+    }
+
+    /// A `#L` range handle must contribute its FILE, not the whole handle.
+    ///
+    /// `live.file("src/lib.rs#L10-20")` canonicalizes a path containing the
+    /// fragment and fails as nonexistent. The range itself is a read_file
+    /// concern and is correctly ignored here — but only the fragment may be
+    /// dropped, never the file.
+    #[test]
+    fn test_split_file_hint_keeps_only_the_file_from_a_range_handle() {
+        let (file, symbol) = split_file_hint(Some("src/lib.rs#L10-20"), "wanted".to_string());
+        assert_eq!(file.as_deref(), Some("src/lib.rs"), "range must be dropped");
+        assert_eq!(symbol, "wanted", "a range must not override the symbol");
+    }
+
+    /// A `#symbol` handle contributes BOTH: the path and the target symbol
+    /// (the handle wins over the argument, as documented in the schema).
+    #[test]
+    fn test_split_file_hint_takes_the_symbol_from_a_symbol_handle() {
+        let (file, symbol) = split_file_hint(Some("src/lib.rs#helper"), "ignored".to_string());
+        assert_eq!(file.as_deref(), Some("src/lib.rs"));
+        assert_eq!(symbol, "helper");
+    }
+
+    /// The file portion is DECODED with the same escapes the read path uses,
+    /// so an escaped filename round-trips instead of resolving to `a%23b.rs`.
+    #[test]
+    fn test_split_file_hint_decodes_an_escaped_filename() {
+        let (file, symbol) = split_file_hint(Some("src/a%23b.rs#L1-2"), "wanted".to_string());
+        assert_eq!(file.as_deref(), Some("src/a#b.rs"));
+        assert_eq!(symbol, "wanted");
+    }
+
+    /// No handle: the file hint is passed through unchanged.
+    #[test]
+    fn test_split_file_hint_passes_a_plain_path_through() {
+        let (file, symbol) = split_file_hint(Some("src/lib.rs"), "wanted".to_string());
+        assert_eq!(file.as_deref(), Some("src/lib.rs"));
+        assert_eq!(symbol, "wanted");
+        let (none, symbol) = split_file_hint(None, "wanted".to_string());
+        assert_eq!(none, None);
+        assert_eq!(symbol, "wanted");
     }
 
     #[test]

@@ -261,6 +261,41 @@ struct PatternHit {
     form: &'static str,
 }
 
+/// The VARIANT PATHS inside a pattern, without payloads.
+///
+/// `Shade::Dark(x)` and `Shade::Dark { value }` are `tuple_struct_pattern` and
+/// `struct_pattern` nodes whose `type` field is the path. Their raw text ends
+/// in `Dark(x)` / `Dark { value }`, so a `names_target` comparison that splits
+/// on `::`, `.` and `|` sees a terminal segment of `Dark(x)` — never `Dark` —
+/// and a qualified query `Shade::Dark` silently misses every data-carrying
+/// variant while still finding the unit ones.
+///
+/// A match arm nests the payload node inside `match_pattern` (and or-patterns
+/// nest them inside `or_pattern`), so this walks the pattern's WHOLE subtree:
+/// every data-carrying variant anywhere in the pattern contributes its path,
+/// which the caller records ALONGSIDE the full pattern text.
+fn pattern_variant_paths(node: tree_sitter::Node<'_>, text: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if matches!(current.kind(), "tuple_struct_pattern" | "struct_pattern")
+            && let Some(path_node) = current.child_by_field_name("type")
+            && let Ok(raw) = path_node.utf8_text(text.as_bytes())
+        {
+            let raw = raw.trim();
+            // A path of `_` (or an empty one) carries no variant identity.
+            if !raw.is_empty() && raw != "_" {
+                paths.push(raw.to_string());
+            }
+        }
+        let mut cursor = current.walk();
+        for child in current.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    paths
+}
+
 /// Collect match-pattern candidates in one parsed file.
 fn collect_match_candidates(
     root: tree_sitter::Node<'_>,
@@ -277,31 +312,44 @@ fn collect_match_candidates(
             form,
         })
     }
+    /// Push the pattern node's own text, plus the payload-free variant paths of
+    /// every data-carrying variant it contains.
+    fn push_pattern(
+        hits: &mut Vec<PatternHit>,
+        node: tree_sitter::Node<'_>,
+        text: &str,
+        form: &'static str,
+    ) {
+        if let Some(hit) = node_hit(node, text, form) {
+            hits.push(hit);
+        }
+        for path in pattern_variant_paths(node, text) {
+            hits.push(PatternHit {
+                byte: node.start_byte(),
+                pattern_text: path,
+                form,
+            });
+        }
+    }
     let mut hits = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         match language {
             "rust" | "rs" => match node.kind() {
                 "match_pattern" => {
-                    if let Some(hit) = node_hit(node, text, "match arm") {
-                        hits.push(hit);
-                    }
+                    push_pattern(&mut hits, node, text, "match arm");
                 }
                 // `if let PAT = expr` parses as a `let_condition` inside the
                 // if_expression's condition field; its `pattern` field is the
                 // pattern alone.
                 "let_condition" => {
-                    if let Some(pattern) = node.child_by_field_name("pattern")
-                        && let Some(hit) = node_hit(pattern, text, "if let")
-                    {
-                        hits.push(hit);
+                    if let Some(pattern) = node.child_by_field_name("pattern") {
+                        push_pattern(&mut hits, pattern, text, "if let");
                     }
                 }
                 "let_declaration" => {
-                    if let Some(pattern) = node.child_by_field_name("pattern")
-                        && let Some(hit) = node_hit(pattern, text, "let pattern")
-                    {
-                        hits.push(hit);
+                    if let Some(pattern) = node.child_by_field_name("pattern") {
+                        push_pattern(&mut hits, pattern, text, "let pattern");
                     }
                 }
                 "macro_invocation" => {
@@ -743,6 +791,56 @@ pub fn dark_check(s: &Shade) -> bool {
         assert!(lines.contains(&26), "match arm lines: {sites:?}");
         assert!(lines.contains(&31), "if let lines: {sites:?}");
         assert!(lines.contains(&34), "matches! lines: {sites:?}");
+    }
+
+    #[test]
+    fn test_data_carrying_variants_are_matched_by_their_variant_path() {
+        // `Dark(x)` / `Dark { value }` end with the payload, so a naive
+        // terminal-segment compare sees `Dark(x)` and never `Dark`. Every
+        // payload form must still be reported for a qualified variant query.
+        let src = "pub enum Shade { Light, Dark(u8), Grey { value: u8 } }\n\
+fn use_shade(s: Shade) -> u8 {\n\
+    match s {\n\
+        Shade::Light => 0,\n\
+        Shade::Dark(x) => x,\n\
+        Shade::Grey { value } => value,\n\
+    }\n\
+}\n\
+fn dark_check(s: &Shade) -> bool {\n\
+    if let Shade::Dark(_) = s { return true; }\n\
+    false\n\
+}\n\
+fn bind(s: Shade) {\n\
+    let Shade::Grey { value } = s else { return };\n\
+    let _ = value;\n\
+}\n";
+        let tree = parse(src, "rs");
+        let dark = collect_sites(
+            tree.root_node(),
+            src,
+            "rust",
+            &query(UsageKind::Match, "Shade::Dark"),
+        );
+        let lines: Vec<usize> = dark.iter().map(|site| site.line).collect();
+        assert!(lines.contains(&5), "tuple variant in a match arm: {dark:?}");
+        assert!(lines.contains(&10), "tuple variant in `if let`: {dark:?}");
+        assert!(
+            !lines.contains(&6),
+            "a different variant must not match: {dark:?}"
+        );
+
+        let grey = collect_sites(
+            tree.root_node(),
+            src,
+            "rust",
+            &query(UsageKind::Match, "Shade::Grey"),
+        );
+        let lines: Vec<usize> = grey.iter().map(|site| site.line).collect();
+        assert!(
+            lines.contains(&6),
+            "struct variant in a match arm: {grey:?}"
+        );
+        assert!(lines.contains(&14), "struct variant in `let`: {grey:?}");
     }
 
     #[test]
