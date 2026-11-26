@@ -37,6 +37,14 @@ pub(crate) struct Guidance {
 struct Member {
     name: String,
     dir: PathBuf,
+    /// Does this member build a library target?
+    ///
+    /// `cargo test --lib` means "test only this package's library" and FAILS
+    /// with `no library targets found` on a binary-only package, so the flag
+    /// may only be emitted when a library target actually exists. Derived
+    /// from the member manifest: a `[lib]` section, or the default
+    /// `src/lib.rs` path.
+    has_lib: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -194,7 +202,13 @@ fn discover(root: &Path, stamp: &mut Stamp) -> Facts {
             if let Some(manifest) = read_stamped(dir.join("Cargo.toml"), stamp)
                 && let Some(name) = package_name(&manifest)
             {
-                facts.members.push(Member { name, dir });
+                // Probe `src/lib.rs`, so a member that gains or loses its
+                // library must invalidate the cache too. Without the stamp a
+                // cached binary-only answer would outlive the new lib target.
+                let lib_rs = dir.join("src/lib.rs");
+                stamp.push((lib_rs.clone(), mtime(&lib_rs)));
+                let has_lib = has_library_target(&dir, &manifest);
+                facts.members.push(Member { name, dir, has_lib });
             }
         }
     }
@@ -241,6 +255,24 @@ fn package_name(manifest: &str) -> Option<String> {
         .get("name")?
         .as_str()
         .map(str::to_string)
+}
+
+/// Does this package build a LIBRARY target?
+///
+/// `cargo test --lib` is "test only this package's library", so it is only
+/// valid when a library target exists. Cargo's rules: an explicit `[lib]`
+/// section declares one, otherwise `src/lib.rs` is the implicit default.
+/// A `[lib] path` pointing somewhere else is honoured as written.
+fn has_library_target(dir: &Path, manifest: &str) -> bool {
+    let table = manifest.parse::<toml::Table>().ok();
+    if let Some(lib) = table.as_ref().and_then(|t| t.get("lib")) {
+        // `[lib]` with no `path` still means `src/lib.rs`.
+        return match lib.get("path").and_then(toml::Value::as_str) {
+            Some(path) => dir.join(path).is_file(),
+            None => true,
+        };
+    }
+    dir.join("src/lib.rs").is_file()
 }
 
 fn package_scripts(text: &str) -> Vec<String> {
@@ -318,25 +350,62 @@ fn make_targets(text: &str, just: bool) -> Vec<String> {
     targets
 }
 
+/// Resolve the Cargo INTEGRATION TEST target that owns a path under `tests/`.
+///
+/// Cargo's rules, and the reason the requested file's stem is the wrong answer:
+/// - `tests/<name>.rs` is its own target, named `<name>`.
+/// - `tests/<dir>/main.rs` is a target named `<dir>` — NOT `main`. Emitting
+///   `--test main` selects nothing and `cargo test` rejects it with
+///   `no test target named main`, listing `<dir>` as the available target.
+/// - Any other file under `tests/<dir>/` is a helper module `include!`d or
+///   `mod`-ed by that target, so it still maps to the `<dir>` target. Using the
+///   helper's own stem would name a target that does not exist.
+///
+/// Returns `None` for a path that is not under `tests/`.
+fn integration_target_name(rel: &Path) -> Option<String> {
+    let tests_path = rel.strip_prefix("tests/").ok()?;
+    let mut components = tests_path.components();
+    let first = components.next()?;
+    let name = match components.next() {
+        // Deeper than one component: the FIRST component is the target, and it
+        // must be a directory (Cargo only looks at `tests/*.rs` and
+        // `tests/*/main.rs`).
+        Some(_) => first.as_os_str().to_string_lossy().into_owned(),
+        // A single component is a top-level `tests/<name>.rs` file. A bare
+        // non-`.rs` name is not a target Cargo would build, so fall through to
+        // the generic handling rather than inventing one.
+        None => first
+            .as_os_str()
+            .to_string_lossy()
+            .strip_suffix(".rs")?
+            .to_string(),
+    };
+    if name.is_empty() {
+        return None;
+    }
+    Some(name)
+}
+
 /// Select the Cargo test target for the requested path: integration tests get
-/// `--test <name>`, binary sources drop `--lib` (so binary-only members still
-/// run), and everything else keeps the library default.
+/// `--test <owning target>`, binary sources drop `--lib` (so binary-only members
+/// still run), and the library default is emitted ONLY when the member has a
+/// library target — `cargo test --lib` fails outright with `no library targets
+/// found` on a binary-only package.
 fn cargo_test_target(member: &Member, path: &Path) -> String {
     let Ok(rel) = path.strip_prefix(&member.dir) else {
-        return " --lib".to_string();
+        return if member.has_lib {
+            " --lib".to_string()
+        } else {
+            String::new()
+        };
     };
-    if let Ok(tests_path) = rel.strip_prefix("tests/")
-        && let Some(stem) = tests_path
-            .file_stem()
-            .map(|stem| stem.to_string_lossy().into_owned())
-            .filter(|stem| !stem.is_empty())
-    {
-        return format!(" --test {stem}");
+    if let Some(target) = integration_target_name(rel) {
+        return format!(" --test {target}");
     }
     let binary_source = rel == Path::new("src/main.rs")
         || rel.starts_with("src/bin/")
         || rel.starts_with("examples/");
-    if binary_source {
+    if binary_source || !member.has_lib {
         String::new()
     } else {
         " --lib".to_string()

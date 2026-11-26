@@ -202,18 +202,14 @@ async fn test_git_command_child_leads_its_own_process_group() {
     let mut child = command.spawn().expect("git available");
     let pid = child.id().expect("child is alive") as libc::pid_t;
 
-    // Field 5 of /proc/<pid>/stat is the process-group id. Read it from the
-    // kernel rather than trusting `Command::process_group`'s own bookkeeping.
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("/proc stat");
-    // The comm field is parenthesised and may contain spaces, so split after
-    // the LAST ')' before counting fields.
-    let after_comm = stat.rsplit_once(')').expect("comm field").1;
-    let pgid: libc::pid_t = after_comm
-        .split_whitespace()
-        .nth(2)
-        .expect("pgid field")
-        .parse()
-        .expect("numeric pgid");
+    // `getpgid` is portable across unix; /proc/<pid>/stat is Linux-only and
+    // would panic this test on macOS, where `#[cfg(unix)]` also compiles.
+    let pgid = unsafe { libc::getpgid(pid) };
+    assert!(
+        pgid >= 0,
+        "getpgid({pid}) failed: {}",
+        std::io::Error::last_os_error()
+    );
 
     assert_eq!(
         pgid, pid,
@@ -233,6 +229,28 @@ async fn test_git_command_child_leads_its_own_process_group() {
 #[cfg(unix)]
 #[tokio::test]
 async fn test_process_group_kill_reaps_a_grandchild_that_outlives_its_parent() {
+    /// Signal the group on EVERY exit path, including an assertion panic.
+    ///
+    /// The direct child exits before the assertions run, so without this a
+    /// failed poll would leave the background writer looping forever in the
+    /// test harness. The explicit kill in the test body is the behaviour under
+    /// test; this guard only guarantees nothing survives the test itself.
+    struct GroupGuard(libc::pid_t);
+    impl GroupGuard {
+        fn kill(&self) {
+            // SAFETY: plain signal delivery to a group this test created with
+            // `process_group(0)`; no memory is touched.
+            unsafe {
+                libc::kill(-self.0, libc::SIGKILL);
+            }
+        }
+    }
+    impl Drop for GroupGuard {
+        fn drop(&mut self) {
+            self.kill();
+        }
+    }
+
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("hook-writes.log");
     let child_pid_file = dir.path().join("gc.pid");
@@ -254,6 +272,8 @@ async fn test_process_group_kill_reaps_a_grandchild_that_outlives_its_parent() {
     command.process_group(0);
     let mut child = command.spawn().expect("sh available");
     let pgid = child.id().expect("child alive") as libc::pid_t;
+    // Installed BEFORE any assertion: from here on the group is always reaped.
+    let guard = GroupGuard(pgid);
     let _ = child.wait().await;
 
     // Wait for the grandchild to actually start writing, so a pass cannot be
@@ -280,28 +300,21 @@ async fn test_process_group_kill_reaps_a_grandchild_that_outlives_its_parent() {
     assert!(saw_output, "the descendant must be writing before the kill");
 
     // The production teardown: signal the whole group.
-    // SAFETY: plain signal delivery to the group created by
-    // `process_group(0)` above; no memory is touched.
-    unsafe {
-        libc::kill(-pgid, libc::SIGKILL);
-    }
+    guard.kill();
 
-    // The grandchild must be gone (or a zombie awaiting its reaper), and must
-    // have STOPPED writing.
+    // The grandchild must be gone (or a zombie awaiting its reaper). Liveness
+    // is checked with the PORTABLE probe: `/proc` is Linux-only, and reading
+    // its absence as "stopped" would make this test vacuously pass on macOS.
+    // `kill(pid, 0)` works everywhere POSIX and returns ESRCH once the pid is
+    // gone; a zombie still answers, so poll until the reaper collects it or
+    // the budget expires.
     let mut stopped = false;
     for _ in 0..100 {
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let alive = std::fs::read_to_string(format!("/proc/{grandchild}/stat"))
-            .map(|s| {
-                let state = s
-                    .rsplit_once(')')
-                    .map(|(_, rest)| rest.split_whitespace().next().unwrap_or("").to_string());
-                // 'Z' is a zombie: killed, awaiting reap. That counts as dead
-                // for our purposes — it cannot write any more.
-                state.as_deref() != Some("Z")
-            })
-            .unwrap_or(false);
-        if !alive {
+        // SAFETY: signal 0 performs the permission/existence check only.
+        let alive = unsafe { libc::kill(grandchild, 0) } == 0;
+        let zombie = is_zombie(grandchild);
+        if !alive || zombie {
             stopped = true;
             break;
         }
@@ -319,4 +332,29 @@ async fn test_process_group_kill_reaps_a_grandchild_that_outlives_its_parent() {
         size_after, size_settled,
         "a killed group must stop writing; the file grew after the signal"
     );
+}
+
+/// Is `pid` a zombie awaiting its reaper?
+///
+/// Linux answers from `/proc/<pid>/stat` (state 'Z'). Elsewhere the honest
+/// answer is "cannot tell", which returns `false` so the caller keeps polling
+/// `kill(pid, 0)` rather than treating an unreadable interface as proof of
+/// death.
+#[cfg(unix)]
+fn is_zombie(pid: libc::pid_t) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|s| {
+                s.rsplit_once(')')
+                    .map(|(_, rest)| rest.split_whitespace().next() == Some("Z"))
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
 }

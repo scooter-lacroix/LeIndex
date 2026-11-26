@@ -82,7 +82,18 @@ pub(crate) fn compute_signals(
             // `pub` detection from the source line the node starts on — the
             // PDG does not carry visibility, and the stub in drift.rs treats
             // everything as public.
-            let line_start = original[..node.byte_range.0.min(original.len())]
+            //
+            // The stored byte offset is STALE whenever the file changed after
+            // indexing (`ensure_pdg_loaded_graph_only` hydrates the graph but
+            // cannot refresh the ranges). `min(original.len())` alone guards
+            // only the length: an offset that lands on a continuation byte of
+            // a multi-byte character panics on the slice instead of returning
+            // a preview, e.g. rewriting `//x\n` to `//aé\n` moves the
+            // declaration from 4 to 5 and leaves the indexed 4 inside `é`.
+            // Snap DOWN to the nearest char boundary, which can only move the
+            // probe earlier and never splits a character.
+            let decl_offset = floor_char_boundary(original, node.byte_range.0);
+            let line_start = original[..decl_offset]
                 .rfind('\n')
                 .map(|pos| pos + 1)
                 .unwrap_or(0);
@@ -142,6 +153,22 @@ fn range_touched(edit_ranges: &[(usize, usize)], byte: usize) -> bool {
     edit_ranges
         .iter()
         .any(|&(s, e)| s <= byte && byte < e.max(s + 1))
+}
+
+/// Largest char boundary at or below `index`, clamped to `text.len()`.
+///
+/// Stored PDG byte offsets can point anywhere once the file has been edited
+/// since indexing, including into the middle of a multi-byte character.
+/// Slicing at such an offset panics, so every use of a stored offset against
+/// live text goes through here first. Rounding DOWN (never up) can only move
+/// the probe to an earlier line, which is safe for a heuristic like
+/// visibility detection.
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 /// Does any test-side node reference `symbol_name` through the call/data
@@ -210,5 +237,35 @@ mod test {
         assert_eq!(finding.level, "medium");
         assert!(finding.reason.contains("3 callers"));
         assert!(finding.reason.contains("tests reference"));
+    }
+
+    /// A stale PDG offset must never panic a preview.
+    ///
+    /// The indexed byte range is not refreshed when the file changes, so the
+    /// offset can land inside a multi-byte character. The old
+    /// `original[..offset.min(len)]` guarded length only and panicked exactly
+    /// there; `floor_char_boundary` snaps down to a real boundary.
+    #[test]
+    fn test_floor_char_boundary_never_splits_a_character() {
+        // `//aé\n`: bytes 0..=2 are `//a`, `é` occupies bytes 3 and 4, the
+        // newline is byte 5. Offset 4 is the middle of `é`.
+        let text = "//aé\npub fn f() {}";
+        assert!(!text.is_char_boundary(4), "fixture must split `é`");
+
+        assert_eq!(floor_char_boundary(text, 4), 3, "snaps down, never up");
+        assert_eq!(floor_char_boundary(text, 3), 3, "a boundary is kept");
+        assert_eq!(floor_char_boundary(text, 5), 5, "past the char is fine");
+
+        // Out of bounds still clamps rather than panicking.
+        assert_eq!(floor_char_boundary(text, text.len() + 1_000), text.len());
+        assert_eq!(floor_char_boundary(text, 0), 0);
+
+        // The property that matters: slicing at the result cannot panic, for
+        // EVERY offset in the string.
+        for offset in 0..=text.len() + 5 {
+            let boundary = floor_char_boundary(text, offset);
+            assert!(text.is_char_boundary(boundary), "offset {offset}");
+            let _ = &text[..boundary];
+        }
     }
 }
