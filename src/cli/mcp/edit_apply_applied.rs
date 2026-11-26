@@ -62,16 +62,28 @@ pub(crate) fn replace_spans(changes: &[EditChange]) -> Vec<ReplaceSpan> {
 ///   replacement text;
 /// * offsets before any replacement resolve unchanged.
 pub(crate) fn translate_original_offset(offset: usize, spans: &[ReplaceSpan]) -> usize {
-    let mut shift: i64 = 0;
-    for span in spans {
-        if span.end <= offset {
-            shift += span.delta();
-        } else if span.start <= offset && offset < span.end {
-            // Inside a replaced region: map to the start of the replacement.
-            return (span.start as i64 + shift).max(0) as usize;
-        }
-    }
-    (offset as i64 + shift).max(0) as usize
+    // Resolve WHICH replacement contains the offset first, then sum the deltas
+    // of every replacement that ENDS at or before that reference point.
+    //
+    // A single streaming accumulation is wrong whenever the spans arrive in
+    // descending source order — which is exactly the order the edit engine
+    // applies them in. For `a b\n` with `b -> é` (2..3) followed by deleting
+    // `a` (0..1), the stream sees the 2..3 span first with shift 0 and answers
+    // 2, while the `é` actually starts at byte 1 of ` é\n`. `line_of` then
+    // slices INSIDE `é` and panics — after the edit is already durable.
+    //
+    // The answer is the containing span's start (or the offset itself) plus
+    // the net delta of the spans that END before it, which is order-free.
+    let containing = spans
+        .iter()
+        .find(|span| span.start <= offset && offset < span.end);
+    let base = containing.map_or(offset, |span| span.start);
+    let shift: i64 = spans
+        .iter()
+        .filter(|span| span.end <= base)
+        .map(ReplaceSpan::delta)
+        .sum();
+    (base as i64 + shift).max(0) as usize
 }
 
 /// 1-based line number of a byte offset within a completed file string. The
@@ -202,6 +214,65 @@ mod tests {
         let spans = vec![span(2, 5, "x")];
         assert_eq!(translate_original_offset(3, &spans), 2);
         assert_eq!(translate_original_offset(4, &spans), 2);
+    }
+
+    /// DESCENDING span order — the order the edit engine actually applies in.
+    ///
+    /// A single streaming accumulation answers 2 for the original offset of
+    /// `b` here, but `é` starts at byte 1 of ` é\n`; `line_of` then slices
+    /// inside `é` and panics AFTER the edit is durable.
+    #[test]
+    fn test_translate_original_offset_descending_spans_accumulate_the_later_edit() {
+        // `b -> é` (2..3) listed FIRST, then the deletion of `a` (0..1).
+        let spans = vec![span(2, 3, "é"), span(0, 1, "")];
+        assert_eq!(
+            translate_original_offset(2, &spans),
+            1,
+            "the deletion precedes the replacement in the final text"
+        );
+        assert_eq!(translate_original_offset(3, &spans), 3);
+        // ...and the answer must not depend on the order the spans arrived in.
+        let ascending = vec![span(0, 1, ""), span(2, 3, "é")];
+        for offset in 0..=3 {
+            assert_eq!(
+                translate_original_offset(offset, &spans),
+                translate_original_offset(offset, &ascending),
+                "order-independence broke at offset {offset}"
+            );
+        }
+    }
+
+    /// The same defect end to end: descending caller order must still produce
+    /// a char-boundary `Applied:` echo instead of panicking.
+    #[test]
+    fn test_applied_lines_descending_change_order_does_not_panic() {
+        let original = "a b\n";
+        let changes = crate::cli::mcp::helpers::parse_edit_changes(
+            &serde_json::json!([
+                { "type": "replace_text", "old_text": "b", "new_text": "é" },
+                { "type": "replace_text", "old_text": "a", "new_text": "" }
+            ]),
+            Some(original),
+        )
+        .expect("changes must parse");
+        let modified = crate::cli::mcp::helpers::apply_changes_in_memory(original, &changes)
+            .expect("in-memory apply must succeed");
+        assert_eq!(modified, " é\n");
+
+        let file = BatchFileEdit {
+            canonical_path: PathBuf::from("/tmp/z.rs"),
+            display_path: "z.rs".to_string(),
+            original: original.to_string(),
+            modified,
+            changes,
+        };
+        let out = applied_lines(&[file], None);
+        assert_eq!(out.len(), 1, "one changed file must produce one echo line");
+        assert!(
+            out[0].contains("Applied: z.rs:L1-1 (+1/-1)"),
+            "echo must report the final-file range, got: {}",
+            out[0]
+        );
     }
 
     /// THE regression: a multi-byte UTF-8 character introduced by an earlier
