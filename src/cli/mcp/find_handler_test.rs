@@ -1,1270 +1,1264 @@
 use super::*;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Shape a response the way the paging tests always do: no roots, no
+/// regex note, no case recount, empty query args.
+fn shape(
+    pattern: &str,
+    output: &str,
+    result: SearchOutput,
+    offset: usize,
+    limit: Option<usize>,
+) -> Value {
+    let base = find_window(&serde_json::json!({})).unwrap();
+    shape_text_result(
+        pattern,
+        output,
+        &[],
+        result,
+        &FindWindow {
+            offset,
+            limit,
+            ..base
+        },
+        None,
+        0,
+        &serde_json::json!({}),
+    )
+}
 
-    /// Shape a response the way the paging tests always do: no roots, no
-    /// regex note, no case recount, empty query args.
-    fn shape(
-        pattern: &str,
-        output: &str,
-        result: SearchOutput,
-        offset: usize,
-        limit: Option<usize>,
-    ) -> Value {
-        let base = find_window(&serde_json::json!({})).unwrap();
-        shape_text_result(
-            pattern,
-            output,
-            &[],
-            result,
-            &FindWindow {
-                offset,
-                limit,
-                ..base
-            },
-            None,
-            0,
-            &serde_json::json!({}),
+#[test]
+fn test_find_window_limit_zero_maps_to_ceiling_not_unbounded() {
+    // `limit: 0` must NOT reach the engine as `None` (unbounded
+    // collection): the ceiling exists precisely to stop one request
+    // from parking every match of every file in the shared daemon.
+    let window = find_window(&serde_json::json!({ "limit": 0 })).unwrap();
+    assert_eq!(window.limit, Some(MAX_LIMIT));
+
+    // Values above the ceiling clamp; the offset clamps for the same
+    // reason (the engine buffers offset + limit hits per file).
+    let window =
+        find_window(&serde_json::json!({ "limit": 500_000, "offset": 90_000_000 })).unwrap();
+    assert_eq!(window.limit, Some(MAX_LIMIT));
+    assert_eq!(window.offset, MAX_LIMIT);
+
+    // A limit of None (absent) keeps the default page, not unbounded.
+    let window = find_window(&serde_json::json!({})).unwrap();
+    assert_eq!(window.limit, Some(DEFAULT_LIMIT));
+}
+
+fn project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn parse_config() {}\npub fn other() {\n    parse_config();\n}\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("README.md"), "Call parse_config first.\n").unwrap();
+    dir
+}
+
+async fn run(dir: &Path, args: Value) -> Value {
+    // A bare registry: `test_registry_for` would create `.leindex`, which
+    // marks the project as indexed.
+    let registry = Arc::new(ProjectRegistry::new(2));
+    let mut args = args;
+    args["project_path"] = json!(dir.to_string_lossy());
+    FindHandler.execute(&registry, args).await.unwrap()
+}
+
+#[tokio::test]
+async fn test_find_matches_are_grouped_by_file_with_lines() {
+    let dir = project();
+    let value = run(dir.path(), json!({"pattern": "parse_config"})).await;
+    assert_eq!(value["total_files"], 2);
+    assert_eq!(value["total_matches"], 3);
+    assert_eq!(value["has_more"], false);
+    let files: Vec<&str> = value["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["file"].as_str().unwrap())
+        .collect();
+    assert_eq!(files, ["README.md", "src/lib.rs"]);
+    assert_eq!(value["files"][1]["hits"][1]["line"], 3);
+}
+
+#[tokio::test]
+async fn test_find_searches_outside_the_workspace_without_an_index() {
+    let workspace = project();
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::fs::write(
+        elsewhere.path().join("notes.txt"),
+        "remember: parse_config lives here\n",
+    )
+    .unwrap();
+    let value = run(
+        workspace.path(),
+        json!({"pattern": "parse_config", "paths": [elsewhere.path().to_string_lossy()]}),
+    )
+    .await;
+    assert_eq!(value["total_files"], 1, "only the extra path was searched");
+    let file = value["files"][0]["file"].as_str().unwrap();
+    assert!(
+        file.ends_with("notes.txt") && Path::new(file).is_absolute(),
+        "{file}"
+    );
+    assert_eq!(value["roots"][0]["indexed"], false);
+    assert!(
+        !elsewhere.path().join(".leindex").exists(),
+        "searching must have no side effects"
+    );
+}
+
+#[tokio::test]
+async fn test_find_works_with_no_project_at_all() {
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::fs::write(elsewhere.path().join("a.txt"), "needle\n").unwrap();
+    let registry = Arc::new(ProjectRegistry::new(2));
+    let value = FindHandler
+        .execute(
+            &registry,
+            json!({"pattern": "needle", "paths": [elsewhere.path().to_string_lossy()]}),
         )
-    }
-
-    #[test]
-    fn test_find_window_limit_zero_maps_to_ceiling_not_unbounded() {
-        // `limit: 0` must NOT reach the engine as `None` (unbounded
-        // collection): the ceiling exists precisely to stop one request
-        // from parking every match of every file in the shared daemon.
-        let window = find_window(&serde_json::json!({ "limit": 0 })).unwrap();
-        assert_eq!(window.limit, Some(MAX_LIMIT));
-
-        // Values above the ceiling clamp; the offset clamps for the same
-        // reason (the engine buffers offset + limit hits per file).
-        let window =
-            find_window(&serde_json::json!({ "limit": 500_000, "offset": 90_000_000 })).unwrap();
-        assert_eq!(window.limit, Some(MAX_LIMIT));
-        assert_eq!(window.offset, MAX_LIMIT);
-
-        // A limit of None (absent) keeps the default page, not unbounded.
-        let window = find_window(&serde_json::json!({})).unwrap();
-        assert_eq!(window.limit, Some(DEFAULT_LIMIT));
-    }
-
-    fn project() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(
-            dir.path().join("src/lib.rs"),
-            "pub fn parse_config() {}\npub fn other() {\n    parse_config();\n}\n",
-        )
+        .await
         .unwrap();
-        std::fs::write(dir.path().join("README.md"), "Call parse_config first.\n").unwrap();
-        dir
-    }
+    assert_eq!(value["total_matches"], 1);
+}
 
-    async fn run(dir: &Path, args: Value) -> Value {
-        // A bare registry: `test_registry_for` would create `.leindex`, which
-        // marks the project as indexed.
-        let registry = Arc::new(ProjectRegistry::new(2));
-        let mut args = args;
-        args["project_path"] = json!(dir.to_string_lossy());
-        FindHandler.execute(&registry, args).await.unwrap()
-    }
+#[tokio::test]
+async fn test_find_ignored_dir_found_via_paths_bypasses_ignore_rules() {
+    // §3.7: an explicitly named directory is searched RAW. The default
+    // inventory consults git ignore rules and would hide the target.
+    let dir = project();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let ignored = elsewhere.path().join("target/debug");
+    std::fs::create_dir_all(&ignored).unwrap();
+    std::fs::write(ignored.join("artifact.txt"), "the hidden parse_config\n").unwrap();
+    std::fs::write(elsewhere.path().join(".gitignore"), "target/\n").unwrap();
+    let value = run(
+        dir.path(),
+        json!({"pattern": "parse_config", "paths": [elsewhere.path().to_string_lossy()]}),
+    )
+    .await;
+    assert_eq!(
+        value["total_files"], 1,
+        "the git-ignored directory must be searched when named in paths"
+    );
+    let file = value["files"][0]["file"].as_str().unwrap();
+    assert!(file.contains("target/debug/artifact.txt"), "file: {file}");
+}
 
-    #[tokio::test]
-    async fn test_find_matches_are_grouped_by_file_with_lines() {
-        let dir = project();
-        let value = run(dir.path(), json!({"pattern": "parse_config"})).await;
-        assert_eq!(value["total_files"], 2);
-        assert_eq!(value["total_matches"], 3);
-        assert_eq!(value["has_more"], false);
-        let files: Vec<&str> = value["files"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|f| f["file"].as_str().unwrap())
-            .collect();
-        assert_eq!(files, ["README.md", "src/lib.rs"]);
-        assert_eq!(value["files"][1]["hits"][1]["line"], 3);
-    }
+#[tokio::test]
+async fn test_find_paths_file_root_is_never_doubled() {
+    // §3.7: a paths entry naming one FILE displays as that path exactly —
+    // the engine reports the bare file name as rel, and joining root+rel
+    // again produced the doubled `g6.log/g6.log`.
+    let dir = project();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let file = elsewhere.path().join("solo.log");
+    std::fs::write(&file, "parse_config appears here\n").unwrap();
+    let value = run(
+        dir.path(),
+        json!({"pattern": "parse_config", "paths": [file.to_string_lossy()]}),
+    )
+    .await;
+    assert_eq!(value["total_files"], 1);
+    let shown = value["files"][0]["file"].as_str().unwrap();
+    assert_eq!(
+        shown,
+        file.to_string_lossy(),
+        "a named file must render as its own path, got {shown}"
+    );
+    assert!(
+        !shown.ends_with("solo.log/solo.log"),
+        "the doubled path is the defect"
+    );
+}
 
-    #[tokio::test]
-    async fn test_find_searches_outside_the_workspace_without_an_index() {
-        let workspace = project();
-        let elsewhere = tempfile::tempdir().unwrap();
-        std::fs::write(
-            elsewhere.path().join("notes.txt"),
-            "remember: parse_config lives here\n",
-        )
-        .unwrap();
-        let value = run(
-            workspace.path(),
-            json!({"pattern": "parse_config", "paths": [elsewhere.path().to_string_lossy()]}),
-        )
-        .await;
-        assert_eq!(value["total_files"], 1, "only the extra path was searched");
-        let file = value["files"][0]["file"].as_str().unwrap();
-        assert!(
-            file.ends_with("notes.txt") && Path::new(file).is_absolute(),
-            "{file}"
-        );
-        assert_eq!(value["roots"][0]["indexed"], false);
-        assert!(
-            !elsewhere.path().join(".leindex").exists(),
-            "searching must have no side effects"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_find_works_with_no_project_at_all() {
-        let elsewhere = tempfile::tempdir().unwrap();
-        std::fs::write(elsewhere.path().join("a.txt"), "needle\n").unwrap();
-        let registry = Arc::new(ProjectRegistry::new(2));
-        let value = FindHandler
-            .execute(
-                &registry,
-                json!({"pattern": "needle", "paths": [elsewhere.path().to_string_lossy()]}),
-            )
-            .await
-            .unwrap();
-        assert_eq!(value["total_matches"], 1);
-    }
-
-    #[tokio::test]
-    async fn test_find_ignored_dir_found_via_paths_bypasses_ignore_rules() {
-        // §3.7: an explicitly named directory is searched RAW. The default
-        // inventory consults git ignore rules and would hide the target.
-        let dir = project();
-        let elsewhere = tempfile::tempdir().unwrap();
-        let ignored = elsewhere.path().join("target/debug");
-        std::fs::create_dir_all(&ignored).unwrap();
-        std::fs::write(ignored.join("artifact.txt"), "the hidden parse_config\n").unwrap();
-        std::fs::write(elsewhere.path().join(".gitignore"), "target/\n").unwrap();
-        let value = run(
-            dir.path(),
-            json!({"pattern": "parse_config", "paths": [elsewhere.path().to_string_lossy()]}),
-        )
-        .await;
-        assert_eq!(
-            value["total_files"], 1,
-            "the git-ignored directory must be searched when named in paths"
-        );
-        let file = value["files"][0]["file"].as_str().unwrap();
-        assert!(file.contains("target/debug/artifact.txt"), "file: {file}");
-    }
-
-    #[tokio::test]
-    async fn test_find_paths_file_root_is_never_doubled() {
-        // §3.7: a paths entry naming one FILE displays as that path exactly —
-        // the engine reports the bare file name as rel, and joining root+rel
-        // again produced the doubled `g6.log/g6.log`.
-        let dir = project();
-        let elsewhere = tempfile::tempdir().unwrap();
-        let file = elsewhere.path().join("solo.log");
-        std::fs::write(&file, "parse_config appears here\n").unwrap();
-        let value = run(
-            dir.path(),
-            json!({"pattern": "parse_config", "paths": [file.to_string_lossy()]}),
-        )
-        .await;
-        assert_eq!(value["total_files"], 1);
-        let shown = value["files"][0]["file"].as_str().unwrap();
-        assert_eq!(
-            shown,
-            file.to_string_lossy(),
-            "a named file must render as its own path, got {shown}"
-        );
-        assert!(
-            !shown.ends_with("solo.log/solo.log"),
-            "the doubled path is the defect"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_find_literal_metachar_pattern_auto_retries_as_regex() {
-        // §3.8: `a|b` as a literal matches nothing; the file holds b. The
-        // zero-hit literal search gets ONE retry as a regex, the results
-        // arrive, and the note says what happened. A lone `.` must NOT
-        // trigger the retry.
-        let dir = project();
-        let value = run(dir.path(), json!({"pattern": "zzz|other"})).await;
-        assert_eq!(value["total_matches"], 1, "b-side of the regex");
-        assert_eq!(
-            value["note"].as_str().unwrap_or_default(),
-            "(interpreted as regex)"
-        );
-        let lone_dot = run(dir.path(), json!({"pattern": "."})).await;
-        assert!(
-            lone_dot["total_matches"].as_u64().unwrap() > 0,
-            "a lone dot matches literally and needs no reinterpretation"
-        );
-        let both_dead = run(dir.path(), json!({"pattern": "zzz|qqq"})).await;
-        assert_eq!(both_dead["total_matches"], 0);
-        assert!(
-            both_dead["note"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("both matched nothing"),
-            "note: {}",
-            both_dead["note"]
-        );
-    }
-
-    #[tokio::test]
-    async fn test_find_context_merge_never_prints_a_line_twice() {
-        // §4.2b: touching windows must not print a line twice — measured per
-        // FILE, because line numbers across different files legitimately
-        // collide.
-        let dir = project();
-        let value = run(
-            dir.path(),
-            json!({"pattern": "parse_config", "context_lines": 2}),
-        )
-        .await;
-        let seen = collect_printed_lines(&value);
-        let unique: std::collections::BTreeSet<_> = seen.iter().cloned().collect();
-        assert_eq!(
-            seen.len(),
-            unique.len(),
-            "a line printed twice is the defect; printed {seen:?}"
-        );
-    }
-
-    /// Every context line the page prints, as (file, line) pairs.
-    fn collect_printed_lines(value: &Value) -> Vec<(String, u64)> {
-        let mut lines = Vec::new();
-        for file in value["files"].as_array().unwrap() {
-            let path = file["file"].as_str().unwrap_or("").to_string();
-            for hit in file["hits"].as_array().unwrap() {
-                let line = hit["line"].as_u64().unwrap();
-                let before_len = hit["before"].as_array().map_or(0, Vec::len) as u64;
-                for offset in 0..before_len {
-                    lines.push((path.clone(), line - before_len + offset));
-                }
-                lines.push((path.clone(), line));
-                let after_len = hit["after"].as_array().map_or(0, Vec::len) as u64;
-                for offset in 1..=after_len {
-                    lines.push((path.clone(), line + offset));
-                }
-            }
-        }
-        lines
-    }
-
-    #[tokio::test]
-    async fn test_find_tests_rank_after_source_and_collapse() {
-        // §4.2c: default — test-file entries come after source entries and
-        // collapse to one summary line each; include_tests=true shows them
-        // in full, still ranked last.
-        let dir = project();
-        std::fs::write(
-            dir.path().join("src/lib_test.rs"),
-            "parse_config in tests\n",
-        )
-        .unwrap();
-        let collapsed = run(dir.path(), json!({"pattern": "parse_config"})).await;
-        let files = collapsed["files"].as_array().unwrap();
-        let test_positions: Vec<usize> = files
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| f.get("collapsed").is_some())
-            .map(|(i, _)| i)
-            .collect();
-        assert_eq!(test_positions.len(), 1, "one collapsed test entry");
-        assert_eq!(
-            test_positions[0],
-            files.len() - 1,
-            "the collapsed entry rides at the end"
-        );
-        assert!(
-            files[test_positions[0]]["collapsed"]
-                .as_str()
-                .unwrap()
-                .starts_with("tests: ")
-        );
-        let source_entry = files
-            .iter()
-            .find(|f| f.get("collapsed").is_none())
-            .expect("source files stay detailed");
-        assert!(source_entry.get("hits").is_some());
-
-        let expanded = run(
-            dir.path(),
-            json!({"pattern": "parse_config", "include_tests": true}),
-        )
-        .await;
-        let expanded_files = expanded["files"].as_array().unwrap();
-        assert!(
-            expanded_files.iter().all(|f| f.get("collapsed").is_none()),
-            "include_tests=true shows tests in full"
-        );
-        let last = expanded_files.last().unwrap()["file"].as_str().unwrap();
-        assert!(
-            last.ends_with("_test.rs"),
-            "tests still rank after source, got {last}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_find_token_budget_fills_greedily_and_emits_next() {
-        // §4.2d: a tiny budget keeps one row, ends the page early, and the
-        // continuation is the token (with per-file cursors) — never a bare
-        // offset, which cannot express the rows the budget cut away.
-        let dir = project();
-        let first = run(
-            dir.path(),
-            json!({"pattern": "parse_config", "token_budget": 12}),
-        )
-        .await;
-        assert_eq!(first["has_more"], true);
-        assert!(
-            first["files"].as_array().unwrap().len() < 2,
-            "the budget must cut the page short"
-        );
-        assert!(first["next"].as_str().is_some());
-        assert!(
-            first.get("next_offset").is_none(),
-            "a budget-cut page must not advertise a bare offset"
-        );
-        assert!(first["budget_note"].is_null() || first["budget_note"].as_str().is_some());
-        let token = first["next"]
+#[tokio::test]
+async fn test_find_literal_metachar_pattern_auto_retries_as_regex() {
+    // §3.8: `a|b` as a literal matches nothing; the file holds b. The
+    // zero-hit literal search gets ONE retry as a regex, the results
+    // arrive, and the note says what happened. A lone `.` must NOT
+    // trigger the retry.
+    let dir = project();
+    let value = run(dir.path(), json!({"pattern": "zzz|other"})).await;
+    assert_eq!(value["total_matches"], 1, "b-side of the regex");
+    assert_eq!(
+        value["note"].as_str().unwrap_or_default(),
+        "(interpreted as regex)"
+    );
+    let lone_dot = run(dir.path(), json!({"pattern": "."})).await;
+    assert!(
+        lone_dot["total_matches"].as_u64().unwrap() > 0,
+        "a lone dot matches literally and needs no reinterpretation"
+    );
+    let both_dead = run(dir.path(), json!({"pattern": "zzz|qqq"})).await;
+    assert_eq!(both_dead["total_matches"], 0);
+    assert!(
+        both_dead["note"]
             .as_str()
-            .expect("budget page issues a continuation token");
-        let second = run(
-            dir.path(),
-            json!({"pattern": "parse_config", "next": token}),
-        )
-        .await;
-        let first_files: Vec<&str> = first["files"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|f| f["file"].as_str().unwrap())
-            .collect();
-        let second_files: Vec<&str> = second["files"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|f| f["file"].as_str().unwrap())
-            .collect();
-        for file in &first_files {
-            assert!(
-                !second_files.contains(file),
-                "page 2 re-served {file}: pages overlap"
-            );
-        }
-    }
+            .unwrap_or_default()
+            .contains("both matched nothing"),
+        "note: {}",
+        both_dead["note"]
+    );
+}
 
-    #[tokio::test]
-    async fn test_find_per_file_cap_overflow_reachable_on_next_page() {
-        // §4.2e: the cap bounds DISPLAY, not reach. Past-cap matches must
-        // appear on the next offset page (the old text claimed they appear
-        // on no page). lib.rs holds 2 matches; cap 1 shows 1 and announces
-        // the withheld tail.
-        let dir = project();
-        let first = run(
-            dir.path(),
-            json!({"pattern": "parse_config", "per_file_cap": 1}),
-        )
-        .await;
-        let lib = first["files"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|f| f["file"].as_str().unwrap().ends_with("lib.rs"))
-            .unwrap();
-        // `matches` stays the honest total (2); the DISPLAYED hits are capped.
-        assert_eq!(lib["matches"], 2);
-        assert_eq!(lib["hits"].as_array().unwrap().len(), 1);
-        assert_eq!(lib["cap_line"], "+1 more in this file (next page)");
-        assert_eq!(first["withheld_by_cap"], 1);
-        let second = run(
-            dir.path(),
-            json!({"pattern": "parse_config", "per_file_cap": 1, "offset": first["next_offset"]}),
-        )
-        .await;
-        assert!(
-            second["total_matches"].as_u64().unwrap() >= 1,
-            "past-cap matches must be reachable on the next page"
-        );
-    }
+#[tokio::test]
+async fn test_find_context_merge_never_prints_a_line_twice() {
+    // §4.2b: touching windows must not print a line twice — measured per
+    // FILE, because line numbers across different files legitimately
+    // collide.
+    let dir = project();
+    let value = run(
+        dir.path(),
+        json!({"pattern": "parse_config", "context_lines": 2}),
+    )
+    .await;
+    let seen = collect_printed_lines(&value);
+    let unique: std::collections::BTreeSet<_> = seen.iter().cloned().collect();
+    assert_eq!(
+        seen.len(),
+        unique.len(),
+        "a line printed twice is the defect; printed {seen:?}"
+    );
+}
 
-    #[tokio::test]
-    async fn test_find_new_output_modes() {
-        // §4.2f: definitions routes through the symbols machinery (with no
-        // symbol index it answers honestly and says so); callsites drop the
-        // definition line; exists answers and points at the hit.
-        let dir = project();
-        let defs = run(
-            dir.path(),
-            json!({"pattern": "parse_config", "output": "definitions"}),
-        )
-        .await;
-        assert_eq!(defs["output"], "definitions");
-        assert_eq!(defs["target"], "symbols");
-        assert_eq!(
-            defs["note"].as_str().unwrap_or_default(),
-            "Symbol search needs an index: run leindex_manage action=index"
-        );
-
-        let calls = run(
-            dir.path(),
-            json!({"pattern": "parse_config(", "output": "callsites"}),
-        )
-        .await;
-        assert_eq!(calls["output"], "callsites");
-        assert_eq!(
-            calls["total_matches"], 1,
-            "the one call site; definition excluded"
-        );
-        let texts: Vec<&str> = calls["files"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .flat_map(|f| f["hits"].as_array().unwrap().iter())
-            .map(|h| h["text"].as_str().unwrap())
-            .collect();
-        assert!(
-            texts.iter().all(|t| !t.trim_start().starts_with("pub fn ")),
-            "the definition line must not ride in callsites: {texts:?}"
-        );
-
-        let exists = run(
-            dir.path(),
-            json!({"pattern": "parse_config", "output": "exists"}),
-        )
-        .await;
-        assert_eq!(exists["exists"], true);
-        assert_eq!(exists["first"]["line"], 1);
-        let missing = run(
-            dir.path(),
-            json!({"pattern": "zzz_nothing_zzz", "output": "exists"}),
-        )
-        .await;
-        assert_eq!(missing["exists"], false);
-    }
-
-    #[tokio::test]
-    async fn test_find_zero_result_reports_reasons() {
-        // §6.7: a case-sensitive zero with insensitive hits names the case
-        // mismatch; a zero with no candidates hints at ignore rules.
-        let dir = project();
-        let case = run(
-            dir.path(),
-            json!({"pattern": "PARSE_CONFIG", "case": "sensitive"}),
-        )
-        .await;
-        assert_eq!(case["total_matches"], 0);
-        let reasons: Vec<&str> = case["zero_reasons"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|r| r.as_str().unwrap())
-            .collect();
-        assert!(
-            reasons.iter().any(|r| r.contains("case-insensitive")),
-            "reasons: {reasons:?}"
-        );
-
-        let no_candidates = run(
-            dir.path(),
-            json!({"pattern": "zzz_nothing_zzz", "exclude_globs": ["*.rs", "*.md"]}),
-        )
-        .await;
-        assert_eq!(no_candidates["total_matches"], 0);
-        let reasons: Vec<&str> = no_candidates["zero_reasons"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|r| r.as_str().unwrap())
-            .collect();
-        assert!(
-            reasons.iter().any(|r| r.contains("excluded")),
-            "reasons: {reasons:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_find_next_token_pages_without_overlap() {
-        // §6.8: the token alone (plus project_path) continues the stream;
-        // the two pages must not share a file entry.
-        let dir = project();
-        let first = run(dir.path(), json!({"pattern": "parse_config", "limit": 1})).await;
-        let token = first["next"].as_str().expect("page 1 must issue next");
-        let registry = Arc::new(ProjectRegistry::new(2));
-        let second = FindHandler
-            .execute(
-                &registry,
-                json!({"next": token, "project_path": dir.path().to_string_lossy()}),
-            )
-            .await
-            .unwrap();
-        assert_eq!(second["pattern"], "parse_config", "the query is replayed");
-        // §6.8 non-overlap is hit-level: a file with more hits than the
-        // page limit legitimately appears on both pages (its NEXT hits),
-        // but no (file, line) pair may repeat.
-        let hit_set = |page: &Value| -> std::collections::BTreeSet<(String, u64)> {
-            page["files"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .flat_map(|file| {
-                    let path = file["file"].as_str().unwrap().to_string();
-                    file["hits"]
-                        .as_array()
-                        .map(|hits| {
-                            hits.iter()
-                                .filter_map(|hit| {
-                                    hit["line"].as_u64().map(|line| (path.clone(), line))
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default()
-                })
-                .collect()
-        };
-        let first_hits = hit_set(&first);
-        let second_hits = hit_set(&second);
-        let second_files: Vec<&str> = second["files"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|f| f["file"].as_str().unwrap())
-            .collect();
-        assert!(
-            !second_files.is_empty(),
-            "token page must serve the stream's remainder"
-        );
-        for hit in &second_hits {
-            assert!(
-                !first_hits.contains(hit),
-                "token page re-served {hit:?}: pages overlap"
-            );
-        }
-        assert_eq!(second["offset"], first["next_offset"]);
-    }
-
-    /// Regression (Codex round 4, C4-1): a continuation page used to drop
-    /// the resume cursors of every file it did not show a row for —
-    /// including files an earlier page had already delivered in full. Those
-    /// files were visited again (the engine keeps their cursor entry so the
-    /// next page skips them), but with no row on the page the shaper filtered
-    /// their cursor out of the next token, and the page after that served
-    /// their already-delivered hits a second time.
-    ///
-    /// Three files (b.txt holds two hits), `limit: 1` pages the stream one
-    /// hit at a time: a:1, b:1 (a.txt fully skipped), b:2, c:1. Walking the
-    /// tokens to exhaustion must deliver every hit exactly once.
-    #[tokio::test]
-    async fn test_find_budget_cut_continuation_keeps_cursors_of_fully_delivered_files() {
-        let dir = tempfile::tempdir().unwrap();
-        for (name, body) in [
-            ("a.txt", "parse_config\n"),
-            ("b.txt", "parse_config\nparse_config\n"),
-            ("c.txt", "parse_config\n"),
-        ] {
-            std::fs::write(dir.path().join(name), body).unwrap();
-        }
-        let page = |args: Value| {
-            let dir = dir.path().to_path_buf();
-            async move {
-                let registry = Arc::new(ProjectRegistry::new(2));
-                let mut args = args;
-                args["project_path"] = json!(dir.to_string_lossy());
-                FindHandler.execute(&registry, args).await.unwrap()
+/// Every context line the page prints, as (file, line) pairs.
+fn collect_printed_lines(value: &Value) -> Vec<(String, u64)> {
+    let mut lines = Vec::new();
+    for file in value["files"].as_array().unwrap() {
+        let path = file["file"].as_str().unwrap_or("").to_string();
+        for hit in file["hits"].as_array().unwrap() {
+            let line = hit["line"].as_u64().unwrap();
+            let before_len = hit["before"].as_array().map_or(0, Vec::len) as u64;
+            for offset in 0..before_len {
+                lines.push((path.clone(), line - before_len + offset));
             }
-        };
-        let hits_of = |value: &Value| -> Vec<(String, u64)> {
-            value["files"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .flat_map(|file| {
-                    let path = file["file"].as_str().unwrap().to_string();
-                    file["hits"]
-                        .as_array()
-                        .map(|hits| {
-                            hits.iter()
-                                .filter_map(|hit| {
-                                    hit["line"].as_u64().map(|line| (path.clone(), line))
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default()
-                })
-                .collect()
-        };
-
-        let mut delivered: Vec<(String, u64)> = Vec::new();
-        let mut first = page(json!({ "pattern": "parse_config", "limit": 1 })).await;
-        assert_eq!(
-            first["files"].as_array().unwrap().len(),
-            1,
-            "one hit per page: {first}"
-        );
-        let mut pages = 1;
-        loop {
-            delivered.extend(hits_of(&first));
-            let Some(next) = first["next"].as_str().map(str::to_string) else {
-                break;
-            };
-            assert!(pages < 10, "the stream never ends: {first}");
-            first = page(json!({ "next": next, "limit": 1 })).await;
-            pages += 1;
+            lines.push((path.clone(), line));
+            let after_len = hit["after"].as_array().map_or(0, Vec::len) as u64;
+            for offset in 1..=after_len {
+                lines.push((path.clone(), line + offset));
+            }
         }
-        assert_eq!(
-            first["has_more"], false,
-            "the last page must close the stream: {first}"
-        );
-        delivered.sort();
-        assert_eq!(
-            delivered,
-            [
-                ("a.txt".to_string(), 1),
-                ("b.txt".to_string(), 1),
-                ("b.txt".to_string(), 2),
-                ("c.txt".to_string(), 1),
-            ],
-            "every hit exactly once across {pages} pages"
-        );
     }
+    lines
+}
 
-    #[test]
-    fn test_find_regex_like_heuristic_lone_dot_exempt() {
-        // §3.8 heuristic, unit-level: the metacharacters that CHANGE meaning
-        // fire; a LONE dot (e.g. a filename or version fragment) does not.
-        assert!(looks_like_regex("a|b"));
-        assert!(looks_like_regex("foo.*bar"));
-        assert!(looks_like_regex(r"\bword\b"));
-        assert!(looks_like_regex("[a-z]+"));
-        assert!(looks_like_regex("(a)"));
+#[tokio::test]
+async fn test_find_tests_rank_after_source_and_collapse() {
+    // §4.2c: default — test-file entries come after source entries and
+    // collapse to one summary line each; include_tests=true shows them
+    // in full, still ranked last.
+    let dir = project();
+    std::fs::write(
+        dir.path().join("src/lib_test.rs"),
+        "parse_config in tests\n",
+    )
+    .unwrap();
+    let collapsed = run(dir.path(), json!({"pattern": "parse_config"})).await;
+    let files = collapsed["files"].as_array().unwrap();
+    let test_positions: Vec<usize> = files
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.get("collapsed").is_some())
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(test_positions.len(), 1, "one collapsed test entry");
+    assert_eq!(
+        test_positions[0],
+        files.len() - 1,
+        "the collapsed entry rides at the end"
+    );
+    assert!(
+        files[test_positions[0]]["collapsed"]
+            .as_str()
+            .unwrap()
+            .starts_with("tests: ")
+    );
+    let source_entry = files
+        .iter()
+        .find(|f| f.get("collapsed").is_none())
+        .expect("source files stay detailed");
+    assert!(source_entry.get("hits").is_some());
+
+    let expanded = run(
+        dir.path(),
+        json!({"pattern": "parse_config", "include_tests": true}),
+    )
+    .await;
+    let expanded_files = expanded["files"].as_array().unwrap();
+    assert!(
+        expanded_files.iter().all(|f| f.get("collapsed").is_none()),
+        "include_tests=true shows tests in full"
+    );
+    let last = expanded_files.last().unwrap()["file"].as_str().unwrap();
+    assert!(
+        last.ends_with("_test.rs"),
+        "tests still rank after source, got {last}"
+    );
+}
+
+#[tokio::test]
+async fn test_find_token_budget_fills_greedily_and_emits_next() {
+    // §4.2d: a tiny budget keeps one row, ends the page early, and the
+    // continuation is the token (with per-file cursors) — never a bare
+    // offset, which cannot express the rows the budget cut away.
+    let dir = project();
+    let first = run(
+        dir.path(),
+        json!({"pattern": "parse_config", "token_budget": 12}),
+    )
+    .await;
+    assert_eq!(first["has_more"], true);
+    assert!(
+        first["files"].as_array().unwrap().len() < 2,
+        "the budget must cut the page short"
+    );
+    assert!(first["next"].as_str().is_some());
+    assert!(
+        first.get("next_offset").is_none(),
+        "a budget-cut page must not advertise a bare offset"
+    );
+    assert!(first["budget_note"].is_null() || first["budget_note"].as_str().is_some());
+    let token = first["next"]
+        .as_str()
+        .expect("budget page issues a continuation token");
+    let second = run(
+        dir.path(),
+        json!({"pattern": "parse_config", "next": token}),
+    )
+    .await;
+    let first_files: Vec<&str> = first["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["file"].as_str().unwrap())
+        .collect();
+    let second_files: Vec<&str> = second["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["file"].as_str().unwrap())
+        .collect();
+    for file in &first_files {
         assert!(
-            looks_like_regex("3.14"),
-            "a dot next to other chars is regex-shaped"
-        );
-        assert!(!looks_like_regex("."), "a lone dot is literal-shaped");
-        assert!(!looks_like_regex("word."));
-        assert!(!looks_like_regex("plain"));
-    }
-
-    #[tokio::test]
-    async fn test_find_output_modes() {
-        let dir = project();
-        let count = run(
-            dir.path(),
-            json!({"pattern": "parse_config", "output": "count"}),
-        )
-        .await;
-        assert_eq!(count["total_matches"], 3);
-        assert!(count.get("files").is_none() && count.get("hits").is_none());
-        let files = run(
-            dir.path(),
-            json!({"pattern": "parse_config", "output": "files"}),
-        )
-        .await;
-        assert_eq!(
-            files["files"][1],
-            json!({"file": "src/lib.rs", "matches": 2})
+            !second_files.contains(file),
+            "page 2 re-served {file}: pages overlap"
         );
     }
+}
 
-    #[test]
-    fn test_continuation_past_ceiling_boundaries() {
-        assert!(!continuation_past_ceiling(MAX_LIMIT));
-        assert!(continuation_past_ceiling(MAX_LIMIT + 1));
+#[tokio::test]
+async fn test_find_per_file_cap_overflow_reachable_on_next_page() {
+    // §4.2e: the cap bounds DISPLAY, not reach. Past-cap matches must
+    // appear on the next offset page (the old text claimed they appear
+    // on no page). lib.rs holds 2 matches; cap 1 shows 1 and announces
+    // the withheld tail.
+    let dir = project();
+    let first = run(
+        dir.path(),
+        json!({"pattern": "parse_config", "per_file_cap": 1}),
+    )
+    .await;
+    let lib = first["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["file"].as_str().unwrap().ends_with("lib.rs"))
+        .unwrap();
+    // `matches` stays the honest total (2); the DISPLAYED hits are capped.
+    assert_eq!(lib["matches"], 2);
+    assert_eq!(lib["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(lib["cap_line"], "+1 more in this file (next page)");
+    assert_eq!(first["withheld_by_cap"], 1);
+    let second = run(
+        dir.path(),
+        json!({"pattern": "parse_config", "per_file_cap": 1, "offset": first["next_offset"]}),
+    )
+    .await;
+    assert!(
+        second["total_matches"].as_u64().unwrap() >= 1,
+        "past-cap matches must be reachable on the next page"
+    );
+}
+
+#[tokio::test]
+async fn test_find_new_output_modes() {
+    // §4.2f: definitions routes through the symbols machinery (with no
+    // symbol index it answers honestly and says so); callsites drop the
+    // definition line; exists answers and points at the hit.
+    let dir = project();
+    let defs = run(
+        dir.path(),
+        json!({"pattern": "parse_config", "output": "definitions"}),
+    )
+    .await;
+    assert_eq!(defs["output"], "definitions");
+    assert_eq!(defs["target"], "symbols");
+    assert_eq!(
+        defs["note"].as_str().unwrap_or_default(),
+        "Symbol search needs an index: run leindex_manage action=index"
+    );
+
+    let calls = run(
+        dir.path(),
+        json!({"pattern": "parse_config(", "output": "callsites"}),
+    )
+    .await;
+    assert_eq!(calls["output"], "callsites");
+    assert_eq!(
+        calls["total_matches"], 1,
+        "the one call site; definition excluded"
+    );
+    let texts: Vec<&str> = calls["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|f| f["hits"].as_array().unwrap().iter())
+        .map(|h| h["text"].as_str().unwrap())
+        .collect();
+    assert!(
+        texts.iter().all(|t| !t.trim_start().starts_with("pub fn ")),
+        "the definition line must not ride in callsites: {texts:?}"
+    );
+
+    let exists = run(
+        dir.path(),
+        json!({"pattern": "parse_config", "output": "exists"}),
+    )
+    .await;
+    assert_eq!(exists["exists"], true);
+    assert_eq!(exists["first"]["line"], 1);
+    let missing = run(
+        dir.path(),
+        json!({"pattern": "zzz_nothing_zzz", "output": "exists"}),
+    )
+    .await;
+    assert_eq!(missing["exists"], false);
+}
+
+#[tokio::test]
+async fn test_find_zero_result_reports_reasons() {
+    // §6.7: a case-sensitive zero with insensitive hits names the case
+    // mismatch; a zero with no candidates hints at ignore rules.
+    let dir = project();
+    let case = run(
+        dir.path(),
+        json!({"pattern": "PARSE_CONFIG", "case": "sensitive"}),
+    )
+    .await;
+    assert_eq!(case["total_matches"], 0);
+    let reasons: Vec<&str> = case["zero_reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap())
+        .collect();
+    assert!(
+        reasons.iter().any(|r| r.contains("case-insensitive")),
+        "reasons: {reasons:?}"
+    );
+
+    let no_candidates = run(
+        dir.path(),
+        json!({"pattern": "zzz_nothing_zzz", "exclude_globs": ["*.rs", "*.md"]}),
+    )
+    .await;
+    assert_eq!(no_candidates["total_matches"], 0);
+    let reasons: Vec<&str> = no_candidates["zero_reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap())
+        .collect();
+    assert!(
+        reasons.iter().any(|r| r.contains("excluded")),
+        "reasons: {reasons:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_find_next_token_pages_without_overlap() {
+    // §6.8: the token alone (plus project_path) continues the stream;
+    // the two pages must not share a file entry.
+    let dir = project();
+    let first = run(dir.path(), json!({"pattern": "parse_config", "limit": 1})).await;
+    let token = first["next"].as_str().expect("page 1 must issue next");
+    let registry = Arc::new(ProjectRegistry::new(2));
+    let second = FindHandler
+        .execute(
+            &registry,
+            json!({"next": token, "project_path": dir.path().to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second["pattern"], "parse_config", "the query is replayed");
+    // §6.8 non-overlap is hit-level: a file with more hits than the
+    // page limit legitimately appears on both pages (its NEXT hits),
+    // but no (file, line) pair may repeat.
+    let hit_set = |page: &Value| -> std::collections::BTreeSet<(String, u64)> {
+        page["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|file| {
+                let path = file["file"].as_str().unwrap().to_string();
+                file["hits"]
+                    .as_array()
+                    .map(|hits| {
+                        hits.iter()
+                            .filter_map(|hit| hit["line"].as_u64().map(|line| (path.clone(), line)))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect()
+    };
+    let first_hits = hit_set(&first);
+    let second_hits = hit_set(&second);
+    let second_files: Vec<&str> = second["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["file"].as_str().unwrap())
+        .collect();
+    assert!(
+        !second_files.is_empty(),
+        "token page must serve the stream's remainder"
+    );
+    for hit in &second_hits {
+        assert!(
+            !first_hits.contains(hit),
+            "token page re-served {hit:?}: pages overlap"
+        );
     }
+    assert_eq!(second["offset"], first["next_offset"]);
+}
 
-    /// A page whose continuation would land past the offset ceiling must END
-    /// the stream (has_more=false, no next_offset, ceiling note) instead of
-    /// advertising a next_offset the next request would clamp back to this
-    /// page's start — the repeat-forever page (Codex P2, round 8).
-    #[test]
-    fn test_matches_page_at_ceiling_ends_stream_instead_of_repeating() {
-        // Engine-shaped window stop (`has_more` pairs with `complete=false`;
-        // the deadline never fired): the page starting AT the ceiling is a
-        // window stop, not a time-budget stop.
-        let more = || SearchOutput {
-            returned: 5,
+/// Regression (Codex round 4, C4-1): a continuation page used to drop
+/// the resume cursors of every file it did not show a row for —
+/// including files an earlier page had already delivered in full. Those
+/// files were visited again (the engine keeps their cursor entry so the
+/// next page skips them), but with no row on the page the shaper filtered
+/// their cursor out of the next token, and the page after that served
+/// their already-delivered hits a second time.
+///
+/// Three files (b.txt holds two hits), `limit: 1` pages the stream one
+/// hit at a time: a:1, b:1 (a.txt fully skipped), b:2, c:1. Walking the
+/// tokens to exhaustion must deliver every hit exactly once.
+#[tokio::test]
+async fn test_find_budget_cut_continuation_keeps_cursors_of_fully_delivered_files() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, body) in [
+        ("a.txt", "parse_config\n"),
+        ("b.txt", "parse_config\nparse_config\n"),
+        ("c.txt", "parse_config\n"),
+    ] {
+        std::fs::write(dir.path().join(name), body).unwrap();
+    }
+    let page = |args: Value| {
+        let dir = dir.path().to_path_buf();
+        async move {
+            let registry = Arc::new(ProjectRegistry::new(2));
+            let mut args = args;
+            args["project_path"] = json!(dir.to_string_lossy());
+            FindHandler.execute(&registry, args).await.unwrap()
+        }
+    };
+    let hits_of = |value: &Value| -> Vec<(String, u64)> {
+        value["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|file| {
+                let path = file["file"].as_str().unwrap().to_string();
+                file["hits"]
+                    .as_array()
+                    .map(|hits| {
+                        hits.iter()
+                            .filter_map(|hit| hit["line"].as_u64().map(|line| (path.clone(), line)))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect()
+    };
+
+    let mut delivered: Vec<(String, u64)> = Vec::new();
+    let mut first = page(json!({ "pattern": "parse_config", "limit": 1 })).await;
+    assert_eq!(
+        first["files"].as_array().unwrap().len(),
+        1,
+        "one hit per page: {first}"
+    );
+    let mut pages = 1;
+    loop {
+        delivered.extend(hits_of(&first));
+        let Some(next) = first["next"].as_str().map(str::to_string) else {
+            break;
+        };
+        assert!(pages < 10, "the stream never ends: {first}");
+        first = page(json!({ "next": next, "limit": 1 })).await;
+        pages += 1;
+    }
+    assert_eq!(
+        first["has_more"], false,
+        "the last page must close the stream: {first}"
+    );
+    delivered.sort();
+    assert_eq!(
+        delivered,
+        [
+            ("a.txt".to_string(), 1),
+            ("b.txt".to_string(), 1),
+            ("b.txt".to_string(), 2),
+            ("c.txt".to_string(), 1),
+        ],
+        "every hit exactly once across {pages} pages"
+    );
+}
+
+#[test]
+fn test_find_regex_like_heuristic_lone_dot_exempt() {
+    // §3.8 heuristic, unit-level: the metacharacters that CHANGE meaning
+    // fire; a LONE dot (e.g. a filename or version fragment) does not.
+    assert!(looks_like_regex("a|b"));
+    assert!(looks_like_regex("foo.*bar"));
+    assert!(looks_like_regex(r"\bword\b"));
+    assert!(looks_like_regex("[a-z]+"));
+    assert!(looks_like_regex("(a)"));
+    assert!(
+        looks_like_regex("3.14"),
+        "a dot next to other chars is regex-shaped"
+    );
+    assert!(!looks_like_regex("."), "a lone dot is literal-shaped");
+    assert!(!looks_like_regex("word."));
+    assert!(!looks_like_regex("plain"));
+}
+
+#[tokio::test]
+async fn test_find_output_modes() {
+    let dir = project();
+    let count = run(
+        dir.path(),
+        json!({"pattern": "parse_config", "output": "count"}),
+    )
+    .await;
+    assert_eq!(count["total_matches"], 3);
+    assert!(count.get("files").is_none() && count.get("hits").is_none());
+    let files = run(
+        dir.path(),
+        json!({"pattern": "parse_config", "output": "files"}),
+    )
+    .await;
+    assert_eq!(
+        files["files"][1],
+        json!({"file": "src/lib.rs", "matches": 2})
+    );
+}
+
+#[test]
+fn test_continuation_past_ceiling_boundaries() {
+    assert!(!continuation_past_ceiling(MAX_LIMIT));
+    assert!(continuation_past_ceiling(MAX_LIMIT + 1));
+}
+
+/// A page whose continuation would land past the offset ceiling must END
+/// the stream (has_more=false, no next_offset, ceiling note) instead of
+/// advertising a next_offset the next request would clamp back to this
+/// page's start — the repeat-forever page (Codex P2, round 8).
+#[test]
+fn test_matches_page_at_ceiling_ends_stream_instead_of_repeating() {
+    // Engine-shaped window stop (`has_more` pairs with `complete=false`;
+    // the deadline never fired): the page starting AT the ceiling is a
+    // window stop, not a time-budget stop.
+    let more = || SearchOutput {
+        returned: 5,
+        has_more: true,
+        complete: false,
+        ..SearchOutput::default()
+    };
+
+    // Control: a normal page keeps paging.
+    let value = shape("p", "matches", more(), 10, Some(50));
+    assert_eq!(value["has_more"], true);
+    assert_eq!(value["next_offset"], 15);
+    assert!(value.get("truncated_by_ceiling").is_none());
+
+    // The page starting AT the ceiling: returned hits are served in
+    // full, but the continuation is refused with an explanation.
+    let value = shape("p", "matches", more(), MAX_LIMIT, Some(50));
+    assert_eq!(value["has_more"], false);
+    assert!(value["next_offset"].is_null());
+    assert_eq!(value["truncated_by_ceiling"], true);
+    let note = value["note"].as_str().unwrap();
+    assert!(note.contains("window ceiling"), "note: {note}");
+
+    // The straddling page (offset + returned crosses the ceiling): same
+    // honest end, no clamped overlap.
+    let value = shape("p", "matches", more(), MAX_LIMIT - 2, Some(50));
+    assert_eq!(value["has_more"], false);
+    assert!(value["next_offset"].is_null());
+    assert_eq!(value["truncated_by_ceiling"], true);
+}
+
+/// The round-10 Kilo CRITICAL: a page that ended because the WINDOW
+/// filled at the ceiling (no deadline involved) must report the ceiling
+/// as the cause. The old note keyed the budget sentence on `complete`
+/// — which a window stop also sets false — so the page was mislabeled
+/// "Stopped at the time budget" and the ceiling sentence was dead code
+/// on the matches path (`has_more => !complete` made
+/// `ceiling_ended && result.complete` unreachable).
+#[test]
+fn test_window_stop_at_ceiling_reports_the_ceiling_not_the_budget() {
+    let value = shape(
+        "p",
+        "matches",
+        SearchOutput {
+            returned: 50,
             has_more: true,
             complete: false,
             ..SearchOutput::default()
-        };
+        },
+        MAX_LIMIT,
+        Some(50),
+    );
+    assert_eq!(value["has_more"], false);
+    assert_eq!(value["truncated_by_ceiling"], true);
+    let note = value["note"].as_str().unwrap();
+    assert!(
+        note.contains("window ceiling") && !note.contains("time budget"),
+        "a window stop at the ceiling is not a time-budget stop, note: {note}"
+    );
+}
 
-        // Control: a normal page keeps paging.
-        let value = shape("p", "matches", more(), 10, Some(50));
-        assert_eq!(value["has_more"], true);
-        assert_eq!(value["next_offset"], 15);
-        assert!(value.get("truncated_by_ceiling").is_none());
-
-        // The page starting AT the ceiling: returned hits are served in
-        // full, but the continuation is refused with an explanation.
-        let value = shape("p", "matches", more(), MAX_LIMIT, Some(50));
-        assert_eq!(value["has_more"], false);
-        assert!(value["next_offset"].is_null());
-        assert_eq!(value["truncated_by_ceiling"], true);
-        let note = value["note"].as_str().unwrap();
-        assert!(note.contains("window ceiling"), "note: {note}");
-
-        // The straddling page (offset + returned crosses the ceiling): same
-        // honest end, no clamped overlap.
-        let value = shape("p", "matches", more(), MAX_LIMIT - 2, Some(50));
-        assert_eq!(value["has_more"], false);
-        assert!(value["next_offset"].is_null());
-        assert_eq!(value["truncated_by_ceiling"], true);
-    }
-
-    /// The round-10 Kilo CRITICAL: a page that ended because the WINDOW
-    /// filled at the ceiling (no deadline involved) must report the ceiling
-    /// as the cause. The old note keyed the budget sentence on `complete`
-    /// — which a window stop also sets false — so the page was mislabeled
-    /// "Stopped at the time budget" and the ceiling sentence was dead code
-    /// on the matches path (`has_more => !complete` made
-    /// `ceiling_ended && result.complete` unreachable).
-    #[test]
-    fn test_window_stop_at_ceiling_reports_the_ceiling_not_the_budget() {
-        let value = shape(
-            "p",
-            "matches",
-            SearchOutput {
-                returned: 50,
-                has_more: true,
-                complete: false,
-                ..SearchOutput::default()
-            },
-            MAX_LIMIT,
-            Some(50),
-        );
-        assert_eq!(value["has_more"], false);
-        assert_eq!(value["truncated_by_ceiling"], true);
-        let note = value["note"].as_str().unwrap();
-        assert!(
-            note.contains("window ceiling") && !note.contains("time budget"),
-            "a window stop at the ceiling is not a time-budget stop, note: {note}"
-        );
-    }
-
-    /// A zero-hit page must end the stream whatever its offset: its
-    /// next_offset equals its own offset, so a `while has_more` client would
-    /// re-serve the identical page forever (the engine forces has_more=true
-    /// on a deadline stop, making this reachable at offset == MAX_LIMIT).
-    #[test]
-    fn test_zero_hit_page_ends_the_stream() {
-        let value = shape(
-            "p",
-            "matches",
-            SearchOutput {
-                returned: 0,
-                has_more: true,
-                complete: false,
-                stopped_by_deadline: true,
-                ..SearchOutput::default()
-            },
-            MAX_LIMIT,
-            Some(50),
-        );
-        assert_eq!(value["has_more"], false);
-        assert!(value["next_offset"].is_null());
-        assert!(
-            value.get("truncated_by_ceiling").is_none(),
-            "zero hits is not a ceiling truncation"
-        );
-        let note = value["note"].as_str().unwrap_or_default();
-        assert!(note.contains("time budget"), "note: {note}");
-    }
-
-    /// A deadline-stopped page at the ceiling reports BOTH causes: the
-    /// ceiling is the binding constraint for the stream (its continuation is
-    /// unservable), and the deadline made the page's totals provisional. The
-    /// old note picked one cause from `complete` alone — which a window stop
-    /// also sets false — so a pure window stop was mislabeled "time budget"
-    /// and a deadline stop at the ceiling lost the ceiling sentence.
-    #[test]
-    fn test_deadline_stopped_page_at_ceiling_reports_both_causes() {
-        let value = shape(
-            "p",
-            "matches",
-            SearchOutput {
-                returned: 50,
-                has_more: true,
-                complete: false,
-                stopped_by_deadline: true,
-                ..SearchOutput::default()
-            },
-            MAX_LIMIT,
-            Some(50),
-        );
-        assert_eq!(value["has_more"], false);
-        assert_eq!(value["truncated_by_ceiling"], true);
-        let note = value["note"].as_str().unwrap();
-        assert!(
-            note.contains("window ceiling") && note.contains("time budget"),
-            "both the ceiling and the budget must be named, note: {note}"
-        );
-    }
-
-    /// The time-budget sentence applies to every output mode: a truncated
-    /// `count` response carries provisional totals and must say so. The
-    /// engine end state `has_more=false, complete=false` is exactly the
-    /// deadline stop (the closing fallback sets both), so the fixture
-    /// carries `stopped_by_deadline`.
-    #[test]
-    fn test_budget_note_applies_to_summary_modes() {
-        let value = shape(
-            "p",
-            "count",
-            SearchOutput {
-                has_more: false,
-                complete: false,
-                stopped_by_deadline: true,
-                stats: crate::search::textsearch::SearchStats {
-                    match_lines: 7,
-                    ..Default::default()
-                },
-                ..SearchOutput::default()
-            },
-            0,
-            None,
-        );
-        assert_eq!(value["complete"], false);
-        let note = value["note"].as_str().unwrap();
-        assert!(note.contains("time budget"), "note: {note}");
-    }
-
-    #[tokio::test]
-    async fn test_find_pages_with_next_offset() {
-        let dir = project();
-        let first = run(dir.path(), json!({"pattern": "parse_config", "limit": 2})).await;
-        assert_eq!(first["returned"], 2);
-        assert_eq!(first["has_more"], true);
-        let next = first["next_offset"].as_u64().unwrap();
-        let second = run(
-            dir.path(),
-            json!({"pattern": "parse_config", "limit": 2, "offset": next}),
-        )
-        .await;
-        assert_eq!(second["returned"], 1);
-        assert_eq!(second["has_more"], false);
-        let all = run(dir.path(), json!({"pattern": "parse_config", "limit": 0})).await;
-        assert_eq!(all["returned"], 3);
-    }
-
-    #[tokio::test]
-    async fn test_find_accepts_the_legacy_text_search_spelling() {
-        let dir = project();
-        let value = run(
-            dir.path(),
-            json!({"query": "PARSE_CONFIG", "case_sensitive": false, "max_results": 5, "include_globs": ["*.rs"]}),
-        )
-        .await;
-        assert_eq!(value["total_files"], 1);
-        let sensitive = run(
-            dir.path(),
-            json!({"query": "PARSE_CONFIG", "case_sensitive": true}),
-        )
-        .await;
-        assert_eq!(sensitive["total_matches"], 0);
-    }
-
-    #[tokio::test]
-    async fn test_find_regex_errors_are_actionable_and_bad_args_rejected() {
-        let dir = project();
-        let registry = Arc::new(ProjectRegistry::new(2));
-        let error = FindHandler
-            .execute(&registry, json!({"pattern": "(oops", "regex": true, "project_path": dir.path().to_string_lossy()}))
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("invalid pattern"), "{error}");
-        let error = FindHandler.execute(&registry, json!({})).await.unwrap_err();
-        assert!(error.message_with_hint().contains("pattern"), "{error}");
-        let error = FindHandler
-            .execute(&registry, json!({"pattern": "x", "output": "nope", "project_path": dir.path().to_string_lossy()}))
-            .await
-            .unwrap_err();
-        assert!(
-            error.message_with_hint().contains("matches | files"),
-            "{error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_find_does_not_hydrate_the_project() {
-        use crate::cli::mcp::request_meta::{PDG_LOADS, PROJECT_HYDRATIONS};
-        use std::sync::atomic::Ordering;
-        let dir = project();
-        let (pdg, hydrations) = (
-            PDG_LOADS.load(Ordering::Relaxed),
-            PROJECT_HYDRATIONS.load(Ordering::Relaxed),
-        );
-        let registry = Arc::new(ProjectRegistry::new(2));
-        FindHandler
-            .execute(
-                &registry,
-                json!({"pattern": "parse_config", "project_path": dir.path().to_string_lossy()}),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            registry.len().await,
-            0,
-            "find must not load the project into the registry"
-        );
-        assert_eq!(PDG_LOADS.load(Ordering::Relaxed), pdg);
-        assert_eq!(PROJECT_HYDRATIONS.load(Ordering::Relaxed), hydrations);
-    }
-
-    #[tokio::test]
-    async fn test_find_uses_and_refreshes_the_index_when_the_project_is_indexed() {
-        let dir = project();
-        std::fs::create_dir_all(dir.path().join(".leindex")).unwrap(); // marks the project as indexed
-        let first = run(dir.path(), json!({"pattern": "parse_config"})).await;
-        assert_eq!(first["roots"][0]["indexed"], true);
-        assert!(dir.path().join(".leindex/textindex/index.bin").is_file());
-
-        std::thread::sleep(Duration::from_millis(20));
-        std::fs::write(
-            dir.path().join("src/new.rs"),
-            "fn added_after_indexing() {}\n",
-        )
-        .unwrap();
-        let fresh = run(dir.path(), json!({"pattern": "added_after_indexing"})).await;
-        assert_eq!(
-            fresh["total_matches"], 1,
-            "files added after the index was built are still found"
-        );
-        assert!(fresh["stats"]["changed_since_index"].as_u64().unwrap() >= 1);
-    }
-
-    #[tokio::test]
-    async fn test_find_auto_target_falls_back_to_text() {
-        let dir = project();
-        let value = run(
-            dir.path(),
-            json!({"pattern": "parse_config", "target": "auto"}),
-        )
-        .await;
-        assert_eq!(value["target"], "text");
-        assert_eq!(value["total_matches"], 3);
-        assert!(value["fallback"].as_str().unwrap().contains("text"));
-    }
-
-    #[tokio::test]
-    async fn test_find_symbols_target_without_an_index_explains_itself() {
-        let dir = project();
-        let value = run(dir.path(), json!({"pattern": "parse", "target": "symbols"})).await;
-        assert_eq!(value["total_symbols"], 0);
-        assert!(value["note"].as_str().unwrap().contains("leindex_manage"));
-    }
-
-    /// #085: exclude globs must apply to explicitly NAMED files too — the
-    /// engine skips the filter for file roots, so the handler pre-checks.
-    #[tokio::test]
-    async fn test_find_paths_file_honors_include_exclude_globs() {
-        let dir = project();
-        let elsewhere = tempfile::tempdir().unwrap();
-        std::fs::write(elsewhere.path().join("keep.rs"), "parse_config here\n").unwrap();
-        std::fs::write(elsewhere.path().join("skip.log"), "parse_config here\n").unwrap();
-        let value = run(
-            dir.path(),
-            json!({
-                "pattern": "parse_config",
-                "paths": [elsewhere.path().to_string_lossy()],
-                "exclude_globs": ["*.log"],
-            }),
-        )
-        .await;
-        assert_eq!(value["total_files"], 1, "the *.log file must be excluded");
-        let shown = value["files"][0]["file"].as_str().unwrap();
-        assert!(
-            shown.ends_with("keep.rs"),
-            "kept file is the .rs one, got {shown}"
-        );
-    }
-
-    /// #086/#006: `output=exists` must resolve the first hit through
-    /// `display_path` (absolute for an external file root) and carry a
-    /// content row so the compact renderer prints the answer.
-    #[tokio::test]
-    async fn test_find_exists_answers_with_resolvable_path_and_content_row() {
-        let dir = project();
-        let elsewhere = tempfile::tempdir().unwrap();
-        let file = elsewhere.path().join("solo.txt");
-        std::fs::write(&file, "parse_config appears here\n").unwrap();
-        let value = run(
-            dir.path(),
-            json!({
-                "pattern": "parse_config",
-                "output": "exists",
-                "paths": [file.to_string_lossy()],
-            }),
-        )
-        .await;
-        assert_eq!(value["exists"], true);
-        let first_file = value["first"]["file"].as_str().unwrap();
-        assert_eq!(
-            first_file,
-            file.to_string_lossy(),
-            "exists.first uses display_path"
-        );
-        let row = value["files"][0]["file"].as_str().unwrap();
-        assert_eq!(row, file.to_string_lossy());
-        assert!(
-            value["files"][0]["hits"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("parse_config")
-        );
-    }
-
-    /// #087: overlapping context windows keep the FIRST lines after the
-    /// previous match — the shared lines print once, in order.
-    #[tokio::test]
-    async fn test_find_context_windows_keep_first_lines_and_print_once() {
-        let dir = project();
-        std::fs::write(
-            dir.path().join("src/context.rs"),
-            "parse_config one\nmiddle line\nparse_config two\n",
-        )
-        .unwrap();
-        let value = run(
-            dir.path(),
-            json!({"pattern": "parse_config", "context_lines": 2}),
-        )
-        .await;
-        let context = value["files"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|f| f["file"].as_str().unwrap().ends_with("context.rs"))
-            .expect("context fixture file");
-        let hits = context["hits"].as_array().unwrap();
-        assert_eq!(hits.len(), 2);
-        let first_after: Vec<&str> = hits[0]["after"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|line| line.as_str().unwrap())
-            .collect();
-        assert_eq!(
-            first_after,
-            ["middle line"],
-            "the near context line is kept"
-        );
-        let seen = collect_printed_lines(&value);
-        let unique: std::collections::BTreeSet<_> = seen.iter().cloned().collect();
-        assert_eq!(seen.len(), unique.len(), "no line prints twice: {seen:?}");
-    }
-
-    /// #088: a deadline-stopped regex retry is not a clean miss — the note
-    /// must say the scan did not finish.
-    #[test]
-    fn test_retry_note_distinguishes_incomplete_scan_from_clean_miss() {
-        let complete_zero = SearchOutput {
-            complete: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            retry_note(&complete_zero),
-            Some("literal and regex readings both matched nothing")
-        );
-        let stopped = SearchOutput {
+/// A zero-hit page must end the stream whatever its offset: its
+/// next_offset equals its own offset, so a `while has_more` client would
+/// re-serve the identical page forever (the engine forces has_more=true
+/// on a deadline stop, making this reachable at offset == MAX_LIMIT).
+#[test]
+fn test_zero_hit_page_ends_the_stream() {
+    let value = shape(
+        "p",
+        "matches",
+        SearchOutput {
+            returned: 0,
+            has_more: true,
             complete: false,
             stopped_by_deadline: true,
-            ..Default::default()
-        };
-        assert!(retry_note(&stopped).unwrap().contains("did not finish"));
-    }
+            ..SearchOutput::default()
+        },
+        MAX_LIMIT,
+        Some(50),
+    );
+    assert_eq!(value["has_more"], false);
+    assert!(value["next_offset"].is_null());
+    assert!(
+        value.get("truncated_by_ceiling").is_none(),
+        "zero hits is not a ceiling truncation"
+    );
+    let note = value["note"].as_str().unwrap_or_default();
+    assert!(note.contains("time budget"), "note: {note}");
+}
 
-    /// #007: definition lines are dropped BEFORE the page limit applies, so
-    /// a page of size 1 whose first hit is the definition still shows a
-    /// call.
-    #[tokio::test]
-    async fn test_find_callsites_are_selected_before_the_limit() {
-        let dir = project();
-        std::fs::write(
-            dir.path().join("src/calls.rs"),
-            "pub fn parse_config() {}\nfn main() {\n    parse_config();\n}\n",
-        )
-        .unwrap();
-        let value = run(
-            dir.path(),
-            json!({"pattern": "parse_config", "output": "callsites", "limit": 1}),
-        )
-        .await;
-        let hits: Vec<&str> = value["files"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .flat_map(|f| f["hits"].as_array().into_iter().flatten())
-            .filter_map(|h| h["text"].as_str())
-            .collect();
-        assert!(!hits.is_empty(), "a call must appear on page 1");
-        assert!(hits.iter().all(|t| !t.trim_start().starts_with("pub fn")));
-    }
+/// A deadline-stopped page at the ceiling reports BOTH causes: the
+/// ceiling is the binding constraint for the stream (its continuation is
+/// unservable), and the deadline made the page's totals provisional. The
+/// old note picked one cause from `complete` alone — which a window stop
+/// also sets false — so a pure window stop was mislabeled "time budget"
+/// and a deadline stop at the ceiling lost the ceiling sentence.
+#[test]
+fn test_deadline_stopped_page_at_ceiling_reports_both_causes() {
+    let value = shape(
+        "p",
+        "matches",
+        SearchOutput {
+            returned: 50,
+            has_more: true,
+            complete: false,
+            stopped_by_deadline: true,
+            ..SearchOutput::default()
+        },
+        MAX_LIMIT,
+        Some(50),
+    );
+    assert_eq!(value["has_more"], false);
+    assert_eq!(value["truncated_by_ceiling"], true);
+    let note = value["note"].as_str().unwrap();
+    assert!(
+        note.contains("window ceiling") && note.contains("time budget"),
+        "both the ceiling and the budget must be named, note: {note}"
+    );
+}
 
-    /// Codex round 5 (id 4688435750): the page limit truncates hits the engine
-    /// already fetched, and the old callsite filter then reported `has_more`
-    /// from the ENGINE's flag — which is false when the fetched slack window
-    /// was not exceeded. With `limit: 1` and exactly two call lines in one
-    /// file, the second call was dropped and the page said `has_more: false`,
-    /// so no continuation could ever reach it.
-    #[tokio::test]
-    async fn test_find_callsites_truncated_by_the_limit_stay_reachable() {
-        let dir = tempfile::tempdir().unwrap();
-        // Two CALL lines (no definition at all), so nothing is removed by the
-        // definition filter: the only cut is the page limit.
-        std::fs::write(
-            dir.path().join("two_calls.rs"),
-            "fn a() {\n    parse_config();\n    parse_config();\n}\n",
+/// The time-budget sentence applies to every output mode: a truncated
+/// `count` response carries provisional totals and must say so. The
+/// engine end state `has_more=false, complete=false` is exactly the
+/// deadline stop (the closing fallback sets both), so the fixture
+/// carries `stopped_by_deadline`.
+#[test]
+fn test_budget_note_applies_to_summary_modes() {
+    let value = shape(
+        "p",
+        "count",
+        SearchOutput {
+            has_more: false,
+            complete: false,
+            stopped_by_deadline: true,
+            stats: crate::search::textsearch::SearchStats {
+                match_lines: 7,
+                ..Default::default()
+            },
+            ..SearchOutput::default()
+        },
+        0,
+        None,
+    );
+    assert_eq!(value["complete"], false);
+    let note = value["note"].as_str().unwrap();
+    assert!(note.contains("time budget"), "note: {note}");
+}
+
+#[tokio::test]
+async fn test_find_pages_with_next_offset() {
+    let dir = project();
+    let first = run(dir.path(), json!({"pattern": "parse_config", "limit": 2})).await;
+    assert_eq!(first["returned"], 2);
+    assert_eq!(first["has_more"], true);
+    let next = first["next_offset"].as_u64().unwrap();
+    let second = run(
+        dir.path(),
+        json!({"pattern": "parse_config", "limit": 2, "offset": next}),
+    )
+    .await;
+    assert_eq!(second["returned"], 1);
+    assert_eq!(second["has_more"], false);
+    let all = run(dir.path(), json!({"pattern": "parse_config", "limit": 0})).await;
+    assert_eq!(all["returned"], 3);
+}
+
+#[tokio::test]
+async fn test_find_accepts_the_legacy_text_search_spelling() {
+    let dir = project();
+    let value = run(
+        dir.path(),
+        json!({"query": "PARSE_CONFIG", "case_sensitive": false, "max_results": 5, "include_globs": ["*.rs"]}),
+    )
+    .await;
+    assert_eq!(value["total_files"], 1);
+    let sensitive = run(
+        dir.path(),
+        json!({"query": "PARSE_CONFIG", "case_sensitive": true}),
+    )
+    .await;
+    assert_eq!(sensitive["total_matches"], 0);
+}
+
+#[tokio::test]
+async fn test_find_regex_errors_are_actionable_and_bad_args_rejected() {
+    let dir = project();
+    let registry = Arc::new(ProjectRegistry::new(2));
+    let error = FindHandler
+        .execute(&registry, json!({"pattern": "(oops", "regex": true, "project_path": dir.path().to_string_lossy()}))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("invalid pattern"), "{error}");
+    let error = FindHandler.execute(&registry, json!({})).await.unwrap_err();
+    assert!(error.message_with_hint().contains("pattern"), "{error}");
+    let error = FindHandler
+        .execute(
+            &registry,
+            json!({"pattern": "x", "output": "nope", "project_path": dir.path().to_string_lossy()}),
         )
+        .await
+        .unwrap_err();
+    assert!(
+        error.message_with_hint().contains("matches | files"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn test_find_does_not_hydrate_the_project() {
+    use crate::cli::mcp::request_meta::{PDG_LOADS, PROJECT_HYDRATIONS};
+    use std::sync::atomic::Ordering;
+    let dir = project();
+    let (pdg, hydrations) = (
+        PDG_LOADS.load(Ordering::Relaxed),
+        PROJECT_HYDRATIONS.load(Ordering::Relaxed),
+    );
+    let registry = Arc::new(ProjectRegistry::new(2));
+    FindHandler
+        .execute(
+            &registry,
+            json!({"pattern": "parse_config", "project_path": dir.path().to_string_lossy()}),
+        )
+        .await
         .unwrap();
-        let first = run(
-            dir.path(),
-            json!({"pattern": "parse_config", "output": "callsites", "limit": 1}),
-        )
-        .await;
-        let first_hits: Vec<u64> = first["files"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .flat_map(|f| f["hits"].as_array().into_iter().flatten())
-            .filter_map(|h| h["line"].as_u64())
-            .collect();
-        assert_eq!(first_hits.len(), 1, "the limit shows one call: {first}");
-        assert_eq!(
-            first["has_more"], true,
-            "a call was fetched and cut, so the page is not final: {first}"
-        );
-        let token = first["next"]
+    assert_eq!(
+        registry.len().await,
+        0,
+        "find must not load the project into the registry"
+    );
+    assert_eq!(PDG_LOADS.load(Ordering::Relaxed), pdg);
+    assert_eq!(PROJECT_HYDRATIONS.load(Ordering::Relaxed), hydrations);
+}
+
+#[tokio::test]
+async fn test_find_uses_and_refreshes_the_index_when_the_project_is_indexed() {
+    let dir = project();
+    std::fs::create_dir_all(dir.path().join(".leindex")).unwrap(); // marks the project as indexed
+    let first = run(dir.path(), json!({"pattern": "parse_config"})).await;
+    assert_eq!(first["roots"][0]["indexed"], true);
+    assert!(dir.path().join(".leindex/textindex/index.bin").is_file());
+
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::write(
+        dir.path().join("src/new.rs"),
+        "fn added_after_indexing() {}\n",
+    )
+    .unwrap();
+    let fresh = run(dir.path(), json!({"pattern": "added_after_indexing"})).await;
+    assert_eq!(
+        fresh["total_matches"], 1,
+        "files added after the index was built are still found"
+    );
+    assert!(fresh["stats"]["changed_since_index"].as_u64().unwrap() >= 1);
+}
+
+#[tokio::test]
+async fn test_find_auto_target_falls_back_to_text() {
+    let dir = project();
+    let value = run(
+        dir.path(),
+        json!({"pattern": "parse_config", "target": "auto"}),
+    )
+    .await;
+    assert_eq!(value["target"], "text");
+    assert_eq!(value["total_matches"], 3);
+    assert!(value["fallback"].as_str().unwrap().contains("text"));
+}
+
+#[tokio::test]
+async fn test_find_symbols_target_without_an_index_explains_itself() {
+    let dir = project();
+    let value = run(dir.path(), json!({"pattern": "parse", "target": "symbols"})).await;
+    assert_eq!(value["total_symbols"], 0);
+    assert!(value["note"].as_str().unwrap().contains("leindex_manage"));
+}
+
+/// #085: exclude globs must apply to explicitly NAMED files too — the
+/// engine skips the filter for file roots, so the handler pre-checks.
+#[tokio::test]
+async fn test_find_paths_file_honors_include_exclude_globs() {
+    let dir = project();
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::fs::write(elsewhere.path().join("keep.rs"), "parse_config here\n").unwrap();
+    std::fs::write(elsewhere.path().join("skip.log"), "parse_config here\n").unwrap();
+    let value = run(
+        dir.path(),
+        json!({
+            "pattern": "parse_config",
+            "paths": [elsewhere.path().to_string_lossy()],
+            "exclude_globs": ["*.log"],
+        }),
+    )
+    .await;
+    assert_eq!(value["total_files"], 1, "the *.log file must be excluded");
+    let shown = value["files"][0]["file"].as_str().unwrap();
+    assert!(
+        shown.ends_with("keep.rs"),
+        "kept file is the .rs one, got {shown}"
+    );
+}
+
+/// #086/#006: `output=exists` must resolve the first hit through
+/// `display_path` (absolute for an external file root) and carry a
+/// content row so the compact renderer prints the answer.
+#[tokio::test]
+async fn test_find_exists_answers_with_resolvable_path_and_content_row() {
+    let dir = project();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let file = elsewhere.path().join("solo.txt");
+    std::fs::write(&file, "parse_config appears here\n").unwrap();
+    let value = run(
+        dir.path(),
+        json!({
+            "pattern": "parse_config",
+            "output": "exists",
+            "paths": [file.to_string_lossy()],
+        }),
+    )
+    .await;
+    assert_eq!(value["exists"], true);
+    let first_file = value["first"]["file"].as_str().unwrap();
+    assert_eq!(
+        first_file,
+        file.to_string_lossy(),
+        "exists.first uses display_path"
+    );
+    let row = value["files"][0]["file"].as_str().unwrap();
+    assert_eq!(row, file.to_string_lossy());
+    assert!(
+        value["files"][0]["hits"][0]["text"]
             .as_str()
-            .expect("a truncated callsite page must issue a continuation");
+            .unwrap()
+            .contains("parse_config")
+    );
+}
 
-        // Following the token must reach the second call.
-        let second = run(dir.path(), json!({ "next": token, "limit": 1 })).await;
-        let second_hits: Vec<u64> = second["files"]
+/// #087: overlapping context windows keep the FIRST lines after the
+/// previous match — the shared lines print once, in order.
+#[tokio::test]
+async fn test_find_context_windows_keep_first_lines_and_print_once() {
+    let dir = project();
+    std::fs::write(
+        dir.path().join("src/context.rs"),
+        "parse_config one\nmiddle line\nparse_config two\n",
+    )
+    .unwrap();
+    let value = run(
+        dir.path(),
+        json!({"pattern": "parse_config", "context_lines": 2}),
+    )
+    .await;
+    let context = value["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["file"].as_str().unwrap().ends_with("context.rs"))
+        .expect("context fixture file");
+    let hits = context["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 2);
+    let first_after: Vec<&str> = hits[0]["after"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|line| line.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        first_after,
+        ["middle line"],
+        "the near context line is kept"
+    );
+    let seen = collect_printed_lines(&value);
+    let unique: std::collections::BTreeSet<_> = seen.iter().cloned().collect();
+    assert_eq!(seen.len(), unique.len(), "no line prints twice: {seen:?}");
+}
+
+/// #088: a deadline-stopped regex retry is not a clean miss — the note
+/// must say the scan did not finish.
+#[test]
+fn test_retry_note_distinguishes_incomplete_scan_from_clean_miss() {
+    let complete_zero = SearchOutput {
+        complete: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        retry_note(&complete_zero),
+        Some("literal and regex readings both matched nothing")
+    );
+    let stopped = SearchOutput {
+        complete: false,
+        stopped_by_deadline: true,
+        ..Default::default()
+    };
+    assert!(retry_note(&stopped).unwrap().contains("did not finish"));
+}
+
+/// #007: definition lines are dropped BEFORE the page limit applies, so
+/// a page of size 1 whose first hit is the definition still shows a
+/// call.
+#[tokio::test]
+async fn test_find_callsites_are_selected_before_the_limit() {
+    let dir = project();
+    std::fs::write(
+        dir.path().join("src/calls.rs"),
+        "pub fn parse_config() {}\nfn main() {\n    parse_config();\n}\n",
+    )
+    .unwrap();
+    let value = run(
+        dir.path(),
+        json!({"pattern": "parse_config", "output": "callsites", "limit": 1}),
+    )
+    .await;
+    let hits: Vec<&str> = value["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|f| f["hits"].as_array().into_iter().flatten())
+        .filter_map(|h| h["text"].as_str())
+        .collect();
+    assert!(!hits.is_empty(), "a call must appear on page 1");
+    assert!(hits.iter().all(|t| !t.trim_start().starts_with("pub fn")));
+}
+
+/// Codex round 5 (id 4688435750): the page limit truncates hits the engine
+/// already fetched, and the old callsite filter then reported `has_more`
+/// from the ENGINE's flag — which is false when the fetched slack window
+/// was not exceeded. With `limit: 1` and exactly two call lines in one
+/// file, the second call was dropped and the page said `has_more: false`,
+/// so no continuation could ever reach it.
+#[tokio::test]
+async fn test_find_callsites_truncated_by_the_limit_stay_reachable() {
+    let dir = tempfile::tempdir().unwrap();
+    // Two CALL lines (no definition at all), so nothing is removed by the
+    // definition filter: the only cut is the page limit.
+    std::fs::write(
+        dir.path().join("two_calls.rs"),
+        "fn a() {\n    parse_config();\n    parse_config();\n}\n",
+    )
+    .unwrap();
+    let first = run(
+        dir.path(),
+        json!({"pattern": "parse_config", "output": "callsites", "limit": 1}),
+    )
+    .await;
+    let first_hits: Vec<u64> = first["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|f| f["hits"].as_array().into_iter().flatten())
+        .filter_map(|h| h["line"].as_u64())
+        .collect();
+    assert_eq!(first_hits.len(), 1, "the limit shows one call: {first}");
+    assert_eq!(
+        first["has_more"], true,
+        "a call was fetched and cut, so the page is not final: {first}"
+    );
+    let token = first["next"]
+        .as_str()
+        .expect("a truncated callsite page must issue a continuation");
+
+    // Following the token must reach the second call.
+    let second = run(dir.path(), json!({ "next": token, "limit": 1 })).await;
+    let second_hits: Vec<u64> = second["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|f| f["hits"].as_array().into_iter().flatten())
+        .filter_map(|h| h["line"].as_u64())
+        .collect();
+    assert_eq!(
+        second_hits.len(),
+        1,
+        "the withheld call must be delivered next: {second}"
+    );
+    assert_ne!(
+        first_hits, second_hits,
+        "the second page must show the OTHER call, not the same one again"
+    );
+}
+
+/// Codex/CodeRabbit round 8 (ids 4691102602, 4691119041): the page limit
+/// was spent across FILE ROWS, but exhausting it only `break`-ed out of the
+/// truncation loop — the remaining rows kept their hits and were returned.
+/// Two files with one call each therefore answered `limit: 1` with TWO
+/// calls, and (with more rows) hits that WERE returned were also counted
+/// as withheld, so their cursors rewound and repeated them.
+#[tokio::test]
+async fn test_find_callsites_limit_across_files_returns_exactly_the_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, body) in [
+        ("a_calls.rs", "fn a() {\n    parse_config();\n}\n"),
+        ("b_calls.rs", "fn b() {\n    parse_config();\n}\n"),
+        ("c_calls.rs", "fn c() {\n    parse_config();\n}\n"),
+    ] {
+        std::fs::write(dir.path().join(name), body).unwrap();
+    }
+    let count_calls = |value: &Value| -> usize {
+        value["files"]
             .as_array()
             .unwrap()
             .iter()
-            .flat_map(|f| f["hits"].as_array().into_iter().flatten())
-            .filter_map(|h| h["line"].as_u64())
-            .collect();
-        assert_eq!(
-            second_hits.len(),
-            1,
-            "the withheld call must be delivered next: {second}"
-        );
-        assert_ne!(
-            first_hits, second_hits,
-            "the second page must show the OTHER call, not the same one again"
-        );
-    }
+            .map(|file| file["hits"].as_array().map_or(0, Vec::len))
+            .sum()
+    };
+    let first = run(
+        dir.path(),
+        json!({"pattern": "parse_config", "output": "callsites", "limit": 1}),
+    )
+    .await;
+    assert_eq!(
+        count_calls(&first),
+        1,
+        "a limit of 1 must deliver exactly one call across files: {first}"
+    );
+    // Two files' worth of budget: exactly two calls, no more.
+    let two = run(
+        dir.path(),
+        json!({"pattern": "parse_config", "output": "callsites", "limit": 2}),
+    )
+    .await;
+    assert_eq!(
+        count_calls(&two),
+        2,
+        "a limit of 2 must deliver exactly two calls: {two}"
+    );
+    assert_eq!(two["has_more"], true, "a third call remains: {two}");
+}
 
-    /// Codex/CodeRabbit round 8 (ids 4691102602, 4691119041): the page limit
-    /// was spent across FILE ROWS, but exhausting it only `break`-ed out of the
-    /// truncation loop — the remaining rows kept their hits and were returned.
-    /// Two files with one call each therefore answered `limit: 1` with TWO
-    /// calls, and (with more rows) hits that WERE returned were also counted
-    /// as withheld, so their cursors rewound and repeated them.
-    #[tokio::test]
-    async fn test_find_callsites_limit_across_files_returns_exactly_the_limit() {
-        let dir = tempfile::tempdir().unwrap();
-        for (name, body) in [
-            ("a_calls.rs", "fn a() {\n    parse_config();\n}\n"),
-            ("b_calls.rs", "fn b() {\n    parse_config();\n}\n"),
-            ("c_calls.rs", "fn c() {\n    parse_config();\n}\n"),
-        ] {
-            std::fs::write(dir.path().join(name), body).unwrap();
-        }
-        let count_calls = |value: &Value| -> usize {
-            value["files"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|file| file["hits"].as_array().map_or(0, Vec::len))
-                .sum()
-        };
-        let first = run(
-            dir.path(),
-            json!({"pattern": "parse_config", "output": "callsites", "limit": 1}),
-        )
-        .await;
-        assert_eq!(
-            count_calls(&first),
-            1,
-            "a limit of 1 must deliver exactly one call across files: {first}"
-        );
-        // Two files' worth of budget: exactly two calls, no more.
-        let two = run(
-            dir.path(),
-            json!({"pattern": "parse_config", "output": "callsites", "limit": 2}),
-        )
-        .await;
-        assert_eq!(
-            count_calls(&two),
-            2,
-            "a limit of 2 must deliver exactly two calls: {two}"
-        );
-        assert_eq!(two["has_more"], true, "a third call remains: {two}");
-    }
-
-    /// #089: the ignore regression runs against a REAL Git worktree, so the
-    /// default inventory is git-aware before `paths` bypasses it.
-    #[tokio::test]
-    async fn test_find_ignored_file_omitted_by_inventory_found_via_paths() {
-        let dir = project();
-        let elsewhere = tempfile::tempdir().unwrap();
-        std::fs::write(elsewhere.path().join(".gitignore"), "artifact.txt\n").unwrap();
-        std::fs::write(
-            elsewhere.path().join("artifact.txt"),
-            "the hidden parse_config\n",
-        )
+/// #089: the ignore regression runs against a REAL Git worktree, so the
+/// default inventory is git-aware before `paths` bypasses it.
+#[tokio::test]
+async fn test_find_ignored_file_omitted_by_inventory_found_via_paths() {
+    let dir = project();
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::fs::write(elsewhere.path().join(".gitignore"), "artifact.txt\n").unwrap();
+    std::fs::write(
+        elsewhere.path().join("artifact.txt"),
+        "the hidden parse_config\n",
+    )
+    .unwrap();
+    let init_ok = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(elsewhere.path())
+        .status()
+        .is_ok_and(|status| status.success());
+    assert!(
+        init_ok,
+        "git must be available for the worktree inventory test"
+    );
+    std::process::Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(elsewhere.path())
+        .status()
         .unwrap();
-        let init_ok = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(elsewhere.path())
-            .status()
-            .is_ok_and(|status| status.success());
-        assert!(
-            init_ok,
-            "git must be available for the worktree inventory test"
-        );
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(elsewhere.path())
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.name", "test"])
-            .current_dir(elsewhere.path())
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(elsewhere.path())
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["commit", "-qm", "init"])
-            .current_dir(elsewhere.path())
-            .status()
-            .unwrap();
-        // The default (git-aware) inventory of the worktree omits the ignored
-        // artifact — prove that before proving `paths` bypasses it.
-        let omitted = run(elsewhere.path(), json!({"pattern": "parse_config"})).await;
-        assert_eq!(
-            omitted["total_matches"], 0,
-            "git-aware inventory must omit the ignored file"
-        );
-        let found = run(
-            dir.path(),
-            json!({"pattern": "parse_config", "paths": [elsewhere.path().to_string_lossy()]}),
-        )
-        .await;
-        assert_eq!(found["total_files"], 1);
-        assert!(
-            found["files"][0]["file"]
-                .as_str()
-                .unwrap()
-                .contains("artifact.txt")
-        );
-    }
+    std::process::Command::new("git")
+        .args(["config", "user.name", "test"])
+        .current_dir(elsewhere.path())
+        .status()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(elsewhere.path())
+        .status()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "-qm", "init"])
+        .current_dir(elsewhere.path())
+        .status()
+        .unwrap();
+    // The default (git-aware) inventory of the worktree omits the ignored
+    // artifact — prove that before proving `paths` bypasses it.
+    let omitted = run(elsewhere.path(), json!({"pattern": "parse_config"})).await;
+    assert_eq!(
+        omitted["total_matches"], 0,
+        "git-aware inventory must omit the ignored file"
+    );
+    let found = run(
+        dir.path(),
+        json!({"pattern": "parse_config", "paths": [elsewhere.path().to_string_lossy()]}),
+    )
+    .await;
+    assert_eq!(found["total_files"], 1);
+    assert!(
+        found["files"][0]["file"]
+            .as_str()
+            .unwrap()
+            .contains("artifact.txt")
+    );
 }
