@@ -427,7 +427,16 @@ pub(super) fn render_phase_section(data: &Value, phase: u8, color: bool) -> Stri
                 .unwrap_or(0);
             let mut out = format!("  {bold}Phase 4:{reset} {hotspots} hotspots{reset}\n");
             if let Some(items) = value.get("hotspots").and_then(|v| v.as_array()) {
-                for (index, hotspot) in items.iter().take(5).enumerate() {
+                // The heading states the producer's full count while only the
+                // ranked top five are printed, so the list must say what it is:
+                // a sample. Numbered rows that stop mid-count read as the whole
+                // set otherwise — the same read-as-complete class as the
+                // symbol-lookup caps, just with the total already disclosed.
+                let shown = items.len().min(5);
+                if items.len() > shown {
+                    out.push_str(&format!("    {dim}(top {shown} by score){reset}\n"));
+                }
+                for (index, hotspot) in items.iter().take(shown).enumerate() {
                     let name = hotspot
                         .get("node_id")
                         .and_then(|v| v.as_str())

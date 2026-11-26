@@ -259,6 +259,53 @@ fn test_render_truncated_list_without_a_handle_is_honest_about_it() {
     );
 }
 
+/// Phase 4 states the producer's full hotspot count while printing only the
+/// ranked top five. Without a label the numbered rows read as the whole set,
+/// so the sample must announce itself.
+#[test]
+fn test_render_phase_hotspots_label_the_ranked_sample() {
+    let hotspots: Vec<String> = (1..=9)
+        .map(|i| format!("{{\"node_id\": \"hot_{i}\", \"score\": 0.{i}, \"complexity\": {i}}}"))
+        .collect();
+    let data = v(&format!(
+        "{{\"phase4\": {{\"hotspots\": [{}]}}}}",
+        hotspots.join(",")
+    ));
+    let s = render_phase_section(&data, 4, false);
+    assert!(
+        s.contains("9 hotspots"),
+        "the full count must be stated: {s}"
+    );
+    assert!(
+        s.contains("(top 5 by score)"),
+        "the printed rows must be labelled a ranked sample: {s}"
+    );
+    assert!(
+        s.contains("hot_5") && !s.contains("hot_6"),
+        "exactly the top five rows are printed: {s}"
+    );
+}
+
+/// …and when every hotspot fits, no sample label appears — there is nothing
+/// withheld to disclose.
+#[test]
+fn test_render_phase_hotspots_do_not_label_a_complete_list() {
+    let hotspots: Vec<String> = (1..=3)
+        .map(|i| format!("{{\"node_id\": \"hot_{i}\", \"score\": 0.{i}, \"complexity\": {i}}}"))
+        .collect();
+    let data = v(&format!(
+        "{{\"phase4\": {{\"hotspots\": [{}]}}}}",
+        hotspots.join(",")
+    ));
+    let s = render_phase_section(&data, 4, false);
+    assert!(s.contains("3 hotspots"), "{s}");
+    assert!(
+        !s.contains("by score"),
+        "a complete list must not claim to be a sample: {s}"
+    );
+    assert!(s.contains("hot_3"), "all rows print: {s}");
+}
+
 #[test]
 fn test_render_tree_basic() {
     let tree = v(r#"[
