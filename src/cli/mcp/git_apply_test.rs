@@ -1609,12 +1609,22 @@ async fn test_a_large_ignored_payload_does_not_deadlock_the_ignore_probe() {
     let repo = scratch();
     let root = repo.path();
     git(root, &["config", "commit.gpgSign", "false"]);
-    // Many ignored paths, enough to fill a pipe several times over.
+    // Enough ignored BYTES to fill both pipes several times over, but FEW
+    // enough ENTRIES that the walk's budget is never exhausted.
+    //
+    // This used 4000 short paths. That did fill the pipes, but `expand_paths`
+    // caps a directory walk at 2000 entries, so whether `keep.txt` was
+    // enumerated depended on `readdir` order — the test passed locally and
+    // failed on CI with "a kept file must still be staged: []". A budget-exhausted
+    // walk is the documented, warned-about behaviour, so the fixture is what
+    // was wrong: 1200 long names produce the same pipe pressure with 1201
+    // entries, comfortably inside the cap in every ordering.
     std::fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
     let ignored_dir = root.join("ignored");
     std::fs::create_dir_all(&ignored_dir).unwrap();
-    for i in 0..4000 {
-        std::fs::write(ignored_dir.join(format!("f{i}.bin")), "x\n").unwrap();
+    for i in 0..1_200 {
+        let name = format!("{i:0>4}-{}.bin", "x".repeat(60));
+        std::fs::write(ignored_dir.join(name), "x\n").unwrap();
     }
     std::fs::write(root.join("keep.txt"), "keep\n").unwrap();
     // The whole point: this returns (rather than hanging) and does NOT

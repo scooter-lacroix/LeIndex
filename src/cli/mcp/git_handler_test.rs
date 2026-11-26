@@ -944,6 +944,15 @@ fn test_object_ids_are_accepted_in_either_hash_length() {
 }
 
 /// Helper: a scratch repository with one commit on branch `master`.
+///
+/// Identity lives in the REPOSITORY, not only on the fixture's own commands
+/// (same fix as `git_apply_test::scratch`, CodeRabbit round 10 id 4697090088).
+/// Several tests in this module drive a mutation through the HANDLER, whose
+/// git children never inherit the fixture's `GIT_AUTHOR_*` / `GIT_COMMITTER_*`
+/// env, and one fixture here passes no identity at all. On a CI runner there
+/// is no global `user.name`/`user.email`, so `git commit` and `git rebase`
+/// failed with "Author identity unknown" / "Committer identity unknown" while
+/// passing on any machine with a global config.
 fn scratch_repo() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let git = |args: &[&str]| {
@@ -959,6 +968,9 @@ fn scratch_repo() -> tempfile::TempDir {
         assert!(status.success(), "git {args:?}");
     };
     git(&["init", "-q", "-b", "master"]);
+    git(&["config", "user.name", "t"]);
+    git(&["config", "user.email", "t@t"]);
+    git(&["config", "commit.gpgSign", "false"]);
     std::fs::write(dir.path().join("f.txt"), "a\nb\n").unwrap();
     git(&["add", "."]);
     git(&["commit", "-q", "-m", "one"]);
