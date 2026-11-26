@@ -77,6 +77,37 @@ fn test_trim_symbol_lookup_keeps_actual_fields() {
     assert!(t.get("signature").is_none());
 }
 
+/// The handler PAGES the caller list and reports the continuation through
+/// `callers_total` / `callers_next_offset` / `callers_truncated`. The L1 trim
+/// dropped all three, so a budget-limited response looked complete and the
+/// `caller_offset` argument was unreachable from the answer that documented it.
+#[test]
+fn test_trim_symbol_lookup_keeps_caller_continuation_metadata() {
+    let input = v(r#"{
+            "symbol": "hub",
+            "type": "function",
+            "file": "src/hub.rs",
+            "callers": [{"name": "a"}, {"name": "b"}],
+            "callers_total": 9,
+            "callers_next_offset": 2,
+            "callers_truncated": true,
+            "callees": [],
+            "callees_truncated": false,
+            "impact_radius": {"affected_symbols": 9, "affected_files": 4}
+        }"#);
+    let t = trim_symbol_lookup(&input);
+    assert_eq!(
+        t["callers_total"], 9,
+        "the overflow total must survive: {t}"
+    );
+    assert_eq!(
+        t["callers_next_offset"], 2,
+        "the next-page offset must survive so `caller_offset` is reachable: {t}"
+    );
+    assert_eq!(t["callers_truncated"], true);
+    assert_eq!(t["callees_truncated"], false);
+}
+
 /// The §6.3 usage bodies and the §6.4 tests body REPLACE the relations body,
 /// so the L1 trim must carry them or the default tier answers with metadata
 /// only. Red-verified: removing the alternate keys from the allowlist makes

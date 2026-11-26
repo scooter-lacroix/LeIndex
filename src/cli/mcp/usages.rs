@@ -274,7 +274,13 @@ struct PatternHit {
 /// nest them inside `or_pattern`), so this walks the pattern's WHOLE subtree:
 /// every data-carrying variant anywhere in the pattern contributes its path,
 /// which the caller records ALONGSIDE the full pattern text.
-fn pattern_variant_paths(node: tree_sitter::Node<'_>, text: &str) -> Vec<String> {
+///
+/// Each path carries its OWN byte offset. A multiline pattern
+/// `Outer::Wrap(` / `Shade::Dark(x),` / `)` used to report the `Outer::Wrap`
+/// line for a `Shade::Dark` query, because the caller stamped every derived
+/// path with the outer pattern's `node.start_byte()`. Same-line nested
+/// patterns were right by accident; multiline ones were wrong.
+fn pattern_variant_paths(node: tree_sitter::Node<'_>, text: &str) -> Vec<(String, usize)> {
     let mut paths = Vec::new();
     let mut stack = vec![node];
     while let Some(current) = stack.pop() {
@@ -285,7 +291,7 @@ fn pattern_variant_paths(node: tree_sitter::Node<'_>, text: &str) -> Vec<String>
             let raw = raw.trim();
             // A path of `_` (or an empty one) carries no variant identity.
             if !raw.is_empty() && raw != "_" {
-                paths.push(raw.to_string());
+                paths.push((raw.to_string(), path_node.start_byte()));
             }
         }
         let mut cursor = current.walk();
@@ -323,9 +329,14 @@ fn collect_match_candidates(
         if let Some(hit) = node_hit(node, text, form) {
             hits.push(hit);
         }
-        for path in pattern_variant_paths(node, text) {
+        for (path, path_byte) in pattern_variant_paths(node, text) {
             hits.push(PatternHit {
-                byte: node.start_byte(),
+                // The derived path's OWN offset: a multiline nested variant
+                // (`Outer::Wrap(\n    Shade::Dark(x),\n)`) must report the line
+                // the variant is written on, not the line the outer pattern
+                // starts on. Stamping `node.start_byte()` here was the bug —
+                // same-line patterns were right by accident.
+                byte: path_byte,
                 pattern_text: path,
                 form,
             });
@@ -841,6 +852,47 @@ fn bind(s: Shade) {\n\
             "struct variant in a match arm: {grey:?}"
         );
         assert!(lines.contains(&14), "struct variant in `let`: {grey:?}");
+    }
+
+    /// A NESTED variant in a MULTILINE outer pattern must report the line the
+    /// variant is written on.
+    ///
+    /// `push_pattern` stamped every derived path with the OUTER pattern's
+    /// `node.start_byte()`, so `Shade::Dark` nested inside a multiline
+    /// `Outer::Wrap(..)` was reported on the `Outer::Wrap` line — a site at
+    /// the wrong location. Same-line nesting was right by accident.
+    #[test]
+    fn test_multiline_nested_variant_reports_its_own_line() {
+        // Line 5 is the OUTER pattern; the nested variant is on line 6.
+        let src = "pub enum Shade { Light, Dark(u8) }\n\
+pub enum Outer { Wrap(Shade), Other }\n\
+fn use_outer(o: Outer) -> u8 {\n\
+    match o {\n\
+        Outer::Wrap(\n\
+            Shade::Dark(x),\n\
+        ) => x,\n\
+        Outer::Other => 0,\n\
+    }\n\
+}\n";
+        let tree = parse(src, "rs");
+        let sites = collect_sites(
+            tree.root_node(),
+            src,
+            "rust",
+            &query(UsageKind::Match, "Shade::Dark"),
+        );
+        let dark = sites;
+        assert!(!dark.is_empty(), "the nested variant must be reported");
+
+        let lines: Vec<usize> = dark.iter().map(|site| site.line).collect();
+        assert!(
+            lines.iter().all(|line| *line == 6),
+            "the nested variant lives on line 6, not on the Outer::Wrap line 5: {dark:?}"
+        );
+        assert!(
+            !lines.contains(&5),
+            "Outer::Wrap's own line must not answer a Shade::Dark query: {dark:?}"
+        );
     }
 
     #[test]

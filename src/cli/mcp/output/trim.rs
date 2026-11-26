@@ -410,6 +410,14 @@ fn trim_symbol_lookup_single(data: &Value) -> Value {
         "language",
         "callers",
         "callees",
+        // Caller continuation metadata: without these the L1 response showed a
+        // budget-page of callers with no total and no offset, so the client had
+        // neither an overflow warning nor the means to fetch the rest —
+        // `caller_offset` was unreachable from the answer that documented it.
+        "callers_total",
+        "callers_next_offset",
+        "callers_truncated",
+        "callees_truncated",
         "impact_radius",
         "impact_note",
         "index_freshness",

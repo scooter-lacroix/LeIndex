@@ -74,6 +74,16 @@ pub(super) fn render_symbol_source(data: &Value, color: bool) -> String {
     out
 }
 
+/// Continuation handles for a paged relationship list.
+#[derive(Clone, Copy, Default)]
+pub(super) struct RelationshipPage {
+    /// Field naming the producer-side total (`callers_total`).
+    pub total_key: Option<&'static str>,
+    /// Field naming the offset that fetches the next page
+    /// (`callers_next_offset`), plus the argument that consumes it.
+    pub next: Option<(&'static str, &'static str)>,
+}
+
 pub(super) fn render_symbol_relationships(
     data: &Value,
     key: &str,
@@ -81,6 +91,7 @@ pub(super) fn render_symbol_relationships(
     title: &str,
     arrow: &str,
     color: bool,
+    page: RelationshipPage,
 ) -> String {
     let Some(entries) = data.get(key).and_then(|v| v.as_array()) else {
         return String::new();
@@ -90,7 +101,12 @@ pub(super) fn render_symbol_relationships(
     }
 
     let mut out = format!("\n  {title}:\n");
-    for entry in entries.iter().take(50) {
+    // No renderer-side cap. The producer already pages the list inside the
+    // response character budget and reports the overflow through
+    // `*_truncated` / `*_total` / `*_next_offset`; a second cap here dropped
+    // rows the producer had counted and reported nothing, so a partial list
+    // read as the complete set.
+    for entry in entries {
         let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("?");
         let file = entry.get("file").and_then(|v| v.as_str()).unwrap_or("");
         let typ = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -109,14 +125,32 @@ pub(super) fn render_symbol_relationships(
             if color { RESET } else { "" },
         ));
     }
-    if data
+    // The next-page instruction is what makes a budgeted list actionable:
+    // without it the caller cannot reach the entries the producer withheld,
+    // and the paged `caller_offset` argument is unreachable from this output.
+    let next_offset = page
+        .next
+        .and_then(|(next_key, _)| data.get(next_key).and_then(|v| v.as_u64()));
+    if let (Some((_, argument)), Some(next)) = (page.next, next_offset) {
+        let total = page
+            .total_key
+            .and_then(|total_key| data.get(total_key).and_then(|v| v.as_u64()))
+            .unwrap_or(0);
+        out.push_str(&format!(
+            "    {}... showing {shown} of {total} — pass {argument}={next} for the rest{}\n",
+            if color { DIM } else { "" },
+            if color { RESET } else { "" },
+            shown = entries.len(),
+        ));
+    } else if data
         .get(truncated_key)
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
     {
         out.push_str(&format!(
-            "    {}... (showing 50 or more){}\n",
+            "    {}... (truncated at {}){}\n",
             if color { DIM } else { "" },
+            entries.len(),
             if color { RESET } else { "" },
         ));
     }
@@ -189,6 +223,10 @@ pub(super) fn render_symbol_lookup_single(data: &Value, color: bool) -> String {
         "Callers",
         "→",
         color,
+        RelationshipPage {
+            total_key: Some("callers_total"),
+            next: Some(("callers_next_offset", "caller_offset")),
+        },
     ));
     out.push_str(&render_symbol_relationships(
         data,
@@ -197,6 +235,7 @@ pub(super) fn render_symbol_lookup_single(data: &Value, color: bool) -> String {
         "Callees",
         "←",
         color,
+        RelationshipPage::default(),
     ));
     out
 }
@@ -211,7 +250,13 @@ fn render_test_targets(data: &Value, color: bool) -> String {
         return String::new();
     }
     let mut out = format!("\n  Tests ({}):\n", entries.len());
-    for entry in entries.iter().take(5) {
+    // Render EVERY budgeted entry. The producer already enforces the response
+    // character budget and reports `tests_truncated`; an extra renderer-side
+    // cap silently dropped entries while the heading still counted them, so a
+    // partial answer read as the complete set — six tests printed under a
+    // "(6)" heading with five lines below it, and eleven sites printed under
+    // an "(11)" heading with ten.
+    for entry in entries {
         let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("?");
         let file = entry.get("file").and_then(|v| v.as_str()).unwrap_or("");
         let command = entry.get("command").and_then(|v| v.as_str()).unwrap_or("");
@@ -249,7 +294,11 @@ fn render_usage_sites(data: &Value, color: bool) -> String {
         return format!("\n  {} (0):\n", kind);
     }
     let mut out = format!("\n  {} ({}):\n", kind, entries.len());
-    for entry in entries.iter().take(10) {
+    // No renderer-side cap: `sites_truncated` is the producer's contract, and
+    // the producer already fits the list inside the response character budget.
+    // A second `take(10)` here dropped the eleventh site while the heading
+    // still said eleven, so a partial answer read as the complete set.
+    for entry in entries {
         let file = entry.get("file").and_then(|v| v.as_str()).unwrap_or("");
         let line = entry.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
         let text = entry

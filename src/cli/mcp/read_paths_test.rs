@@ -135,6 +135,44 @@ fn test_parse_read_handle_decodes_percent_escapes() {
     assert_eq!(h.symbol.as_deref(), Some("foo"));
 }
 
+/// A PLAIN path is not a handle and must reach the filesystem byte-for-byte.
+///
+/// Decoding was unconditional, so a file literally named `src/a%20b.rs` was
+/// rewritten to `src/a b.rs` before `live.file(..)` saw it — the read then
+/// resolved a DIFFERENT file, or reported the caller's correct path as
+/// nonexistent. `escape_handle_path` never emits `%20`, so a plain path
+/// containing one is always a literal filename.
+#[test]
+fn test_parse_read_handle_leaves_a_plain_path_percent_literal_unchanged() {
+    for raw in [
+        "src/a%20b.rs",
+        "/abs/dir/a%20b.rs",
+        "src/100%.rs",
+        "src/a%23b.rs",
+    ] {
+        let h = parse_read_handle(raw, None);
+        assert_eq!(
+            h.file_path, raw,
+            "a plain path must not be decoded: {raw} became {}",
+            h.file_path
+        );
+        assert_eq!(h.symbol, None, "a plain path has no fragment: {raw}");
+        assert_eq!(h.line_range, None, "a plain path has no line range: {raw}");
+    }
+}
+
+/// ...while a HANDLE still decodes, because that is what the escaper emits.
+#[test]
+fn test_parse_read_handle_still_decodes_escapes_inside_a_handle() {
+    let h = parse_read_handle("src/a%23b.rs#L1-2", Some(Path::new("/proj")));
+    assert_eq!(h.file_path, "/proj/src/a#b.rs");
+    assert_eq!(h.line_range, Some((1, 2)));
+
+    let symbolic = parse_read_handle("src/a%20b.rs#build", None);
+    assert_eq!(symbolic.file_path, "src/a b.rs");
+    assert_eq!(symbolic.symbol.as_deref(), Some("build"));
+}
+
 #[test]
 fn test_handles_round_trip_through_parse() {
     let root = Path::new("/proj");

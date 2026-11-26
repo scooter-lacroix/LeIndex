@@ -79,6 +79,13 @@ pub(crate) fn parse_read_handle(raw: &str, project_root: Option<&Path>) -> ReadH
     // (a filename like `a b#c.rs`), never a fragment separator — decoding
     // before the split would cut the file part at the escaped `#`.
     let (file_part, fragment) = split_read_fragment(raw);
+    // Decode ONLY when the input is a HANDLE. `escape_handle_path` is applied
+    // exclusively to handles, and it never emits `%20` — so decoding a plain
+    // path can only ever corrupt a real filename. A file literally named
+    // `src/a%20b.rs` was rewritten to `src/a b.rs`, and the read then resolved
+    // a different file (or reported the file as missing) even though the
+    // caller's path was correct.
+    //
     // Decode in the REVERSE order of [`escape_handle_path`]'s escaping, so a
     // filename that literally contains `%23` survives the round trip: the
     // emitted form is `%2523`, which contains no `%23` substring, and only
@@ -88,7 +95,10 @@ pub(crate) fn parse_read_handle(raw: &str, project_root: Option<&Path>) -> ReadH
             .replace("%20", " ")
             .replace("%25", "%")
     };
-    let decoded_file = decode(&file_part);
+    let decoded_file = match fragment {
+        Some(_) => decode(&file_part),
+        None => file_part,
+    };
     let decoded_fragment = fragment.as_deref().map(decode);
 
     let (line_range, symbol) = match decoded_fragment.as_deref().map(classify_fragment) {

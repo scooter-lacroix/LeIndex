@@ -136,6 +136,85 @@ fn test_render_symbol_lookup_renders_usage_sites_and_test_commands() {
     );
 }
 
+/// The renderer must not impose a SECOND cap under the producer's.
+///
+/// `sites_truncated` is the producer's contract and the producer already fits
+/// the list inside the response budget. A renderer-side `take(10)` dropped the
+/// eleventh site while the heading still said eleven, so the answer read as
+/// complete when it was short by one.
+#[test]
+fn test_render_usage_sites_prints_every_budgeted_site() {
+    let sites: Vec<String> = (1..=11)
+        .map(|i| format!("{{\"file\": \"src/s{i}.rs\", \"line\": {i}, \"site_line\": \"Shade {{ }}\", \"form\": \"struct literal\"}}"))
+        .collect();
+    let data = v(&format!(
+        "{{\"symbol\": \"Shade\", \"file\": \"src/shade.rs\", \"kind\": \"construct\", \
+          \"sites\": [{}], \"sites_total\": 11, \"sites_truncated\": false}}",
+        sites.join(",")
+    ));
+    let s = render_tool_output("leindex.symbol-lookup", &data, &v(r#"{"symbol":"Shade"}"#));
+    assert!(s.contains("(11)"), "the heading counts eleven: {s}");
+    for i in 1..=11 {
+        assert!(
+            s.contains(&format!("src/s{i}.rs:{i}")),
+            "site {i} was dropped from the render: {s}"
+        );
+    }
+}
+
+/// …and the same for the §6.4 tests body, whose producer reports six.
+#[test]
+fn test_render_test_targets_prints_every_budgeted_entry() {
+    let entries: Vec<String> = (1..=6)
+        .map(|i| format!("{{\"name\": \"test_{i}\", \"file\": \"tests/t{i}.rs\", \"command\": \"cargo test test_{i}\"}}"))
+        .collect();
+    let data = v(&format!(
+        "{{\"symbol\": \"helper\", \"file\": \"src/lib.rs\", \"kind\": \"tests\", \
+          \"tests\": [{}], \"tests_total\": 6, \"tests_truncated\": false}}",
+        entries.join(",")
+    ));
+    let s = render_tool_output("leindex.symbol-lookup", &data, &v(r#"{"symbol":"helper"}"#));
+    assert!(s.contains("(6)"), "the heading counts six: {s}");
+    for i in 1..=6 {
+        assert!(
+            s.contains(&format!("cargo test test_{i}")),
+            "test target {i} was dropped from the render: {s}"
+        );
+    }
+}
+
+/// A budget-page of callers must tell the client how to fetch the rest.
+///
+/// The handler pages the list and reports `callers_total` +
+/// `callers_next_offset`, and documents `caller_offset` as the way to continue.
+/// The renderer printed the page with no total and no next-page instruction, so
+/// a partial list read as the complete set and the continuation argument was
+/// unreachable from the output that described it.
+#[test]
+fn test_render_callers_print_the_continuation_offset() {
+    let data = v(r#"{
+            "symbol": "hub",
+            "type": "function",
+            "file": "src/hub.rs",
+            "callers": [{"name": "a", "file": "src/a.rs"}, {"name": "b", "file": "src/b.rs"}],
+            "callers_total": 9,
+            "callers_next_offset": 2,
+            "callers_truncated": true,
+            "callees": [],
+            "callees_truncated": false
+        }"#);
+    let s = render_tool_output("leindex.symbol-lookup", &data, &v(r#"{"symbol":"hub"}"#));
+    assert!(s.contains("a"), "callers must render: {s}");
+    assert!(
+        s.contains("showing 2 of 9"),
+        "the page size and the total must both be stated: {s}"
+    );
+    assert!(
+        s.contains("caller_offset=2"),
+        "the continuation argument must be spelled out: {s}"
+    );
+}
+
 #[test]
 fn test_render_tree_basic() {
     let tree = v(r#"[
