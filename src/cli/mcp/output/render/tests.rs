@@ -215,6 +215,50 @@ fn test_render_callers_print_the_continuation_offset() {
     );
 }
 
+/// `tests_truncated` must disclose the producer's total, like the usage-site
+/// notice does. "(truncated)" alone leaves the client unable to tell a budgeted
+/// list from a short one.
+#[test]
+fn test_render_truncated_tests_state_the_total() {
+    let data = v(r#"{
+            "symbol": "helper",
+            "file": "src/lib.rs",
+            "kind": "tests",
+            "tests": [{"name": "test_a", "file": "tests/a.rs", "command": "cargo test test_a"}],
+            "tests_total": 40,
+            "tests_truncated": true
+        }"#);
+    let s = render_tool_output("leindex.symbol-lookup", &data, &v(r#"{"symbol":"helper"}"#));
+    assert!(
+        s.contains("(truncated, 40 total)"),
+        "the truncation notice must state the producer total: {s}"
+    );
+}
+
+/// A truncated list with NO continuation handle must say so, not imply the rest
+/// is retrievable. The producer pages only callers; there is no
+/// `callees_next_offset` in the handler at all.
+#[test]
+fn test_render_truncated_list_without_a_handle_is_honest_about_it() {
+    let data = v(r#"{
+            "symbol": "hub",
+            "type": "function",
+            "file": "src/hub.rs",
+            "callers": [],
+            "callees": [{"name": "a", "file": "src/a.rs"}],
+            "callees_truncated": true
+        }"#);
+    let s = render_tool_output("leindex.symbol-lookup", &data, &v(r#"{"symbol":"hub"}"#));
+    assert!(
+        s.contains("no continuation handle"),
+        "the notice must not promise a continuation that does not exist: {s}"
+    );
+    assert!(
+        !s.contains("caller_offset"),
+        "no offset may be invented for a callee page: {s}"
+    );
+}
+
 #[test]
 fn test_render_tree_basic() {
     let tree = v(r#"[

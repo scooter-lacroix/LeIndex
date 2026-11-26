@@ -147,8 +147,15 @@ pub(super) fn render_symbol_relationships(
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
     {
+        // Truncated with NO continuation handle. The relationship producer
+        // pages only CALLERS (`callers_next_offset`); there is no
+        // `callees_total` / `callees_next_offset` / `callee_offset` anywhere
+        // in the handler, so a callee page cannot be continued and offering a
+        // fake offset would send the client after a field that is never
+        // emitted. The notice therefore states the page size AND that no
+        // continuation exists, instead of implying the rest is retrievable.
         out.push_str(&format!(
-            "    {}... (truncated at {}){}\n",
+            "    {}... (truncated at {} — this list has no continuation handle){}\n",
             if color { DIM } else { "" },
             entries.len(),
             if color { RESET } else { "" },
@@ -278,7 +285,18 @@ fn render_test_targets(data: &Value, color: bool) -> String {
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
     {
-        out.push_str("    ... (truncated)\n");
+        // Same disclosure shape as the usage-site notice: whenever the
+        // producer reports the overflow total, state it — "(truncated)" alone
+        // makes a budgeted list look like a short list.
+        let total = data
+            .get("tests_total")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if total > 0 {
+            out.push_str(&format!("    ... (truncated, {total} total)\n"));
+        } else {
+            out.push_str("    ... (truncated)\n");
+        }
     }
     out
 }
