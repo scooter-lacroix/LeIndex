@@ -65,7 +65,8 @@ fn platform_identity(_path: &Path, meta: &std::fs::Metadata) -> (i64, u64) {
 //
 // Direct kernel32 FFI rather than std::os::windows::fs::MetadataExt:
 // `change_time`/`file_index` are unstable (`windows_change_time` /
-// `windows_by_handle`) and cannot compile at this crate's MSRV (1.88), and
+// `windows_by_handle`) and so cannot compile on stable at this crate's MSRV
+// regardless of its value (1.89 since the rusqlite/SQLite security bump), and
 // those APIs need a file handle anyway (not just &Metadata), so the handle
 // is opened here. kernel32 is linked by default on MSVC targets — no new
 // dependency, exactly what windows-sys does internally.
