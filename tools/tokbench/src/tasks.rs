@@ -65,6 +65,23 @@ pub fn corpus_line_of(path: &str, needle: &str) -> Option<usize> {
     Some(content.lines().position(|l| l.contains(needle))? + 1)
 }
 
+/// The last few non-empty lines of a task's tool output, for a failure note.
+///
+/// A parse miss ("the panic line is not in here") is only actionable if the
+/// message carries the text that was actually searched: the run's raw log
+/// lives in the session's temp storage and is gone by the time anyone reads a
+/// CI failure, so the note has to be self-contained.
+fn tail_for_note(text: &str) -> String {
+    const MAX_LINES: usize = 6;
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let start = lines.len().saturating_sub(MAX_LINES);
+    lines[start..].join(" | ")
+}
+
 /// The struct field insertion edit for task 2/6-style mutations.
 const TOP_P_FIELD_OLD: &str = "    /// Sampling temperature; `None` lets the upstream default apply.\n    pub temperature: Option<f32>,\n}";
 const TOP_P_FIELD_NEW: &str = "    /// Sampling temperature; `None` lets the upstream default apply.\n    pub temperature: Option<f32>,\n    /// Nucleus sampling cap; `None` lets the upstream default apply.\n    pub top_p: Option<f32>,\n}";
@@ -372,8 +389,9 @@ pub fn task3_native(fixture: &Path, counter: &Counter) -> TaskMetrics {
             m.success = located == failing_test_line();
             if !m.success {
                 m.note = format!(
-                    "failing line parsed as {located:?}, want {:?}",
-                    failing_test_line()
+                    "failing line parsed as {located:?}, want {:?}; output tail: {}",
+                    failing_test_line(),
+                    tail_for_note(&text)
                 );
             }
         }
@@ -416,8 +434,9 @@ pub fn task3_leindex(
             m.success = located == failing_test_line();
             if !m.success {
                 m.note = format!(
-                    "failing line parsed as {located:?}, want {:?}",
-                    failing_test_line()
+                    "failing line parsed as {located:?}, want {:?}; output tail: {}",
+                    failing_test_line(),
+                    tail_for_note(&text)
                 );
             }
         }

@@ -69,6 +69,61 @@ All notable changes to the LeIndex project are documented in this file.
 
 ## [Unreleased]
 
+### tokbench: a task-3 parse miss now carries the output it failed to parse
+
+`test_task3_leindex_end_to_end_on_fixture` fails roughly once in ten runs, and
+only when the machine is already saturated with compiles: the fixture's
+`cargo test` output sometimes carries no `panicked at crates/...:LINE` text for
+the parser to read. The assertion was already correct — it refused to pass on
+a run that produced no failing line — but its note said only
+`failing line parsed as None, want Some(44)`, which discards the one piece of
+evidence that identifies the cause, and the raw text lives in a per-session log
+that is gone before CI logs are read. Both task-3 arms now append the last six
+non-empty lines of the output they searched to that note, so the next
+occurrence explains itself instead of costing another bisect.
+
+### Dependency security sweep: eight live RUSTSEC vulnerabilities retired, plus one "unsound"
+
+`cargo audit` reported eight live vulnerabilities on this tree — all eight on
+the QUIC stack — plus one informational `unsound` warning, which audit counts
+separately and leaves out of its failure gate. All nine are fixed by the
+patched release. `deny.toml` still carries `ignore = []`, so none is
+suppressed.
+
+- `quinn-proto` 0.11.16 -> 0.11.19. Seven advisories against the QUIC state
+  machine, each reachable only from a remote peer: zero-length STREAM frames
+  panicking the `RangeSet` during unordered reads (RUSTSEC-2026-0338),
+  `MAX_STREAM_DATA` opening streams beyond the negotiated limit (-0523),
+  a bypassed stream-reassembly memory guard (-0341), a long Retry token
+  panicking or exhausting memory in a client (-0524), unbounded growth of
+  pending connection-ID retirements (-0339), a peer's minimum ACK delay
+  panicking when ACK_FREQUENCY is transmitted (-0340), and zero-length
+  DATAGRAM frames bypassing the receive buffer limit (-0342). The fixes
+  landed in 0.11.18; 0.11.19 is the current release in that line.
+- `quinn-udp` 0.5.15 -> 0.5.16, and `quinn` 0.11.11 -> 0.11.12 to match. The
+  UDP receive loop could spin after a truncated datagram
+  (RUSTSEC-2026-0538); 0.5.16 is the patched release in that line.
+- `rustix` 1.1.4 -> 1.1.6. The `xattr` getters marked unwritten bytes as
+  initialised when handed a zero-length buffer, so a `Vec` sized to its
+  capacity had its length set past its capacity over memory that was never
+  written — undefined behaviour reachable from safe code
+  (RUSTSEC-2026-0486, informational `unsound`). Patched in 1.1.6, which is
+  what the resolver now selects.
+
+`quinn` reaches this tree only through `reqwest`'s `http3` feature edge
+(`cfg(not(target_arch = "wasm32"))`); `remote-embeddings` and `system-one`
+enable `reqwest`, and CI's `cargo deny check advisories` runs with
+`--all-features`, so the widest graph is the one the gate evaluates.
+
+The resolver re-derives a handful of `windows-sys` edges while it takes these
+bumps: `errno`, `tempfile` and `winapi-util` (plus the `windows-sys` selection
+for `anstyle-query`, `anstyle-wincon`, `nu-ansi-term`, `socket2`, `stacker`
+and `termina`) move to a lower `windows-sys` line already present in the lock.
+Every affected requirement admits it (`errno` and `rustix` `>=0.52, <0.62`,
+`tempfile` `>=0.52, <0.62`, `quinn-udp` `>=0.52, <=0.61`, `winapi-util`
+`>=0.48, <=0.61`), no `windows-sys` version leaves the graph, and the Linux
+build compiles none of it.
+
 ### Setup fixes: config escape hints, hermetic hydration test, System One probe
 
 - `config set`/`config unset` failures caused by dangling cross-references
