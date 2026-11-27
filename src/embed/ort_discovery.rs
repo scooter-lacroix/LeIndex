@@ -864,7 +864,9 @@ mod tests {
 
     #[test]
     fn test_discover_candidates_includes_env_var() {
-        let _g = ENV_TEST_LOCK.lock().unwrap();
+        let _g = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         // FIXME: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var(ORT_DYLIB_ENV, tmp.path().join("env.so")) };
@@ -882,7 +884,9 @@ mod tests {
 
     #[test]
     fn test_discover_candidates_excludes_empty_env() {
-        let _g = ENV_TEST_LOCK.lock().unwrap();
+        let _g = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         // FIXME: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var(ORT_DYLIB_ENV, "") };
         let candidates = discover_candidates();
@@ -897,7 +901,9 @@ mod tests {
 
     #[test]
     fn test_discover_candidates_includes_user_lib() {
-        let _g = ENV_TEST_LOCK.lock().unwrap();
+        let _g = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         // FIXME: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::remove_var(ORT_DYLIB_ENV) };
         let tmp = tempfile::tempdir().unwrap();
@@ -918,7 +924,9 @@ mod tests {
 
     #[test]
     fn test_discover_candidates_includes_bundle_lib_next_to_bin() {
-        let _g = ENV_TEST_LOCK.lock().unwrap();
+        let _g = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         // FIXME: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::remove_var(ORT_DYLIB_ENV) };
         // FIXME: Audit that the environment access only happens in single-threaded code.
@@ -940,7 +948,9 @@ mod tests {
 
     #[test]
     fn test_discover_candidates_includes_system_paths() {
-        let _g = ENV_TEST_LOCK.lock().unwrap();
+        let _g = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         // FIXME: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::remove_var(ORT_DYLIB_ENV) };
         // FIXME: Audit that the environment access only happens in single-threaded code.
@@ -962,7 +972,10 @@ mod tests {
 
     #[test]
     fn test_read_config_ort_path_returns_value() {
-        let _g = ENV_TEST_LOCK.lock().unwrap();
+        // Recover from a poisoned lock: one failing test must not cascade.
+        let _g = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         // FIXME: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var(LEINDEX_HOME_ENV, tmp.path()) };
@@ -993,7 +1006,9 @@ mod tests {
 
     #[test]
     fn test_read_config_ort_path_returns_none_when_missing() {
-        let _g = ENV_TEST_LOCK.lock().unwrap();
+        let _g = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         // FIXME: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var(LEINDEX_HOME_ENV, tmp.path()) };
@@ -1017,7 +1032,9 @@ mod tests {
 
     #[test]
     fn test_read_config_ort_path_handles_single_quotes() {
-        let _g = ENV_TEST_LOCK.lock().unwrap();
+        let _g = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         // FIXME: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var(LEINDEX_HOME_ENV, tmp.path()) };
@@ -1226,7 +1243,9 @@ mod tests {
     /// file so it wins the chain.
     #[test]
     fn test_discover_path_only_returns_first_existing_no_init() {
-        let _g = ENV_TEST_LOCK.lock().unwrap();
+        let _g = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let fake_lib = make_fake_lib(tmp.path());
         // FIXME: Audit that the environment access only happens in single-threaded code.
@@ -1254,7 +1273,9 @@ mod tests {
     /// configured `ort_dylib_path` (if any) without crashing.
     #[test]
     fn test_discover_path_only_returns_none_when_absent() {
-        let _g = ENV_TEST_LOCK.lock().unwrap();
+        let _g = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         // Ensure env var is unset and LEINDEX_HOME points to an empty temp
         // dir so user-lib and config-file lookups also miss.
         // FIXME: Audit that the environment access only happens in single-threaded code.
