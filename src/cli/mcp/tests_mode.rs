@@ -71,6 +71,47 @@ impl TestTarget {
     }
 }
 
+/// The name of a `[[test]]` target the package manifest DECLARES for `file`,
+/// if any.
+///
+/// Cargo lets a manifest rename an integration target:
+///
+/// ```toml
+/// [[test]]
+/// name = "acceptance"
+/// path = "tests/api_test.rs"
+/// ```
+///
+/// That builds a target called `acceptance`, and `--test api_test` — the
+/// filename stem — is then a name Cargo rejects with `no test target named
+/// api_test`, listing `acceptance` as available. Only the declared name runs
+/// the tests, so it is resolved BEFORE any filename inference. A `[[test]]`
+/// without a `path` defaults to `tests/<name>.rs`, exactly like Cargo.
+///
+/// Paths are compared canonically, so a `./tests/api_test.rs` spelling in the
+/// manifest matches the absolute path the PDG stores.
+fn declared_integration_target(file: &str) -> Option<String> {
+    let package_dir = cargo_package_dir(Path::new(file))?;
+    let text = std::fs::read_to_string(package_dir.join("Cargo.toml")).ok()?;
+    let table = text.parse::<toml::Table>().ok()?;
+    let canonical = Path::new(file).canonicalize().ok()?;
+    table
+        .get("test")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.get("name").and_then(toml::Value::as_str)?;
+            let declared = match entry.get("path").and_then(toml::Value::as_str) {
+                Some(path) => PathBuf::from(path),
+                None => Path::new("tests").join(format!("{name}.rs")),
+            };
+            let full = package_dir.join(declared);
+            (full.canonicalize().ok() == Some(canonical.clone())).then(|| name.to_string())
+        })
+        .next()
+}
+
 /// The Cargo integration-target name for a file under `tests/`, when exactly
 /// one target can be PROVEN to compile it.
 ///
@@ -97,6 +138,13 @@ impl TestTarget {
 /// `<module>::<fn>`, so `-- --exact` on the bare fn name matches nothing and
 /// exits 0 having run zero tests.
 fn integration_target_name(file: &str) -> Option<String> {
+    // A DECLARED `[[test]]` name wins outright: the manifest is the authority
+    // on what Cargo builds, and the filename stem is not. `[[test]] name =
+    // "acceptance" path = "tests/api_test.rs"` makes `--test api_test` a name
+    // Cargo rejects, so this must be resolved BEFORE the rules below.
+    if let Some(declared) = declared_integration_target(file) {
+        return Some(declared);
+    }
     let lowered = file.replace('\\', "/");
     let segments: Vec<&str> = lowered.split('/').collect();
     let tests_at = segments.iter().position(|segment| *segment == "tests")?;
@@ -1485,6 +1533,88 @@ mod tests {
         assert_eq!(
             cmd, "cargo test -p proj --test api_test test_api",
             "cmd: {cmd}"
+        );
+    }
+
+    /// A manifest can RENAME an integration target:
+    /// `[[test]] name = "acceptance" path = "tests/api_test.rs"`.
+    ///
+    /// The filename stem is then NOT a target — `cargo test --test api_test`
+    /// is rejected with `no test target named api_test`, listing `acceptance`.
+    /// Verified against real cargo in both directions; the declared name is
+    /// the only answer that runs the tests.
+    #[test]
+    fn test_manifest_declared_test_target_wins_over_the_filename_stem() {
+        let dir = manifest_dir("proj");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"proj\"\nversion = \"0.1.0\"\n\n\
+             [[test]]\nname = \"acceptance\"\npath = \"tests/api_test.rs\"\n",
+        )
+        .unwrap();
+        let tests = dir.path().join("tests");
+        std::fs::create_dir_all(&tests).unwrap();
+        let file = tests.join("api_test.rs");
+        std::fs::write(&file, "#[test]\nfn test_api() {}\n").unwrap();
+
+        assert_eq!(
+            integration_target_name(&file.display().to_string()).as_deref(),
+            Some("acceptance"),
+            "the declared [[test]] name is the target Cargo builds"
+        );
+
+        let test_fn = node("test_api", &file.display().to_string(), "rust", (0, 1));
+        let cmd = command_for(&test_fn, None, None);
+        assert_eq!(
+            cmd, "cargo test -p proj --test acceptance test_api",
+            "never the filename stem: {cmd}"
+        );
+    }
+
+    /// A `[[test]]` without a `path` defaults to `tests/<name>.rs`, so that
+    /// file belongs to the declared target too.
+    #[test]
+    fn test_manifest_declared_target_without_a_path_claims_tests_named_after_it() {
+        let dir = manifest_dir("proj");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"proj\"\nversion = \"0.1.0\"\n\n\
+             [[test]]\nname = \"smoke\"\n",
+        )
+        .unwrap();
+        let tests = dir.path().join("tests");
+        std::fs::create_dir_all(&tests).unwrap();
+        let file = tests.join("smoke.rs");
+        std::fs::write(&file, "#[test]\nfn test_smoke() {}\n").unwrap();
+
+        assert_eq!(
+            integration_target_name(&file.display().to_string()).as_deref(),
+            Some("smoke"),
+            "the default path tests/<name>.rs still resolves to the target"
+        );
+    }
+
+    /// The declaration covers the file it names, and nothing else: a sibling
+    /// `tests/other_test.rs` keeps filename inference (its own target).
+    #[test]
+    fn test_manifest_declaration_does_not_capture_undeclared_siblings() {
+        let dir = manifest_dir("proj");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"proj\"\nversion = \"0.1.0\"\n\n\
+             [[test]]\nname = \"acceptance\"\npath = \"tests/api_test.rs\"\n",
+        )
+        .unwrap();
+        let tests = dir.path().join("tests");
+        std::fs::create_dir_all(&tests).unwrap();
+        std::fs::write(tests.join("api_test.rs"), "").unwrap();
+        let other = tests.join("other_test.rs");
+        std::fs::write(&other, "").unwrap();
+
+        assert_eq!(
+            integration_target_name(&other.display().to_string()).as_deref(),
+            Some("other_test"),
+            "an undeclared sibling is still its own auto-discovered target"
         );
     }
 

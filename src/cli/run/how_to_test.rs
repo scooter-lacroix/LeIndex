@@ -43,8 +43,16 @@ struct Member {
     /// with `no library targets found` on a binary-only package, so the flag
     /// may only be emitted when a library target actually exists. Derived
     /// from the member manifest: a `[lib]` section, or the default
-    /// `src/lib.rs` path.
+    /// `src/lib.rs` path when auto-discovery is enabled.
     has_lib: bool,
+    /// Explicitly declared `[[test]]` targets: (declared name, path relative
+    /// to the member directory).
+    ///
+    /// A manifest can declare `[[test]] name = "acceptance" path =
+    /// "tests/api_test.rs"`, and then the target is `acceptance` — inferring
+    /// `--test api_test` from the filename names a target Cargo does not
+    /// have. Declared entries are checked BEFORE filename inference.
+    tests: Vec<(String, PathBuf)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -208,7 +216,20 @@ fn discover(root: &Path, stamp: &mut Stamp) -> Facts {
                 let lib_rs = dir.join("src/lib.rs");
                 stamp.push((lib_rs.clone(), mtime(&lib_rs)));
                 let has_lib = has_library_target(&dir, &manifest);
-                facts.members.push(Member { name, dir, has_lib });
+                let tests = declared_test_targets(&manifest);
+                // A `[[test]]` that declares no `path` defaults to
+                // `tests/<name>.rs`; stamp it so renaming or adding the file
+                // behind a declared target invalidates the cached answer.
+                for (_, path) in &tests {
+                    let full = dir.join(path);
+                    stamp.push((full.clone(), mtime(&full)));
+                }
+                facts.members.push(Member {
+                    name,
+                    dir,
+                    has_lib,
+                    tests,
+                });
             }
         }
     }
@@ -261,18 +282,61 @@ fn package_name(manifest: &str) -> Option<String> {
 ///
 /// `cargo test --lib` is "test only this package's library", so it is only
 /// valid when a library target exists. Cargo's rules: an explicit `[lib]`
-/// section declares one, otherwise `src/lib.rs` is the implicit default.
-/// A `[lib] path` pointing somewhere else is honoured as written.
+/// section declares one, otherwise `src/lib.rs` is the implicit default —
+/// unless `autolib = false` turns auto-discovery off, in which case a
+/// stray `src/lib.rs` is not a target at all and `--lib` fails with
+/// `no library targets found`. A `[lib] path` pointing somewhere else is
+/// honoured as written.
 fn has_library_target(dir: &Path, manifest: &str) -> bool {
     let table = manifest.parse::<toml::Table>().ok();
-    if let Some(lib) = table.as_ref().and_then(|t| t.get("lib")) {
+    let Some(table) = table.as_ref() else {
+        return false;
+    };
+    if let Some(lib) = table.get("lib") {
         // `[lib]` with no `path` still means `src/lib.rs`.
         return match lib.get("path").and_then(toml::Value::as_str) {
             Some(path) => dir.join(path).is_file(),
             None => true,
         };
     }
-    dir.join("src/lib.rs").is_file()
+    // No `[lib]` section: auto-discovery decides, and `autolib = false` means
+    // it does not. Defaults to on, exactly like Cargo.
+    let autolib = table
+        .get("package")
+        .and_then(|package| package.get("autolib"))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(true);
+    autolib && dir.join("src/lib.rs").is_file()
+}
+
+/// `[[test]]` targets this package declares explicitly, as `(name, path)`
+/// with the path relative to the member directory.
+///
+/// Cargo lets a manifest rename a target: `[[test]] name = "acceptance"
+/// path = "tests/api_test.rs"` builds a target called `acceptance`. Inferring
+/// `--test api_test` from the filename then names a target Cargo does not
+/// have, and `cargo test` rejects it. A `[[test]]` without a `path` defaults
+/// to `tests/<name>.rs`; one without a name is refused by Cargo and skipped
+/// here.
+fn declared_test_targets(manifest: &str) -> Vec<(String, PathBuf)> {
+    let table = manifest.parse::<toml::Table>().ok();
+    let Some(table) = table.as_ref() else {
+        return Vec::new();
+    };
+    table
+        .get("test")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.get("name").and_then(toml::Value::as_str)?;
+            let path = match entry.get("path").and_then(toml::Value::as_str) {
+                Some(path) => PathBuf::from(path),
+                None => Path::new("tests").join(format!("{name}.rs")),
+            };
+            Some((name.to_string(), path))
+        })
+        .collect()
 }
 
 fn package_scripts(text: &str) -> Vec<String> {
@@ -399,6 +463,19 @@ fn cargo_test_target(member: &Member, path: &Path) -> String {
             String::new()
         };
     };
+    // A manifest `[[test]]` DECLARES the target name, and Cargo builds only
+    // declared and auto-discovered targets. When the requested file is the
+    // `path` of a declared entry, that declared name is the only correct
+    // answer — the filename is irrelevant. `[[test]] name = "acceptance"
+    // path = "tests/api_test.rs"` makes `--test api_test` a name Cargo
+    // rejects, and `--test acceptance` the one it accepts.
+    if let Some((name, _)) = member
+        .tests
+        .iter()
+        .find(|(_, declared)| declared.as_path() == rel)
+    {
+        return format!(" --test {name}");
+    }
     if let Some(target) = integration_target_name(rel) {
         return format!(" --test {target}");
     }

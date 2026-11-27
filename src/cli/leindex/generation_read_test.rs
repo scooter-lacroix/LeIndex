@@ -23,6 +23,7 @@ use crate::storage::generation::{
     read_generation_manifest,
 };
 use rusqlite::Connection;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -525,6 +526,14 @@ fn test_no_stall_read_during_index() {
 
 /// No-writer-contention gate: a flock of concurrent generation readers must
 /// not delay publication (the read path never acquires the writer's locks).
+///
+/// The invariant is STRUCTURAL, and it is proven structurally: while every
+/// reader is inside its own hydration/search cycle, `ProjectWriteLock`'s
+/// non-blocking acquire must still succeed. A reader that had taken the lock
+/// would make that probe fail deterministically, on any machine, under any
+/// load — no timing involved. The wall-clock assertion below is only a
+/// backstop for a regression that delays the publisher WITHOUT holding the
+/// lock.
 #[test]
 fn test_read_path_no_writer_contention() {
     let _guard = lock_flag_tests();
@@ -534,17 +543,27 @@ fn test_read_path_no_writer_contention() {
     let storage_root = dir.path().join(".leindex");
     publish_live_generation(&storage_root, 1);
 
-    // Baseline: publish with no concurrent readers (this becomes the current
-    // generation the concurrent readers must serve).
-    let baseline = Instant::now();
-    publish_live_generation(&storage_root, 2);
-    let t_baseline = baseline.elapsed();
+    // Baseline: the PUBLISHER's own cost with no concurrent readers.
+    //
+    // Measured three times and reduced to its MAXIMUM, because this bound is
+    // compared against another publish: one lucky fast run cannot set a floor
+    // that a loaded machine can never reach. The earlier form derived its
+    // slack from a READER cycle while charging it to a PUBLISHER measurement,
+    // so a fast reader on a slow-to-publish machine produced a bound that
+    // could not be met with any amount of correctness.
+    let mut t_baseline = Duration::ZERO;
+    let mut generation = 1;
+    for _ in 0..3 {
+        generation += 1;
+        let started = Instant::now();
+        publish_live_generation(&storage_root, generation);
+        t_baseline = t_baseline.max(started.elapsed());
+    }
+    let served_generation = generation;
 
-    // Solo reader cycle: the yardstick for every timing bound below. Fixed
-    // wall-clock limits flake on a loaded or slow machine (and a panic while
-    // holding the flag lock used to poison it for unrelated tests); bounds
-    // that scale with a measured baseline still catch a reader that blocks
-    // the writer, which shows up as a large multiple, not a few milliseconds.
+    // Solo reader cycle: the yardstick for the reader budget. Fixed wall-clock
+    // limits flake on a loaded or slow machine (and a panic while holding the
+    // flag lock used to poison it for unrelated tests).
     set_flag_override_for_test(FeatureFlag::GenerationReaders, true);
     let solo = {
         let started = Instant::now();
@@ -554,34 +573,43 @@ fn test_read_path_no_writer_contention() {
         started.elapsed()
     };
     let reader_budget = (solo * 25).max(Duration::from_millis(800));
-    let writer_slack = (solo * 4).max(Duration::from_millis(400));
+    // Slack scales with the MEASURED publish cost, not with a reader cycle:
+    // the publisher's own scheduling and I/O noise is what this bound has to
+    // absorb, and the baseline is where that noise was sampled.
+    let writer_slack = (t_baseline * 3).max(Duration::from_millis(400));
 
     // Concurrent: 8 readers each open the leased snapshot and run a search
     // cycle while the writer publishes the next generation.
     let project = dir.path().to_path_buf();
+    let in_flight = Arc::new(AtomicUsize::new(0));
     let readers: Vec<_> = (0..8)
         .map(|i| {
             let project = project.clone();
             let storage = storage_root.clone();
+            let in_flight = Arc::clone(&in_flight);
             thread::spawn(move || {
                 // Every reader must see the current generation's content and
                 // complete its search cycle promptly.
                 let snapshot = GenerationSnapshot::open(&storage).expect("reader open snapshot");
                 assert_eq!(
                     snapshot.generation(),
-                    2,
+                    served_generation,
                     "reader must serve the current generation"
                 );
+                // Signal that this reader is INSIDE its cycle, so the main
+                // thread can probe the writer lock while readers are busy.
+                in_flight.fetch_add(1, Ordering::SeqCst);
                 let started = Instant::now();
                 let mut idx = hydrate_generation_instance(&project);
                 let results = idx
                     .search("authenticate user", 10, None)
                     .expect("reader search");
+                let elapsed = started.elapsed();
+                in_flight.fetch_sub(1, Ordering::SeqCst);
                 assert!(
                     !results.is_empty(),
                     "reader {i} must get results from the current generation"
                 );
-                let elapsed = started.elapsed();
                 assert!(
                     elapsed < reader_budget,
                     "reader {i} took {elapsed:?} while writer published \
@@ -591,8 +619,37 @@ fn test_read_path_no_writer_contention() {
         })
         .collect();
 
+    // STRUCTURAL PROOF of the invariant the timing bound can only infer: with
+    // readers in flight, the writer's cross-process lock is still FREE.
+    //
+    // `try_acquire` is the same non-blocking `flock(LOCK_EX | LOCK_NB)` the
+    // real writer uses, so a reader holding it would answer `None` here — a
+    // deterministic failure at any speed, instead of a wall-clock margin that
+    // a loaded machine can eat. The wait is bounded so a reader that never
+    // starts fails the test rather than hanging it.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while in_flight.load(Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "no generation reader entered its cycle; the lock probe would prove nothing"
+        );
+        thread::yield_now();
+    }
+    for probe in 0..8 {
+        let free = ProjectWriteLock::try_acquire(&storage_root)
+            .unwrap_or_else(|error| panic!("write-lock probe {probe} errored: {error}"));
+        assert!(
+            free.is_some(),
+            "probe {probe}: a generation reader holds the writer's write lock while \
+             {} reader(s) are mid-cycle — the read path must never take it",
+            in_flight.load(Ordering::SeqCst)
+        );
+        drop(free);
+    }
+
     let concurrent = Instant::now();
-    publish_live_generation(&storage_root, 3);
+    generation += 1;
+    publish_live_generation(&storage_root, generation);
     let t_concurrent = concurrent.elapsed();
 
     // Readers must finish while the override is still ON: each reader's

@@ -472,3 +472,113 @@ fn test_new_manifest_appearing_invalidates_the_cache() {
         "just test"
     );
 }
+
+/// A manifest can RENAME a test target: `[[test]] name = "acceptance"` with
+/// `path = "tests/api_test.rs"` builds a target called `acceptance`.
+///
+/// Filename inference would answer `--test api_test`, which Cargo rejects with
+/// `no test target named api_test` — it lists `acceptance` instead. The
+/// declared name is the only answer that runs the tests.
+#[test]
+fn test_declared_test_target_uses_the_declared_name() {
+    let (_guard, root) = project();
+    write(
+        &root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/*\"]\n",
+    );
+    write(
+        &root.join("crates/beta/Cargo.toml"),
+        &format!(
+            "{}[[test]]\nname = \"acceptance\"\npath = \"tests/api_test.rs\"\n",
+            package("beta")
+        ),
+    );
+    write(&root.join("crates/beta/tests/api_test.rs"), "");
+    let got = how_to_test(&root, Path::new("crates/beta/tests/api_test.rs")).unwrap();
+    assert_eq!(
+        got.command, "cargo test -p beta --test acceptance",
+        "a declared [[test]] name wins over the filename stem"
+    );
+}
+
+/// A `[[test]]` without a `path` defaults to `tests/<name>.rs`, so the
+/// declared name still governs — and the default path must resolve to the
+/// same target.
+#[test]
+fn test_declared_test_target_without_path_defaults_to_named_file() {
+    let (_guard, root) = project();
+    write(
+        &root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/*\"]\n",
+    );
+    write(
+        &root.join("crates/beta/Cargo.toml"),
+        &format!("{}[[test]]\nname = \"smoke\"\n", package("beta")),
+    );
+    write(&root.join("crates/beta/tests/smoke.rs"), "");
+    let got = how_to_test(&root, Path::new("crates/beta/tests/smoke.rs")).unwrap();
+    assert_eq!(got.command, "cargo test -p beta --test smoke");
+}
+
+/// Files that are NOT the declared target's `path` keep filename inference —
+/// the declaration applies to one file, not to every file under `tests/`.
+#[test]
+fn test_undeclared_sibling_test_file_keeps_its_own_target() {
+    let (_guard, root) = project();
+    write(
+        &root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/*\"]\n",
+    );
+    write(
+        &root.join("crates/beta/Cargo.toml"),
+        &format!(
+            "{}[[test]]\nname = \"acceptance\"\npath = \"tests/api_test.rs\"\n",
+            package("beta")
+        ),
+    );
+    write(&root.join("crates/beta/tests/api_test.rs"), "");
+    write(&root.join("crates/beta/tests/other_test.rs"), "");
+    let got = how_to_test(&root, Path::new("crates/beta/tests/other_test.rs")).unwrap();
+    assert_eq!(got.command, "cargo test -p beta --test other_test");
+}
+
+/// `autolib = false` turns off library auto-discovery, so a leftover
+/// `src/lib.rs` is not a target and `cargo test --lib` fails with
+/// `no library targets found`. The implicit library must not be assumed.
+#[test]
+fn test_autolib_false_removes_the_implicit_library() {
+    let (_guard, root) = project();
+    write(
+        &root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/*\"]\n",
+    );
+    write(
+        &root.join("crates/legacy/Cargo.toml"),
+        &format!("{}autolib = false\n", package("legacy")),
+    );
+    write(&root.join("crates/legacy/src/lib.rs"), "");
+    write(&root.join("crates/legacy/src/main.rs"), "");
+    let got = how_to_test(&root, Path::new("crates/legacy/src/lib.rs")).unwrap();
+    assert_eq!(
+        got.command, "cargo test -p legacy",
+        "autolib = false means src/lib.rs is not a library target"
+    );
+}
+
+/// An explicit `[lib]` still declares a library when `autolib = false`: the
+/// switch governs auto-discovery only.
+#[test]
+fn test_explicit_lib_survives_autolib_false() {
+    let (_guard, root) = project();
+    write(
+        &root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/*\"]\n",
+    );
+    write(
+        &root.join("crates/legacy/Cargo.toml"),
+        &format!("{}autolib = false\n[lib]\n", package("legacy")),
+    );
+    write(&root.join("crates/legacy/src/lib.rs"), "");
+    let got = how_to_test(&root, Path::new("crates/legacy/src/lib.rs")).unwrap();
+    assert_eq!(got.command, "cargo test -p legacy --lib");
+}
