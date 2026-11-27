@@ -447,3 +447,108 @@ mod distribution_coverage {
         );
     }
 }
+
+// ============================================================================
+// Release body: three sources, and the noise filters that make them readable
+// ============================================================================
+
+mod release_body {
+    use super::*;
+
+    /// The `Generate changelog` step is the sole producer of the release body.
+    /// Slice it out so a match elsewhere in the workflow (the `badge` job,
+    /// `INSTALL.txt`, comments) cannot satisfy an assertion by accident.
+    fn changelog_step() -> String {
+        let yml = release_yml();
+        yml.split("Generate changelog")
+            .nth(1)
+            .and_then(|s| s.split("Create GitHub Release").next())
+            .unwrap_or_else(|| panic!("release.yml missing the `Generate changelog` step"))
+            .to_string()
+    }
+
+    /// The curated `CHANGELOG.md` section for this version must be the first
+    /// source. Commit subjects cannot state the version, so without this the
+    /// release body never says what it is releasing; before this change the
+    /// body was `git log` output only.
+    #[test]
+    fn body_leads_with_the_curated_changelog_section() {
+        let step = changelog_step();
+        assert!(
+            step.contains("CHANGELOG.md") && step.contains("## [${VERSION}]"),
+            "release body must read the `## [<version>]` section out of CHANGELOG.md"
+        );
+        assert!(
+            step.contains("### Release notes"),
+            "the curated section must be introduced as `### Release notes`"
+        );
+
+        // The curated block must be written before any `git log` output. A
+        // reorder would bury the prose under 80 commit subjects.
+        let curated = step.find("### Release notes").expect("curated heading");
+        let merges = step
+            .find("### Merged work since ${PREV_TAG}")
+            .expect("merge heading");
+        let commits = step
+            .find("### Commits since ${PREV_TAG}")
+            .expect("commit heading");
+        assert!(
+            curated < merges && merges < commits,
+            "release body order must be curated section, then merges, then commits \
+             (curated={curated}, merges={merges}, commits={commits})"
+        );
+    }
+
+    /// Merge commits carry the only top-level description of multi-lane work,
+    /// and `git log --no-merges` silently dropped every one of them. The step
+    /// must therefore have a merge pass; `Merge branch 'x' into y` integration
+    /// steps stay filtered out because they describe the branch, not the change.
+    #[test]
+    fn body_includes_merge_commits_but_not_integration_steps() {
+        let step = changelog_step();
+        assert!(
+            step.contains("--merges"),
+            "release body must list merge commits (lane and PR merges)"
+        );
+        assert!(
+            step.contains("^Merge branch "),
+            "integration merges (`Merge branch 'x' into y`) must be filtered out of the merge pass"
+        );
+    }
+
+    /// `wip(...)` commits are unshipped orchestrator safety snapshots. Listing
+    /// them in a release claims work that did not ship.
+    #[test]
+    fn body_filters_unshipped_wip_snapshots() {
+        let step = changelog_step();
+        assert!(
+            step.contains("^wip("),
+            "release body must filter out `wip(...)` orchestrator safety snapshots"
+        );
+        assert!(
+            step.contains("^chore(release)"),
+            "release body must filter out version-bump bookkeeping commits"
+        );
+    }
+
+    /// The generated body is handed to the release action through `body_path`.
+    /// If the step wrote `$BODY` but the action kept reading the old
+    /// `CHANGELOG.md` path, the release would publish a body nobody generated —
+    /// and worse, the step used to truncate the tracked `CHANGELOG.md`.
+    #[test]
+    fn body_path_matches_the_file_the_step_writes() {
+        let yml = release_yml();
+        assert!(
+            yml.contains("BODY=release-body.md"),
+            "the changelog step must write a scratch file, not the tracked CHANGELOG.md"
+        );
+        assert!(
+            yml.contains("body_path: release-body.md"),
+            "the release action must publish release-body.md"
+        );
+        assert!(
+            !yml.contains("body_path: CHANGELOG.md"),
+            "the release action must not publish the repo CHANGELOG.md as the body"
+        );
+    }
+}

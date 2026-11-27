@@ -693,24 +693,72 @@ jobs:
           sha256sum leindex-*.tar.gz leindex-*.zip > ../SHA256SUMS
           cat ../SHA256SUMS
 
+      # The release body is built from three sources, in this order:
+      #   1. the repo CHANGELOG.md section for this version (curated, human-written)
+      #   2. the merge commits since the previous tag (lane/PR level structure)
+      #   3. every non-merge commit subject since the previous tag (the detail)
+      # `--no-merges` alone used to drop the lane merges, which are the only
+      # top-level description of multi-lane work, and included the orchestrator
+      # `wip(...)` safety snapshots as though they had shipped. Reading the
+      # curated section is what ties the notes to the version being released:
+      # commit subjects cannot say "this is 2.2.0".
       - name: Generate changelog
         id: changelog
         run: |
+          set -e
           VERSION="${{ needs.detect.outputs.version }}"
           PREV_TAG=$(git tag -l 'v*' --sort=-v:refname | head -1)
+          BODY=release-body.md
+          CURATED=$(mktemp)
 
-          echo "## What's Changed" > CHANGELOG.md
-          echo "" >> CHANGELOG.md
+          echo "## What's Changed" > "$BODY"
+          echo "" >> "$BODY"
+
+          # 1. Curated release notes for this exact version. The awk range runs
+          #    from the "## [<version>]" heading to the next "## [" heading, so
+          #    the section is picked up verbatim regardless of trailing title
+          #    text on the heading line. `sed` drops the blank line that follows
+          #    the heading, so the section does not open with dead space.
+          awk -v sec="## [${VERSION}]" '
+            index($0, sec) == 1 { inside = 1; next }
+            inside && /^## \[/ { exit }
+            inside { print }
+          ' CHANGELOG.md | sed '/./,$!d' > "$CURATED"
+          if [ -s "$CURATED" ]; then
+            echo "### Release notes" >> "$BODY"
+            echo "" >> "$BODY"
+            cat "$CURATED" >> "$BODY"
+            echo "" >> "$BODY"
+          fi
 
           if [ -n "$PREV_TAG" ]; then
-            echo "Changes since ${PREV_TAG}:" >> CHANGELOG.md
-            echo "" >> CHANGELOG.md
-            git log "${PREV_TAG}..HEAD" --pretty=format:"- %s (%h)" --no-merges >> CHANGELOG.md
-            echo "" >> CHANGELOG.md
-            echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...v${VERSION}" >> CHANGELOG.md
+            # 2. Lane and pull-request merges — `Merge branch 'x' into y` is an
+            #    integration step, not a change, so it stays out.
+            echo "### Merged work since ${PREV_TAG}" >> "$BODY"
+            echo "" >> "$BODY"
+            git log "${PREV_TAG}..HEAD" --merges \
+              --invert-grep --grep='^Merge branch ' \
+              --pretty=format:"- %s (%h)" >> "$BODY" || true
+            echo "" >> "$BODY"
+            echo "" >> "$BODY"
+
+            # 3. Individual commits. `wip(...)` entries are unshipped safety
+            #    snapshots from the orchestrator; release-version bumps are
+            #    bookkeeping the version heading already states.
+            echo "### Commits since ${PREV_TAG}" >> "$BODY"
+            echo "" >> "$BODY"
+            git log "${PREV_TAG}..HEAD" --no-merges \
+              --invert-grep --grep='^wip(' --grep='^chore(release)' \
+              --pretty=format:"- %s (%h)" >> "$BODY" || true
+            echo "" >> "$BODY"
+            echo "" >> "$BODY"
+            echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...v${VERSION}" >> "$BODY"
           else
-            echo "Initial release." >> CHANGELOG.md
+            echo "Initial release." >> "$BODY"
           fi
+
+          rm -f "$CURATED"
+          wc -l "$BODY"
 
       - name: Create GitHub Release (draft)
         uses: softprops/action-gh-release@v2
@@ -718,7 +766,7 @@ jobs:
           tag_name: v${{ needs.detect.outputs.version }}
           target_commitish: ${{ github.sha }}
           name: v${{ needs.detect.outputs.version }}
-          body_path: CHANGELOG.md
+          body_path: release-body.md
           draft: true
           prerelease: false
           files: |

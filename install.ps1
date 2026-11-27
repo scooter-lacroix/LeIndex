@@ -1,6 +1,6 @@
 #############################################
 # LeIndex Windows Installer
-# Version: 2.1.5
+# Version: 2.2.0
 # Platform: Windows PowerShell
 #
 # Installer:
@@ -21,10 +21,10 @@ $ProgressPreference = "SilentlyContinue"
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$ScriptVersion = "2.1.5"
+$ScriptVersion = "2.2.0"
 $ProjectName = "LeIndex"
 $ProjectSlug = "leindex"
-$ExpectedVersion = "2.1.5"
+$ExpectedVersion = "2.2.0"
 $MinRustMajor = 1
 $MinRustMinor = 89
 $RepoUrl = "https://github.com/scooter-lacroix/LeIndex"
