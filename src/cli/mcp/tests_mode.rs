@@ -377,47 +377,30 @@ enum CargoTarget {
 ///
 /// A target whose file does not exist is dropped: Cargo refuses such a
 /// manifest, and a root that cannot be read cannot own a test.
-fn cargo_targets(package_dir: &Path) -> Vec<(PathBuf, CargoTarget)> {
-    let Ok(text) = std::fs::read_to_string(package_dir.join("Cargo.toml")) else {
-        return Vec::new();
+/// The library target, per the manifest: an explicit `[lib]` (its `path`
+/// optional, default `src/lib.rs`) wins, otherwise auto-discovery decides and
+/// `autolib = false` turns it off. Only a file that exists is a target.
+fn lib_target(package_dir: &Path, table: &toml::Table, autolib: bool) -> Option<PathBuf> {
+    let path = match table.get("lib") {
+        Some(lib) => lib
+            .get("path")
+            .and_then(toml::Value::as_str)
+            .map(|path| package_dir.join(path))
+            .unwrap_or_else(|| package_dir.join("src/lib.rs")),
+        None if autolib => package_dir.join("src/lib.rs"),
+        None => return None,
     };
-    let Ok(table) = text.parse::<toml::Table>() else {
-        return Vec::new();
-    };
-    let package = table.get("package");
-    let package_name = package
-        .and_then(|section| section.get("name"))
-        .and_then(toml::Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let switch = |key: &str| -> bool {
-        package
-            .and_then(|section| section.get(key))
-            .and_then(toml::Value::as_bool)
-            .unwrap_or(true)
-    };
+    path.is_file().then_some(path)
+}
 
+/// Every explicit `[[bin]]` target, plus the paths they claim so
+/// auto-discovery does not register the same file under a second name.
+fn explicit_bins(
+    package_dir: &Path,
+    package_name: &str,
+    table: &toml::Table,
+) -> (Vec<(PathBuf, CargoTarget)>, HashSet<PathBuf>) {
     let mut targets: Vec<(PathBuf, CargoTarget)> = Vec::new();
-    // A `[lib]` table declares the library explicitly; only its `path` is
-    // optional (default `src/lib.rs`). Without the table, auto-discovery
-    // decides, which `autolib = false` turns off.
-    let lib_path = match table.get("lib") {
-        Some(lib) => Some(
-            lib.get("path")
-                .and_then(toml::Value::as_str)
-                .map(|path| package_dir.join(path))
-                .unwrap_or_else(|| package_dir.join("src/lib.rs")),
-        ),
-        None => switch("autolib").then(|| package_dir.join("src/lib.rs")),
-    };
-    if let Some(path) = lib_path
-        && path.is_file()
-    {
-        targets.push((path, CargoTarget::Lib));
-    }
-
-    // Explicit `[[bin]]` entries, and the paths they claim so auto-discovery
-    // does not also register the same file under a second name.
     let mut claimed: HashSet<PathBuf> = HashSet::new();
     for entry in table
         .get("bin")
@@ -445,46 +428,83 @@ fn cargo_targets(package_dir: &Path) -> Vec<(PathBuf, CargoTarget)> {
             targets.push((path, CargoTarget::Bin(name.to_string())));
         }
     }
+    (targets, claimed)
+}
 
-    if !switch("autobins") {
-        return targets;
-    }
+/// Auto-discovered binary targets under `src/`, as `(crate root, name)`:
+/// `src/main.rs` under the package name, plus every `src/bin/<name>.rs` and
+/// `src/bin/<name>/main.rs`. Sorted, because directory order is unspecified and
+/// the command (and reported target) must be reproducible across machines.
+fn discovered_bins(package_dir: &Path, package_name: &str) -> Vec<(PathBuf, String)> {
+    let mut discovered: Vec<(PathBuf, String)> = Vec::new();
     let main = package_dir.join("src/main.rs");
-    if main.is_file() && !claimed.contains(&main) {
-        targets.push((main, CargoTarget::Bin(package_name.clone())));
+    if main.is_file() {
+        discovered.push((main, package_name.to_string()));
     }
     let Ok(entries) = std::fs::read_dir(package_dir.join("src/bin")) else {
-        return targets;
+        return discovered;
     };
-    let mut discovered: Vec<(PathBuf, CargoTarget)> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        let (root, name) = if path.extension().is_some_and(|ext| ext == "rs") && path.is_file() {
-            // Build the name BEFORE moving `path` out: it must not borrow.
-            let name = path
-                .file_stem()
+        // Build the name BEFORE moving `path` out: it must not borrow.
+        let stem_of = |p: &Path| {
+            p.file_stem()
                 .and_then(|stem| stem.to_str())
                 .unwrap_or_default()
-                .to_string();
-            (path, name)
+                .to_string()
+        };
+        if path.extension().is_some_and(|ext| ext == "rs") && path.is_file() {
+            let name = stem_of(&path);
+            discovered.push((path, name));
         } else if path.is_dir() && path.join("main.rs").is_file() {
             let name = path
                 .file_name()
                 .and_then(|stem| stem.to_str())
                 .unwrap_or_default()
                 .to_string();
-            (path.join("main.rs"), name)
-        } else {
-            continue;
-        };
-        discovered.push((root, CargoTarget::Bin(name)));
+            discovered.push((path.join("main.rs"), name));
+        }
     }
-    // Directory order is unspecified; a stable order keeps the command (and
-    // the reported target) reproducible across machines.
     discovered.sort_by(|left, right| left.0.cmp(&right.0));
-    for (root, target) in discovered {
+    discovered
+}
+
+fn cargo_targets(package_dir: &Path) -> Vec<(PathBuf, CargoTarget)> {
+    let Ok(text) = std::fs::read_to_string(package_dir.join("Cargo.toml")) else {
+        return Vec::new();
+    };
+    let Ok(table) = text.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let package = table.get("package");
+    let package_name = package
+        .and_then(|section| section.get("name"))
+        .and_then(toml::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let switch = |key: &str| -> bool {
+        package
+            .and_then(|section| section.get(key))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(true)
+    };
+
+    let mut targets: Vec<(PathBuf, CargoTarget)> = Vec::new();
+    // A `[lib]` table declares the library explicitly; only its `path` is
+    // optional (default `src/lib.rs`). Without the table, auto-discovery
+    // decides, which `autolib = false` turns off.
+    if let Some(path) = lib_target(package_dir, &table, switch("autolib")) {
+        targets.push((path, CargoTarget::Lib));
+    }
+    let (mut bins, claimed) = explicit_bins(package_dir, &package_name, &table);
+    targets.append(&mut bins);
+
+    if !switch("autobins") {
+        return targets;
+    }
+    for (root, name) in discovered_bins(package_dir, &package_name) {
         if !claimed.contains(&root) && !targets.iter().any(|(known, _)| known == &root) {
-            targets.push((root, target));
+            targets.push((root, CargoTarget::Bin(name)));
         }
     }
     targets
@@ -1012,6 +1032,43 @@ fn attributes_say_test(text: &str, fn_start: usize) -> Option<&'static str> {
     None
 }
 
+/// True when the file NAME is a test-file convention in any supported
+/// language (`x_test.rs`, `test_x.py`, `x.test.ts`, `x.spec.js`, …).
+fn is_test_file_name(file: &str) -> bool {
+    const SUFFIXES: &[&str] = &[
+        "_test.rs",
+        "_test.py",
+        ".test.ts",
+        ".test.js",
+        ".test.tsx",
+        ".test.jsx",
+        ".spec.ts",
+        ".spec.js",
+    ];
+    file.starts_with("test_") || SUFFIXES.iter().any(|suffix| file.ends_with(suffix))
+}
+
+/// True when the enclosing DIRECTORY is a test-tree convention.
+fn is_test_dir(segments: &[&str]) -> bool {
+    segments
+        .iter()
+        .any(|segment| matches!(*segment, "tests" | "test" | "__tests__"))
+}
+
+/// True for a pytest/jest-style test NAME, but only in a language whose test
+/// functions are discovered by name (`test_foo`, `it`, `should`, …). Rust's
+/// `test_` prefix is covered by the name-convention rule above.
+fn is_pytest_or_jest_name(language: &str, name: &str) -> bool {
+    let by_name = matches!(
+        language,
+        "python" | "py" | "typescript" | "ts" | "javascript" | "js"
+    );
+    by_name
+        && (name.starts_with("test_")
+            || name.starts_with("pytest_")
+            || matches!(name, "test" | "it" | "should"))
+}
+
 /// Classify a caller as a test and say what marked it.
 fn classify_test(node: &Node, file_text: Option<&str>) -> Option<&'static str> {
     if let Some(evidence) = file_text.and_then(|text| attributes_say_test(text, node.byte_range.0))
@@ -1025,31 +1082,13 @@ fn classify_test(node: &Node, file_text: Option<&str>) -> Option<&'static str> {
     let path = node.file_path.replace('\\', "/");
     let segments: Vec<&str> = path.split('/').collect();
     let file = segments.last().copied().unwrap_or("");
-    if file.ends_with("_test.rs")
-        || file.starts_with("test_")
-        || file.ends_with("_test.py")
-        || file.ends_with(".test.ts")
-        || file.ends_with(".test.js")
-        || file.ends_with(".test.tsx")
-        || file.ends_with(".test.jsx")
-        || file.ends_with(".spec.ts")
-        || file.ends_with(".spec.js")
-    {
+    if is_test_file_name(file) {
         return Some("test file");
     }
-    if segments.contains(&"tests") || segments.contains(&"test") || segments.contains(&"__tests__")
-    {
+    if is_test_dir(&segments) {
         return Some("tests dir");
     }
-    let pytest_jest = matches!(
-        node.language.as_str(),
-        "python" | "py" | "typescript" | "ts" | "javascript" | "js"
-    ) && (name.starts_with("test_")
-        || name.starts_with("pytest_")
-        || name == "test"
-        || name == "it"
-        || name == "should");
-    if pytest_jest {
+    if is_pytest_or_jest_name(node.language.as_str(), name) {
         return Some("pytest/jest name");
     }
     None

@@ -8,8 +8,10 @@ use super::helpers::{
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
 use crate::edit::ResolvedEditChange;
+use crate::graph::pdg::ProgramDependenceGraph;
 use crate::validation::validation_to_json;
 use serde_json::Value;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -30,6 +32,132 @@ pub(crate) fn file_summary(file: &edit_batch::BatchFileEdit) -> Value {
         "additions": diff.additions,
         "deletions": diff.deletions,
     })
+}
+
+/// Build the per-file edit plan (batch or single) and the primary display path.
+///
+/// All in memory: nothing is written, and the plan is what the diff, the
+/// impact analysis and the cached preview are all derived from.
+async fn build_preview_plan(
+    changes_val: &Value,
+    batch_mode: bool,
+    top_level_path: Option<&str>,
+    project_root: &Path,
+) -> Result<(edit_batch::BatchEditPlan, String), JsonRpcError> {
+    if batch_mode {
+        let plan = edit_batch::resolve_batch(changes_val, top_level_path, project_root).await?;
+        let primary = plan
+            .files
+            .first()
+            .map(|f| f.display_path.clone())
+            .unwrap_or_default();
+        return Ok((plan, primary));
+    }
+    let file_path = top_level_path.unwrap_or_default();
+    let abs_file_path = validate_file_within_project(file_path, project_root)?;
+    let original = tokio::fs::read_to_string(&abs_file_path)
+        .await
+        .map_err(|e| {
+            JsonRpcError::invalid_params(format!("Cannot read file '{file_path}': {e}"))
+        })?;
+    let changes = parse_edit_changes(changes_val, Some(&original))?;
+    let modified = apply_changes_in_memory(&original, &changes)?;
+    let plan = edit_batch::BatchEditPlan {
+        files: vec![edit_batch::BatchFileEdit {
+            canonical_path: abs_file_path,
+            display_path: file_path.to_string(),
+            original,
+            modified,
+            changes,
+        }],
+    };
+    Ok((plan, file_path.to_string()))
+}
+
+/// Diffs, PDG impact and real-signal risk for every file in the plan.
+struct PreviewAnalysis {
+    files_json: Vec<Value>,
+    diffs_json: Vec<Value>,
+    diff_text: String,
+    affected_files: Vec<String>,
+    affected_nodes: Vec<String>,
+    breaking_changes: Vec<String>,
+    risk_level: String,
+    risk_findings: Vec<String>,
+}
+
+/// Walk the plan once, accumulating the rendered diff and the impact/risk
+/// findings per file.
+///
+/// Low risk contributes nothing. When a batch touches several files, the
+/// response reports the HIGHEST risk (a later low-risk file must not downgrade
+/// an earlier high-risk finding), which `pick_higher_risk` implements.
+fn analyze_plan(
+    plan: &edit_batch::BatchEditPlan,
+    pdg_snapshot: Option<&ProgramDependenceGraph>,
+) -> PreviewAnalysis {
+    let mut analysis = PreviewAnalysis {
+        files_json: Vec::new(),
+        diffs_json: Vec::new(),
+        diff_text: String::new(),
+        affected_files: Vec::new(),
+        affected_nodes: Vec::new(),
+        breaking_changes: Vec::new(),
+        risk_level: String::new(),
+        risk_findings: Vec::new(),
+    };
+    for file in &plan.files {
+        let diff = make_diff(&file.original, &file.modified, &file.display_path);
+        analysis.files_json.push(file_summary(file));
+        analysis
+            .diff_text
+            .push_str(&crate::cli::mcp::output::render_unified_diff(&diff, false));
+        analysis.diffs_json.push(serde_json::json!({
+            "file": file.display_path,
+            "diff": diff.to_json(),
+        }));
+
+        let edit_ranges: Vec<(usize, usize)> = file
+            .changes
+            .iter()
+            .filter_map(|c| match c {
+                crate::edit::EditChange::ReplaceText { start, end, .. } => Some((*start, *end)),
+                _ => None,
+            })
+            .collect();
+
+        // Per-file PDG impact (rename callers + edited-region overlap).
+        if let Some(pdg) = pdg_snapshot {
+            let (nodes, files, breaks) =
+                collect_pdg_impact(pdg, &file.changes, &file.canonical_path, &file.display_path);
+            analysis.affected_nodes.extend(nodes);
+            analysis.affected_files.extend(files);
+            analysis.breaking_changes.extend(breaks);
+        } else {
+            analysis
+                .affected_files
+                .push(file.canonical_path.to_string_lossy().to_string());
+        }
+
+        let signals = edit_risk::compute_signals(
+            pdg_snapshot,
+            &file.canonical_path,
+            &file.original,
+            &edit_ranges,
+        );
+        if let Some(finding) = edit_risk::assess(&signals) {
+            analysis.risk_level = pick_higher_risk(&analysis.risk_level, finding.level).to_string();
+            analysis.risk_findings.push(format!(
+                "{}: {} — {}",
+                file.display_path, finding.level, finding.reason
+            ));
+        }
+    }
+    // Deduplicate affected lists while keeping first-seen order.
+    dedup_keep_order(&mut analysis.affected_files);
+    dedup_keep_order(&mut analysis.affected_nodes);
+    dedup_keep_order(&mut analysis.breaking_changes);
+    analysis
 }
 
 #[allow(missing_docs)]
@@ -134,36 +262,8 @@ their own file_path (atomic across files, one token for the whole batch)."
         let preview_token = build_preview_token(nonce);
 
         // 2. Build the per-file edit plan (batch or single) — all in-memory.
-        let (plan, primary_display) = if batch_mode {
-            let plan =
-                edit_batch::resolve_batch(&changes_val, top_level_path, &project_root).await?;
-            let primary = plan
-                .files
-                .first()
-                .map(|f| f.display_path.clone())
-                .unwrap_or_default();
-            (plan, primary)
-        } else {
-            let file_path = top_level_path.unwrap_or_default();
-            let abs_file_path = validate_file_within_project(file_path, &project_root)?;
-            let original = tokio::fs::read_to_string(&abs_file_path)
-                .await
-                .map_err(|e| {
-                    JsonRpcError::invalid_params(format!("Cannot read file '{file_path}': {e}"))
-                })?;
-            let changes = parse_edit_changes(&changes_val, Some(&original))?;
-            let modified = apply_changes_in_memory(&original, &changes)?;
-            let plan = edit_batch::BatchEditPlan {
-                files: vec![edit_batch::BatchFileEdit {
-                    canonical_path: abs_file_path,
-                    display_path: file_path.to_string(),
-                    original,
-                    modified,
-                    changes,
-                }],
-            };
-            (plan, file_path.to_string())
-        };
+        let (plan, primary_display) =
+            build_preview_plan(&changes_val, batch_mode, top_level_path, &project_root).await?;
 
         // 3. Cache under the primary file path (existing path-keyed flow)
         // plus the token alias so apply works with ONLY preview_token.
@@ -202,71 +302,16 @@ their own file_path (atomic across files, one token for the whole batch)."
         store_preview_in_cache(&storage_path, cache_entry).await?;
 
         // 4. Diffs, impact, risk.
-        let mut affected_files: Vec<String> = Vec::new();
-        let mut affected_nodes: Vec<String> = Vec::new();
-        let mut breaking_changes: Vec<String> = Vec::new();
-        let mut risk_findings: Vec<String> = Vec::new();
-        let mut risk_level = String::new();
-        let mut files_json: Vec<Value> = Vec::new();
-        let mut diffs_json: Vec<Value> = Vec::new();
-        let mut diff_text = String::new();
-
-        for file in &plan.files {
-            let diff = make_diff(&file.original, &file.modified, &file.display_path);
-            files_json.push(file_summary(file));
-            diff_text.push_str(&crate::cli::mcp::output::render_unified_diff(&diff, false));
-            diffs_json.push(serde_json::json!({
-                "file": file.display_path,
-                "diff": diff.to_json(),
-            }));
-
-            let edit_ranges: Vec<(usize, usize)> = file
-                .changes
-                .iter()
-                .filter_map(|c| match c {
-                    crate::edit::EditChange::ReplaceText { start, end, .. } => Some((*start, *end)),
-                    _ => None,
-                })
-                .collect();
-
-            // Per-file PDG impact (rename callers + edited-region overlap).
-            if let Some(pdg) = pdg_snapshot.as_ref() {
-                let (nodes, files, breaks) = collect_pdg_impact(
-                    pdg,
-                    &file.changes,
-                    &file.canonical_path,
-                    &file.display_path,
-                );
-                affected_nodes.extend(nodes);
-                affected_files.extend(files);
-                breaking_changes.extend(breaks);
-            } else {
-                affected_files.push(file.canonical_path.to_string_lossy().to_string());
-            }
-
-            // Real-signal risk (§3.6). Low risk contributes nothing. When a
-            // batch touches several files, the response reports the HIGHEST
-            // risk (a later low-risk file must not downgrade an earlier
-            // high-risk finding).
-            let signals = edit_risk::compute_signals(
-                pdg_snapshot.as_ref(),
-                &file.canonical_path,
-                &file.original,
-                &edit_ranges,
-            );
-            if let Some(finding) = edit_risk::assess(&signals) {
-                risk_level = pick_higher_risk(&risk_level, finding.level).to_string();
-                risk_findings.push(format!(
-                    "{}: {} — {}",
-                    file.display_path, finding.level, finding.reason
-                ));
-            }
-        }
-
-        // Deduplicate affected lists while keeping first-seen order.
-        dedup_keep_order(&mut affected_files);
-        dedup_keep_order(&mut affected_nodes);
-        dedup_keep_order(&mut breaking_changes);
+        let PreviewAnalysis {
+            files_json,
+            diffs_json,
+            diff_text,
+            affected_files,
+            affected_nodes,
+            breaking_changes,
+            risk_level,
+            risk_findings,
+        } = analyze_plan(&plan, pdg_snapshot.as_ref());
 
         let mut response = serde_json::json!({
             "preview_token": preview_token,

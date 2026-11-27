@@ -442,6 +442,235 @@ fn wrap_read_result(result: Value, project_root: &Path) -> Value {
 }
 
 #[allow(missing_docs)]
+/// The retrieval block every exact, live read reports: no TF-IDF ranking, no
+/// neural scoring, and the PDG used only when it happens to be loaded.
+fn exact_retrieval(pdg_status: &str) -> Value {
+    serde_json::json!({
+        "tfidf_status": "not_used_exact",
+        "pdg_status": pdg_status,
+        "neural_status": "not_used_exact"
+    })
+}
+
+/// The `unchanged since read` answer: the whole requested range was already
+/// served in this session under the same content hash.
+#[allow(clippy::too_many_arguments)]
+fn unchanged_read_result(
+    handle: &read_paths::ReadHandle,
+    language: &str,
+    total_lines: usize,
+    since_ordinal: u64,
+    start_line: usize,
+    end_line: usize,
+    range_handle: String,
+    resolved_file_path: &Path,
+    project_root: Option<&Path>,
+) -> Value {
+    let mut payload =
+        read_paths::unchanged_payload(&handle.file_path, since_ordinal, start_line, end_line);
+    payload["language"] = serde_json::json!(language);
+    payload["total_lines"] = serde_json::json!(total_lines);
+    payload["handle"] = serde_json::json!(range_handle);
+    payload["retrieval"] = exact_retrieval("not_needed_live");
+    let payload = super::read_paths::attach_range_diagnostics(
+        payload,
+        project_root,
+        resolved_file_path,
+        start_line,
+        end_line,
+    );
+    wrap_read_result(payload, project_root.unwrap_or(resolved_file_path))
+}
+
+/// The `partial overlap` answer: serve only the unseen lines, reference the
+/// rest, and record each served range so the next read is answered precisely.
+#[allow(clippy::too_many_arguments)]
+fn partial_overlap_result(
+    handle: &read_paths::ReadHandle,
+    language: &str,
+    total_lines: usize,
+    since_ordinal: u64,
+    start_line: usize,
+    end_line: usize,
+    unseen: &[(usize, usize)],
+    content: &str,
+    content_hash: &str,
+    range_handle: String,
+    resolved_file_path: &Path,
+    project_root: Option<&Path>,
+    session: &str,
+    ledger: &read_paths::SessionLedger,
+) -> Value {
+    let mut body = String::new();
+    let mut served_ranges: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in unseen {
+        let end = (*e).min(total_lines.max(1));
+        if let Ok(slice) = visible_slice(content, *s, end, total_lines) {
+            let numbered = read_paths::number_lines(&slice, *s);
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&numbered);
+            served_ranges.push((*s, end));
+        }
+    }
+    let mut result = serde_json::json!({
+        "file_path": handle.file_path,
+        "language": language,
+        "total_lines": total_lines,
+        "start_line": start_line,
+        "end_line": end_line,
+        "unchanged_since_read": since_ordinal,
+        "unchanged_ranges": format!("{start_line}-{end_line} minus served ranges below"),
+        "handle": range_handle,
+        "content": body,
+    });
+    for (s, e) in &served_ranges {
+        ledger.record(session, resolved_file_path, content_hash, *s, *e);
+    }
+    result["retrieval"] = exact_retrieval("not_needed_live");
+    let result = super::read_paths::attach_range_diagnostics(
+        result,
+        project_root,
+        resolved_file_path,
+        start_line,
+        end_line,
+    );
+    wrap_read_result(result, project_root.unwrap_or(resolved_file_path))
+}
+
+/// The inclusive 1-based window a read serves, plus the symbol anchor it
+/// resolved (reported back when one was used).
+///
+/// Precedence: explicit `start_line`/`end_line` args, then the `#L600-800`
+/// handle fragment, then a symbol anchor, then the whole file. No anchor and
+/// no explicit range means the WHOLE file — defaulting the end to 1 collapsed
+/// every plain read to its first line. The result is clamped to the file and
+/// to `max_lines`.
+async fn resolve_window(
+    args: &Value,
+    handle: &read_paths::ReadHandle,
+    focus_symbol: Option<&str>,
+    content: &str,
+    resolved_file_path: &Path,
+    total_lines: usize,
+    max_lines: usize,
+) -> Result<((usize, usize), Option<(usize, usize)>), JsonRpcError> {
+    let explicit_start = extract_usize(args, "start_line", 0)?;
+    let explicit_end = extract_usize(args, "end_line", 0)?;
+    let symbol_target = handle
+        .symbol
+        .clone()
+        .or_else(|| focus_symbol.map(str::to_string));
+
+    let mut anchor: Option<(usize, usize)> = None;
+    if let Some(target) = &symbol_target {
+        let live =
+            super::read_symbol_handler::parse_live_file(resolved_file_path.to_path_buf()).await?;
+        let spans = read_paths::spans_with_lines(content, &live.symbols);
+        let span = read_paths::find_span(&spans, target).ok_or_else(|| {
+            JsonRpcError::invalid_params(format!(
+                "Symbol '{target}' not found in {}",
+                resolved_file_path.display()
+            ))
+        })?;
+        anchor = Some((span.start_line, span.end_line));
+    }
+    let (anchor_start, anchor_end) = anchor.unwrap_or((1, total_lines.max(1)));
+    let start_line = if explicit_start > 0 {
+        explicit_start.max(1)
+    } else {
+        handle
+            .line_range
+            .map(|(start, _)| start)
+            .unwrap_or(anchor_start)
+    };
+    let end_line = if explicit_end > 0 {
+        explicit_end
+    } else {
+        handle.line_range.map(|(_, end)| end).unwrap_or(anchor_end)
+    }
+    .min(total_lines.max(1))
+    .min(start_line.saturating_add(max_lines).saturating_sub(1));
+    Ok(((start_line, end_line), anchor))
+}
+
+/// The elided view (§4.1): focus symbol in full, siblings collapsed.
+///
+/// Always served when a focus symbol was asked for — a view is not the same
+/// answer as the bytes. Records only the focus lines the body actually
+/// carried: when `max_lines` cut the body before or inside the focus item,
+/// the omitted lines were never sent, and recording the full range made a
+/// later read of them answer `unchanged since read`.
+#[allow(clippy::too_many_arguments)]
+async fn elided_view_result(
+    content: &str,
+    resolved_file_path: &Path,
+    focus: &str,
+    file_path: &str,
+    language: &str,
+    total_lines: usize,
+    range_handle: String,
+    max_lines: usize,
+    project_root: Option<&Path>,
+    session: &str,
+    content_hash: &str,
+    ledger: &read_paths::SessionLedger,
+) -> Result<Value, JsonRpcError> {
+    let live =
+        super::read_symbol_handler::parse_live_file(resolved_file_path.to_path_buf()).await?;
+    let file_label = project_root
+        .and_then(|root| resolved_file_path.strip_prefix(root).ok())
+        .map(|rel| rel.to_string_lossy().into_owned())
+        .unwrap_or_else(|| resolved_file_path.to_string_lossy().into_owned());
+    let elided = read_paths::elide_around(content, &live.symbols, focus, &file_label, max_lines)
+        .map_err(JsonRpcError::invalid_params)?;
+
+    let mut result = serde_json::json!({
+        "file_path": file_path,
+        "language": language,
+        "total_lines": total_lines,
+        "elided": true,
+        "focus_symbol": focus,
+        "focus_line_start": elided.focus_start_line,
+        "focus_line_end": elided.focus_end_line,
+        "expand": elided.expand,
+        "handle": range_handle,
+        "content": elided.body,
+        "collapsed": elided.collapsed.iter().map(|item| serde_json::json!({
+            "name": item.name,
+            "signature": item.signature,
+            "line": item.start_line,
+            "lines": item.line_count,
+            // Same escaping as the body's `[expand: …]` marker and as
+            // `ElidedOutput.expand`: a raw label would emit `a#b.rs#sym`,
+            // which `parse_read_handle` splits at the FIRST `#` into file
+            // `a` + symbol `b.rs#sym`.
+            "expand": format!("{}#{}", read_paths::escape_handle_path(&file_label), item.name),
+        })).collect::<Vec<_>>(),
+        "retrieval": exact_retrieval("not_needed_live"),
+    });
+    result = super::read_paths::attach_range_diagnostics(
+        result,
+        project_root,
+        resolved_file_path,
+        elided.focus_start_line,
+        elided.focus_end_line,
+    );
+    result = wrap_read_result(result, project_root.unwrap_or(resolved_file_path));
+    if elided.served_end_line > 0 {
+        ledger.record(
+            session,
+            resolved_file_path,
+            content_hash,
+            elided.served_start_line,
+            elided.served_end_line,
+        );
+    }
+    Ok(result)
+}
+
+#[allow(missing_docs)]
 impl ReadFileHandler {
     pub fn name(&self) -> &str {
         "leindex_read_file"
@@ -536,41 +765,16 @@ Works for any absolute path, including outside the project — no index required
 
         // Window resolution. Precedence: explicit start/end args, then the
         // #L600-800 fragment, then a symbol anchor, then the whole file.
-        let explicit_start = extract_usize(&args, "start_line", 0)?;
-        let explicit_end = extract_usize(&args, "end_line", 0)?;
-        let symbol_target = handle.symbol.clone().or_else(|| focus_symbol.clone());
-
-        let mut anchor: Option<(usize, usize)> = None;
-        if let Some(target) = &symbol_target {
-            let live =
-                super::read_symbol_handler::parse_live_file(resolved_file_path.clone()).await?;
-            let spans = read_paths::spans_with_lines(&content, &live.symbols);
-            let span = read_paths::find_span(&spans, target).ok_or_else(|| {
-                JsonRpcError::invalid_params(format!(
-                    "Symbol '{target}' not found in {}",
-                    resolved_file_path.display()
-                ))
-            })?;
-            anchor = Some((span.start_line, span.end_line));
-        }
-        // No anchor and no explicit range means the WHOLE file — defaulting
-        // the end to 1 collapsed every plain read to its first line.
-        let (anchor_start, anchor_end) = anchor.unwrap_or((1, total_lines.max(1)));
-        let start_line = if explicit_start > 0 {
-            explicit_start.max(1)
-        } else {
-            handle
-                .line_range
-                .map(|(start, _)| start)
-                .unwrap_or(anchor_start)
-        };
-        let end_line = if explicit_end > 0 {
-            explicit_end
-        } else {
-            handle.line_range.map(|(_, end)| end).unwrap_or(anchor_end)
-        }
-        .min(total_lines.max(1))
-        .min(start_line.saturating_add(max_lines).saturating_sub(1));
+        let ((start_line, end_line), anchor) = resolve_window(
+            &args,
+            &handle,
+            focus_symbol.as_deref(),
+            &content,
+            &resolved_file_path,
+            total_lines,
+            max_lines,
+        )
+        .await?;
 
         let session = args
             .get("_session")
@@ -586,76 +790,22 @@ Works for any absolute path, including outside the project — no index required
         );
 
         // Elided view (§4.1): focus symbol in full, siblings collapsed.
-        // Always served — a view is not the same answer as the bytes.
         if let Some(focus) = &focus_symbol {
-            let live =
-                super::read_symbol_handler::parse_live_file(resolved_file_path.clone()).await?;
-            let file_label = project_root
-                .as_deref()
-                .and_then(|root| resolved_file_path.strip_prefix(root).ok())
-                .map(|rel| rel.to_string_lossy().into_owned())
-                .unwrap_or_else(|| resolved_file_path.to_string_lossy().into_owned());
-            let elided =
-                read_paths::elide_around(&content, &live.symbols, focus, &file_label, max_lines)
-                    .map_err(JsonRpcError::invalid_params)?;
-
-            let mut result = serde_json::json!({
-                "file_path": handle.file_path,
-                "language": language,
-                "total_lines": total_lines,
-                "elided": true,
-                "focus_symbol": focus,
-                "focus_line_start": elided.focus_start_line,
-                "focus_line_end": elided.focus_end_line,
-                "expand": elided.expand,
-                "handle": range_handle,
-                "content": elided.body,
-                "collapsed": elided.collapsed.iter().map(|item| serde_json::json!({
-                    "name": item.name,
-                    "signature": item.signature,
-                    "line": item.start_line,
-                    "lines": item.line_count,
-                    // Same escaping as the body's `[expand: …]` marker and as
-                    // `ElidedOutput.expand`: a raw label would emit
-                    // `a#b.rs#sym`, which `parse_read_handle` splits at the
-                    // FIRST `#` into file `a` + symbol `b.rs#sym`.
-                    "expand": format!(
-                        "{}#{}",
-                        read_paths::escape_handle_path(&file_label),
-                        item.name
-                    ),
-                })).collect::<Vec<_>>(),
-                "retrieval": serde_json::json!({
-                    "tfidf_status": "not_used_exact",
-                    "pdg_status": "not_needed_live",
-                    "neural_status": "not_used_exact"
-                }),
-            });
-            result = super::read_paths::attach_range_diagnostics(
-                result,
-                project_root.as_deref(),
+            return elided_view_result(
+                &content,
                 &resolved_file_path,
-                elided.focus_start_line,
-                elided.focus_end_line,
-            );
-            result = wrap_read_result(
-                result,
-                project_root.as_deref().unwrap_or(&resolved_file_path),
-            );
-            // Record only the focus lines the body actually carried. When
-            // `max_lines` cut the body before or inside the focus item, the
-            // omitted lines were never sent, and recording the full range
-            // made a later read of them answer `unchanged since read`.
-            if elided.served_end_line > 0 {
-                ledger.record(
-                    session,
-                    &resolved_file_path,
-                    &content_hash,
-                    elided.served_start_line,
-                    elided.served_end_line,
-                );
-            }
-            return Ok(result);
+                focus,
+                &handle.file_path,
+                &language,
+                total_lines,
+                range_handle,
+                max_lines,
+                project_root.as_deref(),
+                session,
+                &content_hash,
+                ledger,
+            )
+            .await;
         }
 
         // Session dedup (§4.1): an unchanged re-read costs bytes, not tokens.
@@ -672,79 +822,37 @@ Works for any absolute path, including outside the project — no index required
                     start_line,
                     end_line,
                 } => {
-                    let mut payload = read_paths::unchanged_payload(
-                        &handle.file_path,
+                    return Ok(unchanged_read_result(
+                        &handle,
+                        &language,
+                        total_lines,
                         since_ordinal,
                         start_line,
                         end_line,
-                    );
-                    payload["language"] = serde_json::json!(language);
-                    payload["total_lines"] = serde_json::json!(total_lines);
-                    payload["handle"] = serde_json::json!(range_handle);
-                    payload["retrieval"] = serde_json::json!({
-                        "tfidf_status": "not_used_exact",
-                        "pdg_status": "not_needed_live",
-                        "neural_status": "not_used_exact"
-                    });
-                    let payload = super::read_paths::attach_range_diagnostics(
-                        payload,
-                        project_root.as_deref(),
+                        range_handle,
                         &resolved_file_path,
-                        start_line,
-                        end_line,
-                    );
-                    return Ok(wrap_read_result(
-                        payload,
-                        project_root.as_deref().unwrap_or(&resolved_file_path),
+                        project_root.as_deref(),
                     ));
                 }
                 ConsultVerdict::PartialOverlap {
                     unseen,
                     since_ordinal,
                 } => {
-                    // Serve only the unseen lines; reference the rest.
-                    let mut body = String::new();
-                    let mut served_ranges: Vec<(usize, usize)> = Vec::new();
-                    for (s, e) in &unseen {
-                        let end = (*e).min(total_lines.max(1));
-                        if let Ok(slice) = visible_slice(&content, *s, end, total_lines) {
-                            let numbered = read_paths::number_lines(&slice, *s);
-                            if !body.is_empty() {
-                                body.push('\n');
-                            }
-                            body.push_str(&numbered);
-                            served_ranges.push((*s, end));
-                        }
-                    }
-                    let mut result = serde_json::json!({
-                        "file_path": handle.file_path,
-                        "language": language,
-                        "total_lines": total_lines,
-                        "start_line": start_line,
-                        "end_line": end_line,
-                        "unchanged_since_read": since_ordinal,
-                        "unchanged_ranges": format!("{start_line}-{end_line} minus served ranges below"),
-                        "handle": range_handle,
-                        "content": body,
-                    });
-                    for (s, e) in &served_ranges {
-                        ledger.record(session, &resolved_file_path, &content_hash, *s, *e);
-                    }
-                    result["retrieval"] = serde_json::json!({
-                        "tfidf_status": "not_used_exact",
-                        "pdg_status": "not_needed_live",
-                        "neural_status": "not_used_exact"
-                    });
-                    let result = super::read_paths::attach_range_diagnostics(
-                        result,
-                        project_root.as_deref(),
-                        &resolved_file_path,
+                    return Ok(partial_overlap_result(
+                        &handle,
+                        &language,
+                        total_lines,
+                        since_ordinal,
                         start_line,
                         end_line,
-                    );
-                    return Ok(wrap_read_result(
-                        result,
-                        project_root.as_deref().unwrap_or(&resolved_file_path),
+                        &unseen,
+                        &content,
+                        &content_hash,
+                        range_handle,
+                        &resolved_file_path,
+                        project_root.as_deref(),
+                        session,
+                        ledger,
                     ));
                 }
                 ConsultVerdict::New => {}
@@ -784,7 +892,12 @@ Works for any absolute path, including outside the project — no index required
 
         // Symbol-anchored reads report what they resolved to.
         if let Some((s, e)) = anchor {
-            result["anchor_symbol"] = serde_json::json!(symbol_target.clone().unwrap_or_default());
+            let symbol_target = handle
+                .symbol
+                .clone()
+                .or_else(|| focus_symbol.clone())
+                .unwrap_or_default();
+            result["anchor_symbol"] = serde_json::json!(symbol_target);
             result["anchor_line_start"] = serde_json::json!(s);
             result["anchor_line_end"] = serde_json::json!(e);
         }

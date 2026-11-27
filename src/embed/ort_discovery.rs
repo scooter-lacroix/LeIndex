@@ -987,7 +987,6 @@ mod tests {
 
         let parsed = read_config_ort_path();
         assert_eq!(parsed, Some(lib_path));
-
         // FIXME: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
     }

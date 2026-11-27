@@ -174,51 +174,29 @@ fn lexical_relative(raw: &str) -> String {
 ///
 /// NUL-delimited both ways, so a path containing a newline cannot be read as
 /// two records. Exit 1 means "none of these are ignored" — a normal answer.
-fn ignored_paths(
-    root: &Path,
-    candidates: &[String],
-) -> Result<std::collections::BTreeSet<String>, JsonRpcError> {
-    let mut ignored = std::collections::BTreeSet::new();
-    if candidates.is_empty() {
-        return Ok(ignored);
-    }
-    let mut payload = Vec::new();
-    for candidate in candidates {
-        payload.extend_from_slice(candidate.as_bytes());
-        payload.push(0);
-    }
-    // The spawn uses the SAME scrubbed builder as every other git child, so an
-    // inherited GIT_DIR/GIT_WORK_TREE cannot redirect the probe.
-    let mut command = git_command_sync(root);
-    command
-        .args(["check-ignore", "-z", "--stdin"])
-        // stdin MUST be piped: `check-ignore --stdin` blocks reading it until
-        // EOF. Without this the child inherited a null/terminal stdin, the
-        // feeder thread had nothing to write to, and every staging call sat
-        // for the full deadline before failing.
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    let mut child = command.spawn().map_err(|error| {
-        JsonRpcError::internal_error(format!("failed to spawn git check-ignore: {error}"))
-    })?;
-    let mut stdin = child.stdin.take();
-    let stdout_pipe = child.stdout.take();
-
-    // Feed the request on a helper thread while THIS thread drains the reply:
-    // the two directions run concurrently, so neither pipe can fill and
-    // deadlock the other. Dropping the handle closes stdin -> `check-ignore`
-    // sees EOF and exits. The reply is read uncapped — it is bounded by the
-    // request (one record per ignored candidate), and capping it would
-    // silently drop ignored paths and then stage them.
-    //
-    // BOTH threads REPORT their result (CodeRabbit round 11, id 4698955155).
-    // Their errors used to be discarded and a panicking reader collapsed to an
-    // empty string, so a PARTIAL reply looked like "nothing is ignored" and the
-    // staging list included files the filter exists to exclude.
+/// Feed `payload` to `stdin` and drain `stdout` CONCURRENTLY, then wait out the
+/// child under one deadline.
+///
+/// Both directions must run at once: a single thread writing while the child
+/// fills its stdout pipe would deadlock. Both threads therefore REPORT their
+/// result (CodeRabbit round 11, id 4698955155) instead of discarding it — a
+/// partial reply must never look like "nothing is ignored".
+///
+/// A wedged git is killed and the request refused: an unknown ignore answer
+/// must never stage anything.
+fn run_check_ignore(
+    mut child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    stdout_pipe: Option<std::process::ChildStdout>,
+    payload: Vec<u8>,
+) -> Result<String, JsonRpcError> {
+    // Dropping the handle closes stdin -> `check-ignore` sees EOF and exits.
+    // The reply is read uncapped: it is bounded by the request (one record per
+    // ignored candidate), and capping it would silently drop ignored paths and
+    // then stage them.
     let feeder = std::thread::spawn(move || {
         use std::io::Write;
-        if let Some(mut input) = stdin.take() {
+        if let Some(mut input) = stdin {
             let mut payload = &payload[..];
             std::io::copy(&mut payload, &mut input)?;
             input.flush()?;
@@ -234,8 +212,6 @@ fn ignored_paths(
         Ok::<Vec<u8>, std::io::Error>(buf)
     });
 
-    // One deadline for the WHOLE exchange. A wedged git is killed and the
-    // request refused: an unknown ignore answer must never stage anything.
     let started = std::time::Instant::now();
     let status = loop {
         match child.try_wait() {
@@ -279,6 +255,7 @@ fn ignored_paths(
         }
     };
 
+    // Exit 1 is a normal answer ("none of these are ignored"), not a failure.
     if !status.success() && status.code() != Some(1) {
         return Err(JsonRpcError::internal_error(format!(
             "git check-ignore failed ({}); the staging request was refused because the \
@@ -286,6 +263,40 @@ fn ignored_paths(
             status.code().unwrap_or(-1)
         )));
     }
+    Ok(stdout)
+}
+
+fn ignored_paths(
+    root: &Path,
+    candidates: &[String],
+) -> Result<std::collections::BTreeSet<String>, JsonRpcError> {
+    let mut ignored = std::collections::BTreeSet::new();
+    if candidates.is_empty() {
+        return Ok(ignored);
+    }
+    let mut payload = Vec::new();
+    for candidate in candidates {
+        payload.extend_from_slice(candidate.as_bytes());
+        payload.push(0);
+    }
+    // The spawn uses the SAME scrubbed builder as every other git child, so an
+    // inherited GIT_DIR/GIT_WORK_TREE cannot redirect the probe.
+    let mut command = git_command_sync(root);
+    command
+        .args(["check-ignore", "-z", "--stdin"])
+        // stdin MUST be piped: `check-ignore --stdin` blocks reading it until
+        // EOF. Without this the child inherited a null/terminal stdin, the
+        // feeder thread had nothing to write to, and every staging call sat
+        // for the full deadline before failing.
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = command.spawn().map_err(|error| {
+        JsonRpcError::internal_error(format!("failed to spawn git check-ignore: {error}"))
+    })?;
+    let stdin = child.stdin.take();
+    let stdout_pipe = child.stdout.take();
+    let stdout = run_check_ignore(child, stdin, stdout_pipe, payload)?;
     for record in stdout.as_bytes().split(|byte: &u8| *byte == 0) {
         if let Ok(text) = std::str::from_utf8(record)
             && !text.is_empty()
@@ -468,19 +479,21 @@ pub(crate) async fn staging_outcome_async(
         })?
 }
 
-fn staging_outcome_inner(root: &Path, args: &Value) -> Result<StagingOutcome, JsonRpcError> {
+/// Resolve the requested `paths` into the list to stage, refusing anything
+/// outside the project.
+///
+/// Tracked files deleted from the worktree are stageable (`git add` records the
+/// removal) but no longer exist on disk, so the canonicalizing containment
+/// check cannot resolve them. They are accepted when git reports them deleted
+/// AND their lexical, normalised form stays inside the project — a deletion can
+/// never escape the root it is reported relative to.
+fn requested_paths(root: &Path, args: &Value) -> Result<Vec<String>, JsonRpcError> {
     let paths = args.get("paths").and_then(Value::as_array).ok_or_else(|| {
         JsonRpcError::invalid_params_with_suggestion(
             "git add requires a non-empty 'paths' array".to_string(),
             "Provide paths: project-relative files to stage".to_string(),
         )
     })?;
-    // Tracked files deleted from the worktree are stageable (`git add`
-    // records the removal) but no longer exist on disk, so the
-    // canonicalizing containment check cannot resolve them. They are
-    // accepted when git reports them deleted AND their lexical, normalised
-    // form stays inside the project — a deletion can never escape the
-    // root it is reported relative to.
     let deleted: std::collections::BTreeSet<String> = crate::cli::git::status(root)
         .map(|status| {
             status
@@ -493,14 +506,13 @@ fn staging_outcome_inner(root: &Path, args: &Value) -> Result<StagingOutcome, Js
     let mut requested = Vec::new();
     for path in paths {
         let raw = path.as_str().unwrap_or_default();
-        if validate_file_within_project(raw, root).is_err() {
-            let lexed = lexical_relative(raw);
-            if !deleted.contains(&lexed) {
-                return Err(JsonRpcError::invalid_params_with_suggestion(
-                    format!("'{raw}' is not a path inside this project"),
-                    "Stage project-relative paths only".to_string(),
-                ));
-            }
+        if validate_file_within_project(raw, root).is_err()
+            && !deleted.contains(&lexical_relative(raw))
+        {
+            return Err(JsonRpcError::invalid_params_with_suggestion(
+                format!("'{raw}' is not a path inside this project"),
+                "Stage project-relative paths only".to_string(),
+            ));
         }
         requested.push(raw.to_string());
     }
@@ -509,6 +521,86 @@ fn staging_outcome_inner(root: &Path, args: &Value) -> Result<StagingOutcome, Js
             "git add requires at least one path".to_string(),
         ));
     }
+    Ok(requested)
+}
+
+/// What one expanded file does to the staging report.
+enum Disposition {
+    /// Excluded from the argv, with the reason shown to the caller.
+    Exclude(&'static str),
+    /// Staged, possibly with a warning.
+    Stage(Vec<String>),
+}
+
+/// Classify one expanded file:
+/// * secret/runtime found under a DIRECTORY path — excluded (and listed)
+///   unless `allow_sensitive: true`, in which case it is staged with a warning;
+/// * secret/runtime named EXPLICITLY — always staged (the caller asked for
+///   exactly this path) with a warning;
+/// * everything else — staged, with warnings for files over 1 MiB and probable
+///   binaries.
+fn classify_staged_file(
+    root: &Path,
+    relative: &str,
+    is_explicit: bool,
+    allow_sensitive: bool,
+) -> Disposition {
+    let secret = is_secret_path(relative);
+    let sensitive = secret || is_runtime_artifact(relative);
+    if sensitive && !is_explicit && !allow_sensitive {
+        return Disposition::Exclude(if secret {
+            "likely secret"
+        } else {
+            "runtime artefact"
+        });
+    }
+    let mut warnings = Vec::new();
+    if sensitive {
+        warnings.push(format!("'{relative}' looks like a secret or runtime artefact; staging it because it was named explicitly or allow_sensitive is set"));
+    }
+    let absolute = root.join(relative);
+    let metadata = std::fs::metadata(&absolute);
+    if metadata.as_ref().is_ok_and(|m| m.len() > 1024 * 1024) {
+        let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+        warnings.push(format!(
+            "'{relative}' is {:.1} MiB (over the 1 MiB warning threshold)",
+            size as f64 / (1024.0 * 1024.0)
+        ));
+    }
+    if looks_binary(&absolute) {
+        warnings.push(format!(
+            "'{relative}' looks binary; check before committing"
+        ));
+    }
+    Disposition::Stage(warnings)
+}
+
+/// Announce a directory walk that did not cover the whole tree.
+///
+/// `skipped` counts entries it saw and dropped. The walk can also stop BEFORE
+/// entering a subtree, in which case it never saw the files there and
+/// `skipped` stays 0 — say so anyway, because silence would claim a complete
+/// bulk add (CodeRabbit round 8, id 4691119046).
+fn enumeration_warnings(skipped: usize, incomplete: bool) -> Vec<String> {
+    if skipped > 0 {
+        return vec![format!(
+            "directory walk hit the {}-entry budget; {} files were not enumerated \
+             — pass narrower paths to cover them",
+            2_000, skipped
+        )];
+    }
+    if incomplete {
+        return vec![
+            "directory walk stopped at its depth/entry limit; enumeration is INCOMPLETE \
+             (unknown remainder) — pass narrower paths to cover the rest"
+                .to_string(),
+        ];
+    }
+    Vec::new()
+}
+
+fn staging_outcome_inner(root: &Path, args: &Value) -> Result<StagingOutcome, JsonRpcError> {
+    let requested = requested_paths(root, args)?;
     let allow_sensitive = args
         .get("allow_sensitive")
         .and_then(Value::as_bool)
@@ -527,56 +619,18 @@ fn staging_outcome_inner(root: &Path, args: &Value) -> Result<StagingOutcome, Js
         if !seen.insert(relative.clone()) {
             continue;
         }
-        let sensitive = is_secret_path(&relative) || is_runtime_artifact(&relative);
         let is_explicit = explicit.contains(&relative);
-        if sensitive && !is_explicit && !allow_sensitive {
-            let reason = if is_secret_path(&relative) {
-                "likely secret"
-            } else {
-                "runtime artefact"
-            };
-            excluded.push((relative, reason));
-            continue;
+        match classify_staged_file(root, &relative, is_explicit, allow_sensitive) {
+            Disposition::Exclude(reason) => excluded.push((relative, reason)),
+            Disposition::Stage(mut notes) => {
+                warnings.append(&mut notes);
+                staged.push(relative);
+            }
         }
-        if sensitive {
-            warnings.push(format!("'{relative}' looks like a secret or runtime artefact; staging it because it was named explicitly or allow_sensitive is set"));
-        }
-        let absolute = root.join(&relative);
-        let metadata = std::fs::metadata(&absolute);
-        if metadata.as_ref().is_ok_and(|m| m.len() > 1024 * 1024) {
-            let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
-            warnings.push(format!(
-                "'{relative}' is {:.1} MiB (over the 1 MiB warning threshold)",
-                size as f64 / (1024.0 * 1024.0)
-            ));
-        }
-        if looks_binary(&absolute) {
-            warnings.push(format!(
-                "'{relative}' looks binary; check before committing"
-            ));
-        }
-        staged.push(relative);
     }
     staged.sort();
     staged.dedup();
-    if skipped > 0 {
-        warnings.push(format!(
-            "directory walk hit the {}-entry budget; {} files were not enumerated \
-             — pass narrower paths to cover them",
-            2_000, skipped
-        ));
-    }
-    // The walk can also stop BEFORE entering a subtree, in which case it never
-    // saw the files there and `skipped` stays 0. Say the enumeration was
-    // incomplete anyway: the count is unknown, but silence would claim a
-    // complete bulk add (CodeRabbit round 8, id 4691119046).
-    if incomplete && skipped == 0 {
-        warnings.push(
-            "directory walk stopped at its depth/entry limit; enumeration is INCOMPLETE \
-             (unknown remainder) — pass narrower paths to cover the rest"
-                .to_string(),
-        );
-    }
+    warnings.extend(enumeration_warnings(skipped, incomplete));
     for (relative, reason) in &excluded {
         warnings.push(format!(
             "excluded '{relative}' from bulk add: {reason} (stage it explicitly or set allow_sensitive:true)"
@@ -1762,6 +1816,120 @@ fn head_branch(root: &Path) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Plan-or-apply entry for every mutating `leindex_git` action.
+/// Re-verify a supplied `preview_token` against the repository's CURRENT state.
+///
+/// Called both after the (potentially slow) rail checks and again right after a
+/// whole-index capture: the caller could have raced either window, and a cheap
+/// comparison is worth more than the mutation it guards.
+fn reverify_token(
+    root: &Path,
+    op: &str,
+    argv: &[String],
+    args: &Value,
+    hint: &str,
+) -> Result<(), JsonRpcError> {
+    let Some(supplied) = args.get("preview_token").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    if supplied == token_now(root, op, argv)? {
+        return Ok(());
+    }
+    Err(JsonRpcError::invalid_params_with_suggestion(
+        "preview_token no longer matches: the repository state changed while \
+         the apply was being validated"
+            .to_string(),
+        hint.to_string(),
+    ))
+}
+
+/// Publish a whole-index commit from an immutable tree, returning the OID it
+/// published (when this op is such a commit) plus any post-publish warnings.
+///
+/// A whole-index commit reads the LIVE index when git runs, and nothing holds
+/// it between the digest check and the spawn — another process (or a pre-commit
+/// hook, which inherits the commit's environment) could stage content in that
+/// window and the reviewed token would authorise a commit that includes it
+/// (CodeRabbit round 8, id 4691119067). `validated_tree_commit` explains why a
+/// snapshot alone does not suffice; it REFUSES when the index cannot be
+/// snapshotted, because the alternative is a plain `git commit` that reads the
+/// live index and runs hooks.
+///
+/// A pathspec commit (`commit -- <paths>`) reads the WORKTREE for its paths,
+/// so it keeps the ordinary command.
+async fn publish_whole_index_commit(
+    root: &Path,
+    op: &str,
+    argv: &[String],
+    args: &Value,
+) -> Result<(Option<String>, Vec<String>), JsonRpcError> {
+    if !commits_whole_index(op, argv) {
+        return Ok((None, Vec::new()));
+    }
+    let plan = validated_tree_commit(root, argv)?;
+    // The token was re-verified BEFORE the capture; a `git merge --quit` in
+    // that gap would have been invisible to it and the capture would then
+    // build a single-parent commit (CodeRabbit round 11, id 4698955164). The
+    // state now includes the merge parents, so one more comparison immediately
+    // after the capture closes that window.
+    reverify_token(
+        root,
+        op,
+        argv,
+        args,
+        "Request a fresh plan and review it before applying",
+    )?;
+    let (oid, warnings) = run_validated_commit(root, &plan).await?;
+    Ok((Some(oid), warnings))
+}
+
+/// Per-action enrichment of the applied-mutation payload. Never turns a
+/// successful mutation into an error: the mutation already landed, so a failed
+/// probe is reported alongside it, not raised.
+async fn describe_applied(
+    op: &str,
+    root: &Path,
+    payload: &mut Value,
+    staging: Option<StagingOutcome>,
+    published: &Option<String>,
+    output: &MutationOutput,
+) {
+    match op {
+        "add" => {
+            let outcome = staging.expect("add always carries its staging outcome");
+            payload["staged"] = json!(outcome.staged);
+            payload["excluded"] = json!(
+                outcome
+                    .excluded
+                    .iter()
+                    .map(|(path, reason)| json!({ "path": path, "reason": reason }))
+                    .collect::<Vec<_>>()
+            );
+            payload["warnings"] = json!(outcome.warnings);
+        }
+        "commit" => {
+            // For the validated-tree path the summary describes the published
+            // OID, not whatever HEAD is by now.
+            let described = published
+                .clone()
+                .unwrap_or_else(|| head_oid(root).unwrap_or_default());
+            match commit_summary(root, &described).await {
+                Ok(summary) => payload["commit"] = summary,
+                Err(error) => {
+                    payload["commit"] = json!({ "oid": described });
+                    payload["commit_summary_error"] = Value::String(error.to_string());
+                }
+            }
+        }
+        "push" => {
+            payload["push"] = push_payload(&output.stdout, root).await;
+        }
+        "stash" => {
+            payload["note"] = Value::String("stash created; use action=stash pop/apply outside this surface or a follow-up plan".to_string());
+        }
+        _ => {}
+    }
+}
+
 pub(crate) async fn handle(op: &str, root: &Path, args: &Value) -> Result<Value, JsonRpcError> {
     // Argument hygiene is enforced AT THE MUTATION GATE (CodeRabbit round 10,
     // id 4697090213). The handler validates before the plan/apply split, but
@@ -1789,59 +1957,9 @@ pub(crate) async fn handle(op: &str, root: &Path, args: &Value) -> Result<Value,
 
     // Re-verify the token AFTER the (potentially slow) rail checks: the
     // caller could have raced the window. Cheap; correctness first.
-    if args.get("preview_token").and_then(Value::as_str).is_some() {
-        let expected = token_now(root, op, &argv)?;
-        let supplied = args
-            .get("preview_token")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if supplied != expected {
-            return Err(JsonRpcError::invalid_params_with_suggestion(
-                "preview_token no longer matches: the repository state changed while \
-                 the apply was being validated"
-                    .to_string(),
-                "Request a fresh plan".to_string(),
-            ));
-        }
-    }
+    reverify_token(root, op, &argv, args, "Request a fresh plan")?;
 
-    // A whole-index commit reads the LIVE index when git runs, and nothing
-    // above holds it between the digest check and the spawn — another process
-    // (or a pre-commit hook, which inherits the commit's environment) could
-    // stage content in that window and the reviewed token would authorise a
-    // commit that includes it (CodeRabbit round 8, id 4691119067). The
-    // commit is therefore made from an immutable tree built from the
-    // validated index (`validated_tree_commit` explains why a snapshot alone
-    // does not suffice). A pathspec commit (`commit -- <paths>`) reads the
-    // WORKTREE for its paths, not the index, so it keeps the ordinary command.
-    // A whole-index commit publishes from the immutable tree and reports the
-    // OID it published. `validated_tree_commit` REFUSES when the index cannot
-    // be snapshotted (a linked worktree whose git dir cannot be read): there
-    // is deliberately no fallback to a plain `git commit`, because that reads
-    // the live index and runs hooks — the exact window this closes.
-    let mut published: Option<String> = None;
-    let mut publish_warnings: Vec<String> = Vec::new();
-    if commits_whole_index(op, &argv) {
-        let plan = validated_tree_commit(root, &argv)?;
-        // The token was re-verified BEFORE the capture; a `git merge --quit`
-        // in that gap would have been invisible to it and the capture would
-        // then build a single-parent commit (CodeRabbit round 11, id
-        // 4698955164). The state now includes the merge parents, so one more
-        // comparison immediately after the capture closes that window.
-        if let Some(supplied) = args.get("preview_token").and_then(Value::as_str)
-            && supplied != token_now(root, op, &argv)?
-        {
-            return Err(JsonRpcError::invalid_params_with_suggestion(
-                "preview_token no longer matches: the repository state changed between \
-                 validation and publication"
-                    .to_string(),
-                "Request a fresh plan and review it before applying".to_string(),
-            ));
-        }
-        let (oid, warnings) = run_validated_commit(root, &plan).await?;
-        publish_warnings = warnings;
-        published = Some(oid);
-    }
+    let (published, publish_warnings) = publish_whole_index_commit(root, op, &argv, args).await?;
     let output = match &published {
         Some(_) => MutationOutput {
             stdout: String::new(),
@@ -1857,44 +1975,7 @@ pub(crate) async fn handle(op: &str, root: &Path, args: &Value) -> Result<Value,
         "dry_run": false,
         "argv": argv,
     });
-    match op {
-        "add" => {
-            let outcome = staging.expect("add always carries its staging outcome");
-            payload["staged"] = json!(outcome.staged);
-            payload["excluded"] = json!(
-                outcome
-                    .excluded
-                    .iter()
-                    .map(|(path, reason)| json!({ "path": path, "reason": reason }))
-                    .collect::<Vec<_>>()
-            );
-            payload["warnings"] = json!(outcome.warnings);
-        }
-        "commit" => {
-            // The commit is already published; the summary is ENRICHMENT. A
-            // failed probe must not turn a successful mutation into an error
-            // (the caller would retry a commit that already landed). For the
-            // validated-tree path the summary describes the published OID,
-            // not whatever HEAD is by now.
-            let described = published
-                .clone()
-                .unwrap_or_else(|| head_oid(root).unwrap_or_default());
-            match commit_summary(root, &described).await {
-                Ok(summary) => payload["commit"] = summary,
-                Err(error) => {
-                    payload["commit"] = json!({ "oid": described });
-                    payload["commit_summary_error"] = Value::String(error.to_string());
-                }
-            }
-        }
-        "push" => {
-            payload["push"] = push_payload(&output.stdout, root).await;
-        }
-        "stash" => {
-            payload["note"] = Value::String("stash created; use action=stash pop/apply outside this surface or a follow-up plan".to_string());
-        }
-        _ => {}
-    }
+    describe_applied(op, root, &mut payload, staging, &published, &output).await;
     if output.truncated_chars > 0 {
         payload["output_truncated_chars"] = json!(output.truncated_chars);
     }

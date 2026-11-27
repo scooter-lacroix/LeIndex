@@ -39,14 +39,31 @@ pub use startup::{StartupReport, StartupReporter};
 
 // ── Test utilities ──────────────────────────────────────────────────────
 //
-// A crate-level mutex shared across all test modules so that tests mutating
-// process-global state (env vars like LEINDEX_HOME, ORT_DYLIB_PATH) can be
-// serialized. Each test module's TEST_LOCK references this to avoid parallel
-// conflicts between e.g. config and ort_discovery tests.
+// Re-export of the crate-wide test env lock. It used to be a mutex local to
+// this module, documented as "crate-level" while excluding nobody outside
+// `embed` — so an `embed` test could be mid-way through a LEINDEX_HOME
+// override while a `config` test (which takes `crate::test_env::EnvLock`)
+// unset the same variable, and `read_config_ort_path` returned None against a
+// config that was just written. The shared lock makes those mutually
+// exclusive; see src/test_env.rs for the full rationale.
 #[cfg(test)]
 pub(crate) mod test_util {
-    use std::sync::Mutex;
+    use std::sync::{MutexGuard, PoisonError};
 
     /// Global lock for serializing env-var-mutating tests across all modules.
-    pub static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+    pub struct EnvTestLock;
+
+    impl EnvTestLock {
+        /// Acquire the crate-wide env lock, mirroring `Mutex::lock`'s result
+        /// so existing `.lock().unwrap()` call sites keep working.
+        #[allow(clippy::type_complexity)]
+        pub fn lock(
+            &self,
+        ) -> Result<MutexGuard<'static, ()>, PoisonError<MutexGuard<'static, ()>>> {
+            crate::test_env::EnvLock.lock()
+        }
+    }
+
+    /// Handle to the crate-wide env lock (see [`EnvTestLock`]).
+    pub static ENV_TEST_LOCK: EnvTestLock = EnvTestLock;
 }

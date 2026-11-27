@@ -1147,6 +1147,107 @@ fn delete_flag(args: &Value) -> bool {
 /// it here would let the plan and the payload disagree. Its arm below routes
 /// through that same helper, so the definition still has one owner.
 /// Crate callers go through [`plan_argv_for`]; [`Op`] stays module-private.
+/// The argv for `reset`/`clean`/branch-delete, with their rails.
+///
+/// The destructive shapes are only BUILDABLE when the explicit flag is set — an
+/// unset flag cannot produce a plan that the executor could then token-validate
+/// into running.
+fn reset_argv(args: &Value, target: String) -> Result<Vec<String>, JsonRpcError> {
+    let clean = args.get("clean").and_then(Value::as_bool).unwrap_or(false);
+    if clean {
+        // Only the DOCUMENTED targets are buildable (CodeRabbit round 11, id
+        // 4698955227). Any other flag-shaped target reached apply as well —
+        // `-n` made a dry run report `applied: true` having removed nothing,
+        // and `-x` would delete IGNORED files (a local `.env`, say) that
+        // neither documented form touches.
+        return match target.as_str() {
+            "-d" | "-fd" => Ok(vec![
+                "clean".to_string(),
+                target.to_string(),
+                "-f".to_string(),
+            ]),
+            other => Err(JsonRpcError::invalid_params_with_suggestion(
+                format!(
+                    "'{other}' is not a supported clean target: clean:true accepts \
+                     target '-d' or '-fd'"
+                ),
+                "Use target:'-fd' to remove untracked files and directories".to_string(),
+            )),
+        };
+    }
+    if target.starts_with('-') {
+        return delete_branch_argv(args, &target);
+    }
+    let hard = args.get("hard").and_then(Value::as_bool).unwrap_or(false);
+    let flag = if hard { "--hard" } else { "--mixed" };
+    Ok(target_argv("reset", Some(flag), target))
+}
+
+/// Branch deletion: `target: "-d <branch>"` plus `delete:true`.
+///
+/// The one legal flag-shaped reset target. Everything else flag-shaped is a
+/// refusal, and with `delete:true` the executor makes it token-only.
+fn delete_branch_argv(args: &Value, target: &str) -> Result<Vec<String>, JsonRpcError> {
+    let Some(branch) = target
+        .strip_prefix("-d ")
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+    else {
+        return Err(JsonRpcError::invalid_params_with_suggestion(
+            format!("'{target}' is not a revision"),
+            "reset takes a commit/branch; branch deletion is target:'-d <branch>' with delete:true"
+                .to_string(),
+        ));
+    };
+    if !delete_flag(args) {
+        return Err(JsonRpcError::invalid_params_with_suggestion(
+            format!("branch deletion refused: '{branch}' needs delete:true (and is token-only)"),
+            "Pass target:'-d <branch>' with delete:true; a preview_token from its plan applies it"
+                .to_string(),
+        ));
+    }
+    Ok(vec![
+        "branch".to_string(),
+        "-d".to_string(),
+        branch.to_string(),
+    ])
+}
+
+/// The argv for a force-push: `force:true`, a `confirm_text` copied verbatim from
+/// the plan, and a lease pinned to the reviewed remote oid.
+///
+/// The lease oid is resolved from the SAME refspec shape the final argv carries:
+/// build the argv once without a pin, read its `<remote>, <branch>` pair, then
+/// rebuild with the reviewed oid. Plan and apply both run this, so the token
+/// binds the oid the command actually carries (id 4691119074).
+fn force_argv(
+    root: &Path,
+    args: &Value,
+    branch_target: String,
+) -> Result<Vec<String>, JsonRpcError> {
+    let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+    if !force {
+        return Err(JsonRpcError::invalid_params_with_suggestion(
+            "force-push refused: set force:true to allow rewriting the remote".to_string(),
+            format!("Set force:true and confirm_text:\"force-push {branch_target}\""),
+        ));
+    }
+    let printed = format!("force-push {branch_target}");
+    let supplied = args
+        .get("confirm_text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if supplied != printed {
+        return Err(JsonRpcError::invalid_params_with_suggestion(
+            format!("confirm_text does not match the plan's confirmation string ('{supplied}')"),
+            format!("Copy it verbatim from the plan: confirm_text:\"{printed}\""),
+        ));
+    }
+    let bare = force_push_argv(&branch_target, None);
+    let lease = super::git_apply::force_lease_oid(root, &bare);
+    Ok(force_push_argv(&branch_target, lease.as_deref()))
+}
+
 fn plan_argv(op: &Op, root: &Path, args: &Value) -> Result<Vec<String>, JsonRpcError> {
     let target = plan_target(op, args)?;
     let required = |field: &str| require_target(&target, op.name, field);
@@ -1183,95 +1284,10 @@ fn plan_argv(op: &Op, root: &Path, args: &Value) -> Result<Vec<String>, JsonRpcE
         // case. The argv is deliberately bare: `git rebase <target>`.
         "rebase" => Ok(target_argv("rebase", None, required("target")?)),
         "push" => Ok(vec!["push".to_string(), "--porcelain".to_string()]),
-        "reset" => {
-            let target = required("target")?;
-            let hard = args.get("hard").and_then(Value::as_bool).unwrap_or(false);
-            let clean = args.get("clean").and_then(Value::as_bool).unwrap_or(false);
-            // Rails: the destructive shapes are only BUILDABLE when the
-            // explicit flag is set — an unset flag cannot produce a plan
-            // that the executor could then token-validate into running.
-            if clean {
-                // Only the DOCUMENTED targets are buildable (CodeRabbit round
-                // 11, id 4698955227). Any other flag-shaped target reached
-                // apply as well — `-n` made a dry run report `applied: true`
-                // having removed nothing, and `-x` would delete IGNORED files
-                // (a local `.env`, say) that neither documented form touches.
-                match target.as_str() {
-                    "-d" | "-fd" => return Ok(vec!["clean".to_string(), target, "-f".to_string()]),
-                    other => {
-                        return Err(JsonRpcError::invalid_params_with_suggestion(
-                            format!(
-                                "'{other}' is not a supported clean target: clean:true accepts \
-                                 target '-d' or '-fd'"
-                            ),
-                            "Use target:'-fd' to remove untracked files and directories"
-                                .to_string(),
-                        ));
-                    }
-                }
-            }
-            if target.starts_with('-') {
-                // The one legal flag-shaped target is branch deletion, and
-                // only with delete:true (the executor then makes it
-                // token-only). Everything else flag-shaped is a refusal.
-                let Some(branch) = target
-                    .strip_prefix("-d ")
-                    .map(str::trim)
-                    .filter(|b| !b.is_empty())
-                else {
-                    return Err(JsonRpcError::invalid_params_with_suggestion(
-                        format!("'{target}' is not a revision"),
-                        "reset takes a commit/branch; branch deletion is target:'-d <branch>' with delete:true".to_string(),
-                    ));
-                };
-                if !delete_flag(args) {
-                    return Err(JsonRpcError::invalid_params_with_suggestion(
-                        format!("branch deletion refused: '{branch}' needs delete:true (and is token-only)"),
-                        "Pass target:'-d <branch>' with delete:true; a preview_token from its plan applies it".to_string(),
-                    ));
-                }
-                return Ok(vec![
-                    "branch".to_string(),
-                    "-d".to_string(),
-                    branch.to_string(),
-                ]);
-            }
-            let flag = if hard { "--hard" } else { "--mixed" };
-            Ok(target_argv("reset", Some(flag), target))
-        }
+        "reset" => reset_argv(args, required("target")?),
         // `force` is a force-push; naming it in the plan makes the destructive
         // shape explicit instead of hiding it behind `push`.
-        "force" => {
-            let branch_target = required("target")?;
-            let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
-            if !force {
-                return Err(JsonRpcError::invalid_params_with_suggestion(
-                    "force-push refused: set force:true to allow rewriting the remote".to_string(),
-                    format!("Set force:true and confirm_text:\"force-push {branch_target}\""),
-                ));
-            }
-            let printed = format!("force-push {branch_target}");
-            let supplied = args
-                .get("confirm_text")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if supplied != printed {
-                return Err(JsonRpcError::invalid_params_with_suggestion(
-                    format!(
-                        "confirm_text does not match the plan's confirmation string ('{supplied}')"
-                    ),
-                    format!("Copy it verbatim from the plan: confirm_text:\"{printed}\""),
-                ));
-            }
-            // The lease oid is resolved from the SAME refspec shape the final
-            // argv carries: build the argv once without a pin, read its
-            // `<remote>, <branch>` pair, then rebuild with the reviewed oid.
-            // Plan and apply both run this, so the token binds the oid the
-            // command actually carries (id 4691119074).
-            let bare = force_push_argv(&branch_target, None);
-            let lease = super::git_apply::force_lease_oid(root, &bare);
-            Ok(force_push_argv(&branch_target, lease.as_deref()))
-        }
+        "force" => force_argv(root, args, required("target")?),
         other => Err(JsonRpcError::internal_error(format!(
             "git operation '{other}' has no plan"
         ))),

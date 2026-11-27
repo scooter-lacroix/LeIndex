@@ -245,44 +245,25 @@ impl FindHandler {
             collect_hits: windowed,
             want_symbols: extract_bool(&args, "symbols", true),
         };
-        // §3.8: a literal search with regex metacharacters that returns
-        // nothing gets ONE retry as a regex, inside the same blocking task —
-        // the double read is paid only on the zero path, and the note says
-        // what happened either way. §6.7: a case-sensitive zero also gets a
-        // case-insensitive recount so the reason can say "0 sensitive,
-        // N insensitive".
         let case_sensitive = !found.compiled.case_insensitive;
-        let compiled = found.compiled;
+        let want_retry = !extract_bool(&args, "regex", false) && looks_like_regex(&found.text);
         let literal = found.text.clone();
-        let want_retry = !extract_bool(&args, "regex", false) && looks_like_regex(&literal);
         let retry_args = args.clone();
-        let (result, regex_note_owned, case_insensitive_hits) = tokio::task::spawn_blocking(
-            move || -> Result<(SearchOutput, Option<String>, usize), JsonRpcError> {
-                let mut result = search(&specs, &compiled, &options);
-                let mut note = None;
-                if want_retry && result.stats.match_lines == 0 {
-                    let mut query = find_query(&retry_args)?;
-                    query.regex = true;
-                    query.pattern = literal;
-                    if let Ok(regex_compiled) = query.compile() {
-                        let retried = search(&specs, &regex_compiled, &options);
-                        note = retry_note(&retried).map(str::to_string);
-                        result = retried;
-                    }
-                }
-                let mut insensitive = 0usize;
-                if result.stats.match_lines == 0 && case_sensitive {
-                    let mut query = find_query(&retry_args)?;
-                    query.case = CaseMode::Insensitive;
-                    if let Ok(ci_compiled) = query.compile() {
-                        insensitive = search(&specs, &ci_compiled, &options).stats.match_lines;
-                    }
-                }
-                Ok((result, note, insensitive))
-            },
-        )
-        .await
-        .map_err(|e| JsonRpcError::internal_error(format!("find failed: {e}")))??;
+        let compiled = found.compiled;
+        let (result, regex_note_owned, case_insensitive_hits) =
+            tokio::task::spawn_blocking(move || {
+                search_with_fallbacks(
+                    &specs,
+                    &compiled,
+                    &options,
+                    want_retry,
+                    literal,
+                    retry_args,
+                    case_sensitive,
+                )
+            })
+            .await
+            .map_err(|e| JsonRpcError::internal_error(format!("find failed: {e}")))??;
         let regex_note = regex_note_owned.as_deref();
 
         let mut value = shape_text_result(
@@ -300,6 +281,46 @@ impl FindHandler {
         }
         Ok(value)
     }
+}
+
+/// One text-search attempt, plus the two advisory follow-ups, run on the
+/// blocking pool.
+///
+/// §3.8: a literal search with regex metacharacters that returns nothing gets
+/// ONE retry as a regex — the double read is paid only on the zero path, and
+/// the note says what happened either way. §6.7: a case-sensitive zero also
+/// gets a case-insensitive recount so the reason can say "0 sensitive,
+/// N insensitive".
+fn search_with_fallbacks(
+    specs: &[RootSpec],
+    compiled: &Compiled,
+    options: &SearchOptions,
+    want_retry: bool,
+    literal: String,
+    retry_args: Value,
+    case_sensitive: bool,
+) -> Result<(SearchOutput, Option<String>, usize), JsonRpcError> {
+    let mut result = search(specs, compiled, options);
+    let mut note = None;
+    if want_retry && result.stats.match_lines == 0 {
+        let mut query = find_query(&retry_args)?;
+        query.regex = true;
+        query.pattern = literal;
+        if let Ok(regex_compiled) = query.compile() {
+            let retried = search(specs, &regex_compiled, options);
+            note = retry_note(&retried).map(str::to_string);
+            result = retried;
+        }
+    }
+    let mut insensitive = 0usize;
+    if result.stats.match_lines == 0 && case_sensitive {
+        let mut query = find_query(&retry_args)?;
+        query.case = CaseMode::Insensitive;
+        if let Ok(ci_compiled) = query.compile() {
+            insensitive = search(specs, &ci_compiled, options).stats.match_lines;
+        }
+    }
+    Ok((result, note, insensitive))
 }
 
 /// The pattern a LeIndex \[Find\] call searches for, with its matcher compiled.

@@ -295,6 +295,86 @@ pub(crate) struct CallSite {
     pub text: String,
 }
 
+/// Every leaf token under `token_tree`, in source order.
+fn flatten_tokens(token_tree: tree_sitter::Node<'_>) -> Vec<tree_sitter::Node<'_>> {
+    let mut flat: Vec<tree_sitter::Node<'_>> = Vec::new();
+    let mut walk = vec![token_tree];
+    while let Some(token) = walk.pop() {
+        let mut cursor = token.walk();
+        let children: Vec<_> = token.children(&mut cursor).collect();
+        if children.is_empty() {
+            flat.push(token);
+        }
+        for child in children.into_iter().rev() {
+            walk.push(child);
+        }
+    }
+    flat.sort_by_key(|token| token.start_byte());
+    flat
+}
+
+/// The earliest `callee(...)` call inside a macro body, as
+/// `(start byte, end byte)`.
+///
+/// A call made inside a macro body exists only as a token sequence:
+/// `assert_eq!(callee(1), 2)` has no `call_expression` node. Paths are
+/// reassembled from ident/`::`/ident token runs, and a path whose last segment
+/// names the callee followed by `(` is the site.
+fn macro_call_site(
+    macro_node: tree_sitter::Node<'_>,
+    text: &str,
+    callee_last: &str,
+) -> Option<(usize, usize)> {
+    let token_tree = macro_node
+        .children(&mut macro_node.walk())
+        .find(|child| child.kind() == "token_tree")?;
+    let flat = flatten_tokens(token_tree);
+    let mut first: Option<(usize, usize)> = None;
+    let mut path: Vec<String> = Vec::new();
+    let mut path_start: Option<usize> = None;
+    let mut after_sep = false;
+    for (idx, token) in flat.iter().enumerate() {
+        let kind = token.kind();
+        let token_text = token.utf8_text(text.as_bytes()).unwrap_or("");
+        let is_ident = kind == "identifier" || kind == "type_identifier";
+        let is_sep = token_text == "::";
+        let next_is_open_paren = flat
+            .get(idx + 1)
+            .is_some_and(|next| next.utf8_text(text.as_bytes()) == Ok("("));
+        if is_ident {
+            if !after_sep && !path.is_empty() {
+                // Two identifiers without a separator: the previous path
+                // ended (`x y` starts a fresh path at `y`).
+                path.clear();
+                path_start = None;
+            }
+            if path.is_empty() {
+                path_start = Some(token.start_byte());
+            }
+            path.push(token_text.to_string());
+            after_sep = false;
+        } else if is_sep && !path.is_empty() {
+            // Keep the path open across the separator.
+            after_sep = true;
+        } else {
+            path.clear();
+            path_start = None;
+            after_sep = false;
+        }
+        // The call itself: path + `(`. Comparing on the last segment so
+        // `Vec::push` matches a `push` callee from the PDG.
+        if next_is_open_paren
+            && let Some(last_seg) = path.last()
+            && last_seg.eq_ignore_ascii_case(callee_last)
+            && let Some(start) = path_start
+            && first.is_none_or(|(hit_start, _)| start < hit_start)
+        {
+            first = Some((start, token.end_byte()));
+        }
+    }
+    first
+}
+
 /// Search the caller's own subtree for a call naming `callee`. Returns the
 /// first hit in source order. The comparison is on the callee's last path
 /// segment (`Vec::push` matches a `push` method call), anchored to a complete
@@ -311,6 +391,7 @@ pub(crate) fn find_call_in_fn(
     }
     let skip = nested_item_kinds(language);
     let callee_last = callee_last_segment(callee);
+    let is_rust = language.starts_with("rust");
 
     let mut stack = vec![fn_node];
     let mut first_hit: Option<(usize, usize)> = None;
@@ -334,72 +415,12 @@ pub(crate) fn find_call_in_fn(
                 first_hit = Some((node.start_byte(), node.end_byte()));
             }
         }
-        // A call made inside a macro body exists only as a token sequence:
-        // `assert_eq!(callee(1), 2)` has no call_expression node. Paths are
-        // reassembled from ident/`::`/ident token runs, and a path whose last
-        // segment names the callee followed by `(` is the site.
-        if language.starts_with("rust")
+        if is_rust
             && node.kind() == "macro_invocation"
-            && let Some(token_tree) = node
-                .children(&mut node.walk())
-                .find(|child| child.kind() == "token_tree")
+            && let Some(hit) = macro_call_site(node, text, &callee_last)
+            && first_hit.is_none_or(|(start, _)| hit.0 < start)
         {
-            let mut flat: Vec<tree_sitter::Node<'_>> = Vec::new();
-            let mut walk = vec![token_tree];
-            while let Some(token) = walk.pop() {
-                let mut cursor = token.walk();
-                let children: Vec<_> = token.children(&mut cursor).collect();
-                if children.is_empty() {
-                    flat.push(token);
-                }
-                for child in children.into_iter().rev() {
-                    walk.push(child);
-                }
-            }
-            flat.sort_by_key(|token| token.start_byte());
-            let mut path: Vec<String> = Vec::new();
-            let mut path_start: Option<usize> = None;
-            let mut after_sep = false;
-            for (idx, token) in flat.iter().enumerate() {
-                let kind = token.kind();
-                let token_text = token.utf8_text(text.as_bytes()).unwrap_or("");
-                let is_ident = kind == "identifier" || kind == "type_identifier";
-                let is_sep = token_text == "::";
-                let next_is_open_paren = flat
-                    .get(idx + 1)
-                    .is_some_and(|next| next.utf8_text(text.as_bytes()) == Ok("("));
-                if is_ident {
-                    if !after_sep && !path.is_empty() {
-                        // Two identifiers without a separator: the previous
-                        // path ended (`x y` starts a fresh path at `y`).
-                        path.clear();
-                        path_start = None;
-                    }
-                    if path.is_empty() {
-                        path_start = Some(token.start_byte());
-                    }
-                    path.push(token_text.to_string());
-                    after_sep = false;
-                } else if is_sep && !path.is_empty() {
-                    // Keep the path open across the separator.
-                    after_sep = true;
-                } else {
-                    path.clear();
-                    path_start = None;
-                    after_sep = false;
-                }
-                // The call itself: path + `(`. Comparing on the last segment
-                // so `Vec::push` matches a `push` callee from the PDG.
-                let last_seg = path.last().map(String::as_str);
-                if next_is_open_paren
-                    && let Some(last_seg) = last_seg
-                    && last_seg.eq_ignore_ascii_case(&callee_last)
-                    && let Some(start) = path_start
-                    && first_hit.is_none_or(|(hit_start, _)| start < hit_start)
-                {
-                    first_hit = Some((start, token.end_byte()));
-                }
-            }
+            first_hit = Some(hit);
         }
         let mut cursor = node.walk();
         let children: Vec<_> = node.children(&mut cursor).collect();

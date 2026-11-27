@@ -157,6 +157,40 @@ pub(crate) fn summarize(
     }
 }
 
+/// The first panic/assertion line of a `---- <name> stdout ----` block is that
+/// test's detail; record it under the block's name.
+fn finish_block(
+    block: &mut Option<String>,
+    lines: &mut Vec<String>,
+    out: &mut BTreeMap<String, String>,
+) {
+    if let Some(name) = block.take() {
+        let detail = lines
+            .iter()
+            .find(|line| line.contains("panicked") || line.contains("assertion"))
+            .cloned()
+            .unwrap_or_default();
+        if !detail.is_empty() {
+            out.insert(name, detail.trim().to_string());
+        }
+        lines.clear();
+    }
+}
+
+/// The test name a `---- <name> stdout ----` / `---- <name> stderr ----`
+/// header carries, or `None` when the line is not one.
+fn block_header(line: &str) -> Option<String> {
+    let is_header = line.starts_with("----")
+        && (line.ends_with("stdout ----") || line.ends_with(" stderr ----"));
+    is_header.then(|| {
+        line.trim_start_matches("----")
+            .trim_end_matches(" stdout ----")
+            .trim_end_matches(" stderr ----")
+            .trim()
+            .to_string()
+    })
+}
+
 /// Parse `cargo test` text output.
 ///
 /// - aggregate every `test result:` line into suite count and passed/failed
@@ -178,22 +212,6 @@ pub(crate) fn parse_cargo_test(output: &str) -> Parsed {
     let mut block: Option<String> = None;
     let mut block_lines: Vec<String> = Vec::new();
 
-    let finish_block = |block: &mut Option<String>,
-                        lines: &mut Vec<String>,
-                        out: &mut BTreeMap<String, String>| {
-        if let Some(name) = block.take() {
-            let detail = lines
-                .iter()
-                .find(|line| line.contains("panicked") || line.contains("assertion"))
-                .cloned()
-                .unwrap_or_default();
-            if !detail.is_empty() {
-                out.insert(name, detail.trim().to_string());
-            }
-            lines.clear();
-        }
-    };
-
     for raw in output.lines() {
         let line = raw.trim();
 
@@ -208,7 +226,7 @@ pub(crate) fn parse_cargo_test(output: &str) -> Parsed {
             continue;
         }
 
-        if line == "failures:" || line.starts_with("failures:") {
+        if line.starts_with("failures:") {
             in_failures = true;
             continue;
         }
@@ -228,16 +246,8 @@ pub(crate) fn parse_cargo_test(output: &str) -> Parsed {
             }
         }
 
-        if (line.starts_with("----") && line.ends_with("stdout ----"))
-            || (line.starts_with("----") && line.ends_with(" stderr ----"))
-        {
+        if let Some(name) = block_header(line) {
             finish_block(&mut block, &mut block_lines, &mut block_details);
-            let name = line
-                .trim_start_matches("----")
-                .trim_end_matches(" stdout ----")
-                .trim_end_matches(" stderr ----")
-                .trim()
-                .to_string();
             block = Some(name);
             continue;
         }

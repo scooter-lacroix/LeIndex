@@ -273,14 +273,15 @@ mod test {
 
     /// Point the shared store at a scratch directory for one test.
     ///
-    /// `LEINDEX_HOME` is process-global, so these tests serialize on a mutex
-    /// and each restores the previous value.
+    /// `LEINDEX_HOME` is process-global, so these tests serialize on the
+    /// crate-wide env lock (a module-local mutex excluded nobody else) and
+    /// each restores the previous value.
     struct ScratchHome {
         _guard: std::sync::MutexGuard<'static, ()>,
         previous: Option<String>,
     }
 
-    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static HOME_LOCK: crate::test_env::EnvLock = crate::test_env::EnvLock;
 
     impl ScratchHome {
         fn new(label: &str) -> (Self, std::path::PathBuf) {

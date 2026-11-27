@@ -303,186 +303,204 @@ fn pattern_variant_paths(node: tree_sitter::Node<'_>, text: &str) -> Vec<(String
 }
 
 /// Collect match-pattern candidates in one parsed file.
+/// One pattern node's own text as a hit.
+fn node_hit(node: tree_sitter::Node<'_>, text: &str, form: &'static str) -> Option<PatternHit> {
+    let pattern_text = node.utf8_text(text.as_bytes()).ok()?;
+    Some(PatternHit {
+        byte: node.start_byte(),
+        pattern_text: pattern_text.to_string(),
+        form,
+    })
+}
+
+/// Push the pattern node's own text, plus the payload-free variant paths of
+/// every data-carrying variant it contains.
+fn push_pattern(
+    hits: &mut Vec<PatternHit>,
+    node: tree_sitter::Node<'_>,
+    text: &str,
+    form: &'static str,
+) {
+    if let Some(hit) = node_hit(node, text, form) {
+        hits.push(hit);
+    }
+    for (path, path_byte) in pattern_variant_paths(node, text) {
+        hits.push(PatternHit {
+            // The derived path's OWN offset: a multiline nested variant
+            // (`Outer::Wrap(\n    Shade::Dark(x),\n)`) must report the line
+            // the variant is written on, not the line the outer pattern
+            // starts on. Stamping `node.start_byte()` here was the bug —
+            // same-line patterns were right by accident.
+            byte: path_byte,
+            pattern_text: path,
+            form,
+        });
+    }
+}
+
+/// Rust pattern positions: match arms, `if let`, `let`, and `matches!`.
+fn collect_rust_pattern(hits: &mut Vec<PatternHit>, node: tree_sitter::Node<'_>, text: &str) {
+    match node.kind() {
+        "match_pattern" => push_pattern(hits, node, text, "match arm"),
+        // `if let PAT = expr` parses as a `let_condition` inside the
+        // if_expression's condition field; its `pattern` field is the
+        // pattern alone.
+        "let_condition" => {
+            if let Some(pattern) = node.child_by_field_name("pattern") {
+                push_pattern(hits, pattern, text, "if let");
+            }
+        }
+        "let_declaration" => {
+            if let Some(pattern) = node.child_by_field_name("pattern") {
+                push_pattern(hits, pattern, text, "let pattern");
+            }
+        }
+        "macro_invocation" => collect_matches_macro(hits, node, text),
+        _ => {}
+    }
+}
+
+/// Variant paths inside a `matches!(value, PATTERN)` token tree.
+///
+/// Token-tree contents are flat tokens: `Shade::Light` arrives as ident, `::`,
+/// ident. Maximal `ident (:: ident)*` sequences are reassembled so whole-enum
+/// queries can qualify them and a bare variant token cannot.
+fn collect_matches_macro(hits: &mut Vec<PatternHit>, node: tree_sitter::Node<'_>, text: &str) {
+    let is_matches = node
+        .child_by_field_name("macro")
+        .and_then(|macro_node| macro_node.utf8_text(text.as_bytes()).ok())
+        .is_some_and(|name| name.trim_end_matches('!') == "matches");
+    if !is_matches {
+        return;
+    }
+    let Some(token_tree) = node
+        .children(&mut node.walk())
+        .find(|child| child.kind() == "token_tree")
+    else {
+        return;
+    };
+    let mut flat: Vec<tree_sitter::Node<'_>> = Vec::new();
+    let mut walk = vec![token_tree];
+    while let Some(token) = walk.pop() {
+        if token_tree_noise(token.kind()) {
+            continue;
+        }
+        let mut cursor = token.walk();
+        let children: Vec<_> = token.children(&mut cursor).collect();
+        if children.is_empty() {
+            flat.push(token);
+        }
+        for child in children.into_iter().rev() {
+            walk.push(child);
+        }
+    }
+    flat.sort_by_key(|token| token.start_byte());
+
+    let mut path: Vec<String> = Vec::new();
+    let mut path_start: Option<usize> = None;
+    let mut after_sep = false;
+    let flush = |path: &mut Vec<String>, start: &mut Option<usize>, hits: &mut Vec<PatternHit>| {
+        if path.len() >= 2
+            && let Some(start) = *start
+        {
+            hits.push(PatternHit {
+                byte: start,
+                pattern_text: path.join("::"),
+                form: "matches!",
+            });
+        }
+        path.clear();
+        *start = None;
+    };
+    for token in flat {
+        let kind = token.kind();
+        let is_ident = kind == "identifier" || kind == "type_identifier";
+        let is_sep = token.utf8_text(text.as_bytes()) == Ok("::");
+        if is_ident {
+            if !after_sep && !path.is_empty() {
+                // Two identifiers without a separator: the previous path
+                // ended (`x y` starts a fresh path at `y`; `s,` already
+                // flushed at the comma).
+                flush(&mut path, &mut path_start, hits);
+            }
+            if path.is_empty() {
+                path_start = Some(token.start_byte());
+            }
+            if let Ok(token_text) = token.utf8_text(text.as_bytes()) {
+                path.push(token_text.to_string());
+            }
+            after_sep = false;
+        } else if is_sep && !path.is_empty() {
+            // Keep the path open across the separator.
+            after_sep = true;
+        } else {
+            flush(&mut path, &mut path_start, hits);
+            after_sep = false;
+        }
+    }
+    flush(&mut path, &mut path_start, hits);
+}
+
+/// Python pattern positions.
+///
+/// The pattern kinds are unnamed and carry no field pointing at themselves;
+/// their kind names only exist inside a `match_statement`, so keying on the
+/// kind is exact.
+fn collect_python_pattern(hits: &mut Vec<PatternHit>, node: tree_sitter::Node<'_>, text: &str) {
+    const PY_PATTERN_KINDS: [&str; 9] = [
+        "pattern",
+        "pattern_list",
+        "as_pattern",
+        "union_pattern",
+        "case_pattern",
+        "class_pattern",
+        "dict_pattern",
+        "list_pattern",
+        "tuple_pattern",
+    ];
+    if PY_PATTERN_KINDS.contains(&node.kind())
+        && let Some(hit) = node_hit(node, text, "match case")
+    {
+        hits.push(hit);
+    }
+}
+
+/// A `case EXPR:` clause, pointing at the expression rather than the clause.
+fn collect_switch_case(hits: &mut Vec<PatternHit>, node: tree_sitter::Node<'_>, text: &str) {
+    if node.kind() != "switch_case" {
+        return;
+    }
+    let Ok(clause) = node.utf8_text(text.as_bytes()) else {
+        return;
+    };
+    let Some(case_idx) = clause.find("case") else {
+        return;
+    };
+    let after = &clause[case_idx + "case".len()..];
+    let expr = after.trim_start();
+    let expr_text = expr.split(':').next().unwrap_or("").trim().to_string();
+    if !expr_text.is_empty() {
+        hits.push(PatternHit {
+            // Point at the case expression, not the clause.
+            byte: node.start_byte() + (clause.len() - expr.len()),
+            pattern_text: expr_text,
+            form: "switch case",
+        });
+    }
+}
+
 fn collect_match_candidates(
     root: tree_sitter::Node<'_>,
     text: &str,
     language: &str,
 ) -> Vec<PatternHit> {
-    // Returns Some(hit) instead of pushing into a borrowed closure vec: the
-    // descent below both builds hits this way and pushes directly.
-    fn node_hit(node: tree_sitter::Node<'_>, text: &str, form: &'static str) -> Option<PatternHit> {
-        let pattern_text = node.utf8_text(text.as_bytes()).ok()?;
-        Some(PatternHit {
-            byte: node.start_byte(),
-            pattern_text: pattern_text.to_string(),
-            form,
-        })
-    }
-    /// Push the pattern node's own text, plus the payload-free variant paths of
-    /// every data-carrying variant it contains.
-    fn push_pattern(
-        hits: &mut Vec<PatternHit>,
-        node: tree_sitter::Node<'_>,
-        text: &str,
-        form: &'static str,
-    ) {
-        if let Some(hit) = node_hit(node, text, form) {
-            hits.push(hit);
-        }
-        for (path, path_byte) in pattern_variant_paths(node, text) {
-            hits.push(PatternHit {
-                // The derived path's OWN offset: a multiline nested variant
-                // (`Outer::Wrap(\n    Shade::Dark(x),\n)`) must report the line
-                // the variant is written on, not the line the outer pattern
-                // starts on. Stamping `node.start_byte()` here was the bug —
-                // same-line patterns were right by accident.
-                byte: path_byte,
-                pattern_text: path,
-                form,
-            });
-        }
-    }
     let mut hits = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         match language {
-            "rust" | "rs" => match node.kind() {
-                "match_pattern" => {
-                    push_pattern(&mut hits, node, text, "match arm");
-                }
-                // `if let PAT = expr` parses as a `let_condition` inside the
-                // if_expression's condition field; its `pattern` field is the
-                // pattern alone.
-                "let_condition" => {
-                    if let Some(pattern) = node.child_by_field_name("pattern") {
-                        push_pattern(&mut hits, pattern, text, "if let");
-                    }
-                }
-                "let_declaration" => {
-                    if let Some(pattern) = node.child_by_field_name("pattern") {
-                        push_pattern(&mut hits, pattern, text, "let pattern");
-                    }
-                }
-                "macro_invocation" => {
-                    let is_matches = node
-                        .child_by_field_name("macro")
-                        .and_then(|macro_node| macro_node.utf8_text(text.as_bytes()).ok())
-                        .is_some_and(|name| name.trim_end_matches('!') == "matches");
-                    if is_matches
-                        && let Some(token_tree) = node
-                            .children(&mut node.walk())
-                            .find(|child| child.kind() == "token_tree")
-                    {
-                        // Token-tree contents are flat tokens: `Shade::Light`
-                        // arrives as ident, `::`, ident. Reassemble maximal
-                        // `ident (:: ident)*` sequences so whole-enum queries
-                        // can qualify them and a bare variant token cannot.
-                        let mut flat: Vec<tree_sitter::Node<'_>> = Vec::new();
-                        let mut walk = vec![token_tree];
-                        while let Some(token) = walk.pop() {
-                            if token_tree_noise(token.kind()) {
-                                continue;
-                            }
-                            let mut cursor = token.walk();
-                            let children: Vec<_> = token.children(&mut cursor).collect();
-                            if children.is_empty() {
-                                flat.push(token);
-                            }
-                            for child in children.into_iter().rev() {
-                                walk.push(child);
-                            }
-                        }
-                        flat.sort_by_key(|token| token.start_byte());
-                        let mut path: Vec<String> = Vec::new();
-                        let mut path_start: Option<usize> = None;
-                        let mut after_sep = false;
-                        let flush =
-                            |path: &mut Vec<String>,
-                             start: &mut Option<usize>,
-                             hits: &mut Vec<PatternHit>| {
-                                if path.len() >= 2
-                                    && let Some(start) = *start
-                                {
-                                    hits.push(PatternHit {
-                                        byte: start,
-                                        pattern_text: path.join("::"),
-                                        form: "matches!",
-                                    });
-                                }
-                                path.clear();
-                                *start = None;
-                            };
-                        for token in flat {
-                            let kind = token.kind();
-                            let is_ident = kind == "identifier" || kind == "type_identifier";
-                            let is_sep = token.utf8_text(text.as_bytes()) == Ok("::");
-                            if is_ident {
-                                if !after_sep && !path.is_empty() {
-                                    // Two identifiers without a separator: the
-                                    // previous path ended (`x y` starts a fresh
-                                    // path at `y`; `s,` already flushed at the
-                                    // comma).
-                                    flush(&mut path, &mut path_start, &mut hits);
-                                }
-                                if path.is_empty() {
-                                    path_start = Some(token.start_byte());
-                                }
-                                if let Ok(text) = token.utf8_text(text.as_bytes()) {
-                                    path.push(text.to_string());
-                                }
-                                after_sep = false;
-                            } else if is_sep && !path.is_empty() {
-                                // Keep the path open across the separator.
-                                after_sep = true;
-                            } else {
-                                flush(&mut path, &mut path_start, &mut hits);
-                                after_sep = false;
-                            }
-                        }
-                        flush(&mut path, &mut path_start, &mut hits);
-                    }
-                }
-                _ => {}
-            },
-            "python" | "py" => {
-                // The pattern kinds are unnamed and carry no field pointing
-                // at themselves; their kind names only exist inside a
-                // match_statement, so keying on the kind is exact.
-                const PY_PATTERN_KINDS: [&str; 9] = [
-                    "pattern",
-                    "pattern_list",
-                    "as_pattern",
-                    "union_pattern",
-                    "case_pattern",
-                    "class_pattern",
-                    "dict_pattern",
-                    "list_pattern",
-                    "tuple_pattern",
-                ];
-                if PY_PATTERN_KINDS.contains(&node.kind())
-                    && let Some(hit) = node_hit(node, text, "match case")
-                {
-                    hits.push(hit);
-                }
-            }
-            "typescript" | "ts" | "javascript" | "js" => {
-                if node.kind() == "switch_case"
-                    && let Ok(clause) = node.utf8_text(text.as_bytes())
-                    && let Some(case_idx) = clause.find("case")
-                {
-                    let after = &clause[case_idx + "case".len()..];
-                    let expr = after.trim_start();
-                    let expr_text = expr.split(':').next().unwrap_or("").trim().to_string();
-                    if !expr_text.is_empty() {
-                        hits.push(PatternHit {
-                            // Point at the case expression, not the clause.
-                            byte: node.start_byte() + (clause.len() - expr.len()),
-                            pattern_text: expr_text,
-                            form: "switch case",
-                        });
-                    }
-                }
-            }
+            "rust" | "rs" => collect_rust_pattern(&mut hits, node, text),
+            "python" | "py" => collect_python_pattern(&mut hits, node, text),
+            "typescript" | "ts" | "javascript" | "js" => collect_switch_case(&mut hits, node, text),
             _ => {}
         }
         let mut cursor = node.walk();

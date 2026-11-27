@@ -233,6 +233,16 @@ pub(crate) fn number_lines(content: &str, start_line: usize) -> String {
 // Elided reads (brief §4.1)
 // =============================================================================
 
+/// True for a doc-comment / attribute line that hangs above an item and
+/// collapses with it (`///`, `//!`, `#[…]`, `#![…]`).
+fn is_doc_or_attr_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("///")
+        || trimmed.starts_with("//!")
+        || trimmed.starts_with("#[")
+        || trimmed.starts_with("#![")
+}
+
 /// One collapsed sibling item.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CollapsedItem {
@@ -244,6 +254,20 @@ pub(crate) struct CollapsedItem {
     pub start_line: usize,
     /// Total line span of the item.
     pub line_count: usize,
+}
+
+/// Start line of the doc/attr block that ends at `item_start - 1`, or
+/// `item_start` when the line above is not part of one.
+fn hanging_block_start(content: &str, item_start: usize) -> usize {
+    let mut block_start = item_start;
+    while block_start > 1 {
+        let line = content.lines().nth(block_start - 2).unwrap_or_default();
+        if !is_doc_or_attr_line(line) {
+            break;
+        }
+        block_start -= 1;
+    }
+    block_start
 }
 
 /// Result of an elided read.
@@ -422,20 +446,7 @@ pub(crate) fn elide_around(
 
         // Doc/attr block above the item: contiguous ///, //!, #[...] lines
         // ending at item_start-1.
-        let mut block_start = span.start_line;
-        while block_start > 1 {
-            let line = content.lines().nth(block_start - 2).unwrap_or_default();
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("///")
-                || trimmed.starts_with("//!")
-                || trimmed.starts_with("#[")
-                || trimmed.starts_with("#![")
-            {
-                block_start -= 1;
-            } else {
-                break;
-            }
-        }
+        let block_start = hanging_block_start(content, span.start_line);
         // A block with the focus item starting inside it belongs to the
         // focus item, not to the sibling — keep it visible.
         let block_belongs_to_focus =
