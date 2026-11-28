@@ -1338,3 +1338,49 @@ fn test_render_project_map_shows_the_continuation_token() {
     let s = render_tool_output("leindex.project_map", &complete, &Value::Null);
     assert!(!s.contains("more files"), "{s}");
 }
+
+/// §4.3/§3.6: requested post-apply validation echoes (`validate:"syntax"` / `validate:"check"`)
+/// ride on every changed-file response. The applied-lines echo must not hide them: a validated
+/// edit that failed its check must render its failure, not look identical to a clean one
+/// (Codex round 1, id 4653371664).
+#[test]
+fn test_render_edit_apply_renders_requested_validation_echoes() {
+    let data = v(r#"{
+        "success": true,
+        "changes_applied": 1,
+        "applied_lines": ["Applied: src/a.rs:L1-5 (+4/-0) in fn a"],
+        "syntax": [
+            {"display_path": "src/a.rs", "summary": "1 error(s): 3:1 ERROR", "errors": ["3:1 ERROR"]}
+        ],
+        "check": {
+            "files": [
+                {"file": "src/a.rs", "exit_code": 1, "headline": "error[E0308]: mismatched types", "error_count": 2, "failures": [], "warning_counts": {}}
+            ]
+        }
+    }"#);
+    let s = render_edit_apply(&data, false);
+    assert!(s.contains("Applied: src/a.rs:L1-5 (+4/-0) in fn a"), "{s}");
+    assert!(
+        s.contains("Syntax src/a.rs: 1 error(s): 3:1 ERROR"),
+        "syntax outcome must render: {s}"
+    );
+    assert!(
+        s.contains("Check src/a.rs: error[E0308]: mismatched types (2 errors)"),
+        "check outcome must render: {s}"
+    );
+    assert!(s.contains("error[E0308]"), "{s}");
+}
+
+/// Without the validation keys the apply echo gains no extra lines.
+#[test]
+fn test_render_edit_apply_validation_echoes_are_absent_without_request() {
+    let data = v(r#"{
+        "success": true,
+        "changes_applied": 1,
+        "applied_lines": ["Applied: src/a.rs:L1-5 (+4/-0) in fn a"]
+    }"#);
+    let s = render_edit_apply(&data, false);
+    assert!(s.contains("Applied: src/a.rs:L1-5 (+4/-0) in fn a"), "{s}");
+    assert!(!s.contains("Syntax "), "{s}");
+    assert!(!s.contains("Check "), "{s}");
+}

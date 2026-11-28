@@ -1342,3 +1342,38 @@ fn test_trim_read_file_keeps_the_diagnostics_overlay() {
     let plain = serde_json::json!({ "file_path": "a.rs", "content": "x" });
     assert!(trim_read_file(&plain).get("diagnostics").is_none());
 }
+
+/// Codex round 7 (id 4690978440): the finding asked for the check-to-read flow through the
+/// TRANSPORT, not just the raw handler response. The MCP L1 path is `trim_llm_payload` ->
+/// `render_tool_output_plain`; this test closes the chain so a diagnostic attached to a read
+/// reaches the text the LLM sees.
+#[test]
+fn test_read_diagnostics_overlay_survives_the_l1_transport_chain() {
+    let raw = serde_json::json!({
+        "file_path": "/p/src/lib.rs",
+        "start_line": 1,
+        "end_line": 5,
+        "language": "rust",
+        "content": "1 fn a() {}\n2 fn b() {}\n",
+        "diagnostics": [
+            { "file": "/p/src/lib.rs", "line": 2, "severity": "error", "code": "E0308", "message": "mismatched types" }
+        ]
+    });
+    let trimmed = trim_llm_payload("leindex_read_file", &raw);
+    assert!(
+        trimmed
+            .get("diagnostics")
+            .and_then(|v| v.as_array())
+            .is_some(),
+        "trim must keep the overlay: {trimmed}"
+    );
+    let rendered = crate::cli::mcp::output::render_tool_output_plain(
+        "leindex_read_file",
+        &trimmed,
+        &serde_json::Value::Null,
+    );
+    assert!(
+        rendered.contains("/p/src/lib.rs:2 error E0308 mismatched types"),
+        "the overlay must reach the rendered payload: {rendered}"
+    );
+}

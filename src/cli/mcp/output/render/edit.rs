@@ -268,6 +268,12 @@ pub(super) fn render_edit_apply(data: &Value, color: bool) -> String {
                 if color { RESET } else { "" },
             ));
         }
+        // §3.6: requested post-apply validation echoes (`validate:"syntax"`
+        // / "check"`) ride on every changed-file response. They must be
+        // surfaced BEFORE the early return, or a validated edit that failed
+        // its own check renders identically to a clean one (Codex round 1,
+        // id 4653371664).
+        render_validation_echoes(&mut out, data);
         return out;
     }
     if let Some(path) = data.get("file_path").and_then(|v| v.as_str()) {
@@ -297,6 +303,46 @@ pub(super) fn render_edit_apply(data: &Value, color: bool) -> String {
             .map_or_else(String::new, |region| render_edit_region(region, color)),
     );
     out
+}
+
+/// Render the post-apply validation echoes (`validate:"syntax"` /
+/// `validate:"check"`): one line per edited file's syntax outcome, then one
+/// line per scoped-check report. Present only when the caller requested them,
+/// so a missing field renders nothing.
+fn render_validation_echoes(out: &mut String, data: &Value) {
+    if let Some(entries) = data.get("syntax").and_then(Value::as_array) {
+        for entry in entries {
+            let Some(path) = entry.get("display_path").and_then(Value::as_str) else {
+                continue;
+            };
+            let summary = entry.get("summary").and_then(Value::as_str).unwrap_or("");
+            out.push_str(&format!("  Syntax {path}: {summary}\n"));
+        }
+    }
+    if let Some(check) = data.get("check") {
+        let Some(files) = check.get("files").and_then(Value::as_array) else {
+            return;
+        };
+        for entry in files {
+            let Some(path) = entry.get("file").and_then(Value::as_str) else {
+                continue;
+            };
+            let report = match entry.get("error").and_then(Value::as_str) {
+                Some(error) => format!("check failed: {error}"),
+                None => match (
+                    entry.get("headline").and_then(Value::as_str),
+                    entry.get("error_count"),
+                ) {
+                    (Some(headline), Some(count)) => {
+                        format!("{headline} ({count} errors)")
+                    }
+                    (Some(headline), None) => headline.to_string(),
+                    _ => "checked".to_string(),
+                },
+            };
+            out.push_str(&format!("  Check {path}: {report}\n"));
+        }
+    }
 }
 
 /// Pick the first status line of the edit-apply render: failure, dry-run
