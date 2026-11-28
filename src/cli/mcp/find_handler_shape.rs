@@ -549,6 +549,13 @@ pub(super) fn shape_matches_page(
             cursor_keys.iter().take(shown).map(String::as_str).collect();
         let offered_keys: std::collections::HashSet<&str> =
             cursor_keys.iter().map(String::as_str).collect();
+        // The cursors the client already held before this page
+        // (`resume_cursors` in the request). A file whose row the token
+        // budget trimmed away was NOT delivered this page, so its position
+        // must not advance: carrying its incoming cursor lets the next page
+        // continue from exactly where the client left off instead of
+        // re-serving the first hit (Codex round 9).
+        let previous = parse_resume_cursors(query_args);
         let cursors = if result.resume.is_empty() {
             Value::Null
         } else {
@@ -556,15 +563,24 @@ pub(super) fn shape_matches_page(
                 .resume
                 .iter()
                 .filter(|(key, _)| {
-                    kept_keys.contains(key.as_str()) || !offered_keys.contains(key.as_str())
+                    kept_keys.contains(key.as_str())
+                        || !offered_keys.contains(key.as_str())
+                        || previous.contains_key(key.as_str())
                 })
                 .map(|(key, value)| {
-                    // A hit the page limit cut was FETCHED (so the engine
-                    // counted it as delivered) but never SHOWN, so the cursor
-                    // has to step back over it or the next page skips it.
-                    let withheld = truncated.get(key).copied().unwrap_or(0);
-                    let delivered = value.saturating_sub(withheld);
-                    (key.clone(), json!(delivered))
+                    if kept_keys.contains(key.as_str()) {
+                        // A hit the page limit cut was FETCHED (so the engine
+                        // counted it as delivered) but never SHOWN, so the cursor
+                        // has to step back over it or the next page skips it.
+                        let withheld = truncated.get(key).copied().unwrap_or(0);
+                        let delivered = value.saturating_sub(withheld);
+                        (key.clone(), json!(delivered))
+                    } else if let Some(ahead) = previous.get(key) {
+                        // Budget-trimmed row: keep the incoming position.
+                        (key.clone(), json!(ahead))
+                    } else {
+                        (key.clone(), json!(value))
+                    }
                 })
                 .filter(|(_, value)| value.as_u64().is_some_and(|shown| shown > 0))
                 .collect();

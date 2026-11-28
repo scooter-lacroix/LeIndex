@@ -312,7 +312,10 @@ pub(super) fn render_edit_apply(data: &Value, color: bool) -> String {
 fn render_validation_echoes(out: &mut String, data: &Value) {
     if let Some(entries) = data.get("syntax").and_then(Value::as_array) {
         for entry in entries {
-            let Some(path) = entry.get("display_path").and_then(Value::as_str) else {
+            // `attach_syntax_validation` emits `{ path, summary, errors }`;
+            // keying on that keeps the renderer correct against the handler's
+            // actual payload (Codex round 9, id 6095...).
+            let Some(path) = entry.get("path").and_then(Value::as_str) else {
                 continue;
             };
             let summary = entry.get("summary").and_then(Value::as_str).unwrap_or("");

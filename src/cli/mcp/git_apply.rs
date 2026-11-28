@@ -1547,6 +1547,35 @@ pub(super) async fn run_validated_commit(
         )));
     }
 
+    // An ordinary commit (exactly one parent) whose tree equals its parent's
+    // tree is an empty commit. git itself refuses it ("nothing to commit"),
+    // but the write-tree/commit-tree/update-ref sequence does not and would
+    // publish a branch-advancing empty commit (Codex round 9). Merges
+    // (parents > 1) may legitimately share a tree with a parent, so the
+    // guard is single-parent only.
+    if plan.parents.len() == 1 {
+        let parent_tree = git_read(
+            root,
+            &[
+                "rev-parse".to_string(),
+                "--verify".to_string(),
+                "--quiet".to_string(),
+                format!("{}^{{tree}}", plan.parents[0]),
+            ],
+        )
+        .ok()
+        .and_then(|(text, _)| {
+            let oid = text.trim();
+            is_oid(oid).then(|| oid.to_string())
+        });
+        if parent_tree.as_deref() == Some(tree) {
+            return Err(JsonRpcError::invalid_params_with_suggestion(
+                "nothing to commit; the index matches HEAD".to_string(),
+                "Stage changes first (git add), or commit with explicit paths".to_string(),
+            ));
+        }
+    }
+
     // 2. Commit that tree with exactly the captured parents.
     let mut commit_argv = vec!["commit-tree".to_string(), tree.to_string()];
     for parent in &plan.parents {

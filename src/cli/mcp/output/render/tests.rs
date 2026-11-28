@@ -1350,7 +1350,7 @@ fn test_render_edit_apply_renders_requested_validation_echoes() {
         "changes_applied": 1,
         "applied_lines": ["Applied: src/a.rs:L1-5 (+4/-0) in fn a"],
         "syntax": [
-            {"display_path": "src/a.rs", "summary": "1 error(s): 3:1 ERROR", "errors": ["3:1 ERROR"]}
+            {"path": "src/a.rs", "summary": "1 error(s): 3:1 ERROR", "errors": ["3:1 ERROR"]}
         ],
         "check": {
             "files": [
@@ -1383,4 +1383,30 @@ fn test_render_edit_apply_validation_echoes_are_absent_without_request() {
     assert!(s.contains("Applied: src/a.rs:L1-5 (+4/-0) in fn a"), "{s}");
     assert!(!s.contains("Syntax "), "{s}");
     assert!(!s.contains("Check "), "{s}");
+}
+
+/// The syntax-validation echo must survive the L1 transport chain with the
+/// handler's REAL field name. `attach_syntax_validation` emits `{ path,
+/// summary, errors }`; an earlier renderer required `display_path`, so even a
+/// failing validated edit rendered only its success echo on the default MCP
+/// path. This test feeds a handler-shaped payload through trim → render, the
+/// exact route the LLM sees (Codex round 9).
+#[test]
+fn test_render_edit_apply_validation_echoes_survive_the_l1_transport_chain() {
+    use crate::cli::mcp::output::trim::trim_llm_payload;
+    let raw = v(r#"{
+        "success": true,
+        "changes_applied": 1,
+        "applied_lines": ["Applied: src/a.rs:L1-5 (+4/-0) in fn a"],
+        "syntax": [
+            {"path": "src/a.rs", "summary": "1 error(s): 3:1 ERROR", "errors": ["3:1 ERROR"]}
+        ]
+    }"#);
+    let trimmed = trim_llm_payload("leindex_edit_apply", &raw);
+    let s = render_tool_output_plain("leindex_edit_apply", &trimmed, &Value::Null);
+    assert!(
+        s.contains("Syntax src/a.rs: 1 error(s): 3:1 ERROR"),
+        "the syntax failure must reach the rendered payload: {s}"
+    );
+    assert!(s.contains("Applied: src/a.rs:L1-5 (+4/-0) in fn a"), "{s}");
 }

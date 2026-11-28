@@ -1957,3 +1957,45 @@ async fn test_a_publish_that_cannot_be_confirmed_directs_the_caller_to_the_ref()
     );
     let _ = head_before;
 }
+
+/// Codex round 9: write-tree/commit-tree/update-ref would publish an EMPTY
+/// commit when the index matches HEAD; git's ordinary commit refuses that with
+/// "nothing to commit". The validated-commit executor must not be more lenient
+/// than git.
+#[tokio::test]
+async fn test_a_clean_tree_commit_is_refused_instead_of_publishing_empty() {
+    let repo = scratch();
+    let root = repo.path();
+    git(root, &["config", "commit.gpgSign", "false"]);
+    std::fs::write(root.join("f.txt"), "reviewed\n").unwrap();
+    git(root, &["add", "f.txt"]);
+    run_mutation(
+        root,
+        &[
+            "commit".to_string(),
+            "--no-gpg-sign".to_string(),
+            "-m".to_string(),
+            "initial".to_string(),
+        ],
+    )
+    .await
+    .expect("the initial commit applies");
+    let head_before = head_oid(root).unwrap();
+
+    // Nothing is staged: the frozen tree equals HEAD's tree.
+    let args = json!({ "message": "empty" });
+    let argv = plan_argv_for("commit", root, &args).unwrap();
+    let plan = validated_tree_commit(root, &argv).expect("plan captures HEAD");
+    assert_eq!(plan.parents.len(), 1, "precondition: a plain commit");
+
+    let error = run_validated_commit(root, &plan)
+        .await
+        .expect_err("an empty commit must be refused");
+    let text = error.message_with_hint();
+    assert!(text.contains("nothing to commit"), "{text}");
+    assert_eq!(
+        head_oid(root).unwrap(),
+        head_before,
+        "the ref must not move when there is nothing to commit"
+    );
+}

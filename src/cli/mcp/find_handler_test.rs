@@ -654,6 +654,79 @@ async fn test_find_budget_cut_continuation_keeps_cursors_of_fully_delivered_file
     );
 }
 
+/// Codex round 9: when a continuation page's token budget trims a file's
+/// row, that file's INCOMING resume cursor must be retained. Dropping it
+/// makes the next page treat the file as unvisited and re-serve its first
+/// hit. Shape-level: two files with engine cursors at 2 and previous
+/// positions of 1; budget 1 keeps one row, and the continuation token must
+/// still carry BOTH cursor keys — the kept row advanced, the trimmed row
+/// unchanged.
+#[test]
+fn test_shape_keeps_incoming_cursor_for_budget_trimmed_rows() {
+    use crate::cli::mcp::find_paging::resume;
+    use crate::search::textsearch::engine::{FileResult, Hit, RootOutput, SearchOutput};
+
+    let file = |rel: &str, line: u32| FileResult {
+        rel: rel.to_string(),
+        match_lines: 2,
+        total_hits: 2,
+        shown: 2,
+        hits: vec![Hit {
+            line,
+            col: 1,
+            text: "x".to_string(),
+            before: Vec::new(),
+            after: Vec::new(),
+            symbol: None,
+        }],
+        ..Default::default()
+    };
+    let result = SearchOutput {
+        returned: 2,
+        has_more: true,
+        complete: false,
+        resume: std::collections::BTreeMap::from([
+            ("0:a.txt".to_string(), 2usize),
+            ("0:b.txt".to_string(), 2usize),
+        ]),
+        roots: vec![RootOutput {
+            root: std::path::PathBuf::from("/r"),
+            used_index: false,
+            files: vec![file("a.txt", 2), file("b.txt", 2)],
+        }],
+        ..Default::default()
+    };
+    // The client already saw a:1 and b:1 on an earlier page.
+    let args = serde_json::json!({
+        "resume_cursors": { "0:a.txt": 1, "0:b.txt": 1 }
+    });
+    let base = find_window(&serde_json::json!({})).unwrap();
+    let window = FindWindow {
+        offset: 0,
+        limit: Some(4),
+        token_budget: Some(1),
+        ..base
+    };
+    let value = shape_text_result("p", "matches", &[], result, &window, None, 0, &args);
+    // Budget 1 keeps exactly one row; the continuation must still exist.
+    assert_eq!(value["files"].as_array().map(|a| a.len()), Some(1));
+    let next = value["next"].as_str().expect("continuation issued");
+    let cont = resume("leindex_find", next).expect("token resolves");
+    let cursors = cont.cursors.as_object().expect("per-file cursors carried");
+    assert_eq!(
+        cursors.len(),
+        2,
+        "both files' cursors must be carried: {cursors:?}"
+    );
+    let mut values: Vec<u64> = cursors.values().filter_map(|v| v.as_u64()).collect();
+    values.sort_unstable();
+    assert_eq!(
+        values,
+        [1, 2],
+        "kept row advances, trimmed row keeps its incoming position: {cursors:?}"
+    );
+}
+
 #[test]
 fn test_find_regex_like_heuristic_lone_dot_exempt() {
     // §3.8 heuristic, unit-level: the metacharacters that CHANGE meaning
