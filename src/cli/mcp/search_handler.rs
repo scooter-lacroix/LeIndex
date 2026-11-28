@@ -102,7 +102,11 @@ fn scoped_search(
             index.search(query, fetch_k, query_type)
         }
     };
-    let required = offset.saturating_add(top_k);
+    // Fetch ONE result beyond the requested window. `has_more` is then
+    // decided on evidence — a page that ends exactly at the edge of the
+    // retrieval is not proof the stream ended, so a full page must not be
+    // misread as the final one.
+    let required = offset.saturating_add(top_k).saturating_add(1);
     let mut fetch_k = required.clamp(1, MAX_FETCH_K);
     let mut all_results = search(index, fetch_k)
         .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
@@ -369,6 +373,10 @@ to switch between projects."
                     "default": 0,
                     "minimum": 0
                 },
+                "next": {
+                    "type": "string",
+                    "description": "Continuation token from a previous page's `next`; pass it (plus project_path) alone to continue without re-sending the query"
+                },
                 "search_mode": {
                     "type": "string",
                     "enum": ["code", "prose", "auto", "exact", "semantic"],
@@ -407,6 +415,26 @@ to switch between projects."
         registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
+        // §6.8: `next` alone (with project_path) continues a previous call
+        // without re-sending the query.
+        if let Some(token) = args
+            .get("next")
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+        {
+            let resumed = crate::cli::mcp::find_paging::resume("leindex_search", token).map_err(
+                |reason| {
+                    JsonRpcError::invalid_params_with_suggestion(reason, "Re-send the full query")
+                },
+            )?;
+            let merged = crate::cli::mcp::find_paging::merge(
+                &resumed.args,
+                &args,
+                resumed.offset,
+                &Value::Null,
+            );
+            return Box::pin(self.execute(registry, merged)).await;
+        }
         let params = parse_search_params(&args)?;
         let started = Instant::now();
         let (route, route_name, query_type) =
@@ -455,14 +483,23 @@ to switch between projects."
             ));
         }
 
+        let has_more = params.offset + total_returned < total_filtered;
         let mut payload = serde_json::json!({
             "results": serde_json::to_value(&page).map_err(|e|
                 JsonRpcError::internal_error(format!("Serialization error: {}", e)))?,
             "offset": params.offset,
             "count": total_returned,
-            "has_more": params.offset + total_returned < total_filtered,
+            "has_more": has_more,
             "retrieval": retrieval_meta(&guard, route, route_name, &params.budget, started)
         });
+        if has_more {
+            let next_offset = params.offset + total_returned;
+            let token = crate::cli::mcp::find_paging::issue("leindex_search", &args, next_offset);
+            payload["next_offset"] = serde_json::json!(next_offset);
+            if !token.is_empty() {
+                payload["next"] = serde_json::json!(token);
+            }
+        }
         annotate_search_payload(&mut payload, &low_signal_json, started);
         Ok(wrap_with_meta(payload, &guard))
     }
@@ -520,6 +557,98 @@ mod tests {
 
     fn directory_root() -> &'static std::path::Path {
         std::path::Path::new(".")
+    }
+
+    /// #009: `has_more` must be decided on evidence — the retriever fetches
+    /// one result beyond the requested window, so a page that fills exactly
+    /// top_k results still reports more when a further result exists.
+    #[tokio::test]
+    async fn test_search_handler_fetches_one_beyond_before_deciding_has_more() {
+        let dir = tempdir().unwrap();
+        for index in 0..3 {
+            let path = dir.path().join(format!("probe_{index}.rs"));
+            std::fs::write(&path, format!("pub fn probe_tok_{index}() {{}}\n")).unwrap();
+        }
+        let mut index = crate::cli::leindex::LeIndex::new(dir.path()).expect("leindex");
+        index.index_project(true).expect("fixture indexes");
+        let registry = std::sync::Arc::new(
+            crate::cli::registry::ProjectRegistry::with_initial_project(5, index),
+        );
+        let args = serde_json::json!({
+            "query": "probe_tok",
+            "top_k": 2,
+            "project_path": dir.path().display().to_string(),
+        });
+        let value = SearchHandler
+            .execute(&registry, args)
+            .await
+            .expect("search succeeds");
+        assert_eq!(
+            value["count"].as_i64(),
+            Some(2),
+            "page serves top_k results"
+        );
+        assert_eq!(
+            value["has_more"].as_bool(),
+            Some(true),
+            "a full page is not the end"
+        );
+        let mut next_offset = value["next_offset"].as_i64().expect("next_offset present");
+        // Walk the stream to its end. The retriever emits one result per matching
+        // PDG node (the symbol AND the file's `file_summary`), so the exact stream
+        // length is an implementation detail; the contract under test is that every
+        // full page reports `has_more` on evidence, the final page reports `false`,
+        // and no result is ever served twice across pages.
+        let mut served = std::collections::BTreeSet::new();
+        for result in value["results"].as_array().expect("results array") {
+            served.insert(result["node_id"].as_str().expect("node_id").to_string());
+        }
+        let mut pages = 1;
+        let mut last = value.clone();
+        while last["has_more"].as_bool() == Some(true) {
+            let args_next = serde_json::json!({
+                "query": "probe_tok",
+                "top_k": 2,
+                "offset": next_offset,
+                "project_path": dir.path().display().to_string(),
+            });
+            last = SearchHandler
+                .execute(&registry, args_next)
+                .await
+                .expect("search continuation page");
+            let count = last["count"].as_i64().expect("count");
+            assert!(
+                count >= 1,
+                "a page that advertises more must serve at least one result (got {count})"
+            );
+            for result in last["results"].as_array().expect("results array") {
+                let node = result["node_id"].as_str().expect("node_id").to_string();
+                assert!(
+                    served.insert(node.clone()),
+                    "result {node:?} was served on an earlier page"
+                );
+            }
+            if last["has_more"].as_bool() == Some(true) {
+                next_offset = last["next_offset"]
+                    .as_i64()
+                    .expect("a page with has_more must carry next_offset");
+            }
+            pages += 1;
+            assert!(
+                pages <= 10,
+                "pagination did not terminate after {pages} pages"
+            );
+        }
+        assert!(
+            pages >= 2,
+            "the fixture must span more than one page (served {}, {pages} pages)",
+            served.len()
+        );
+        assert_eq!(last["has_more"].as_bool(), Some(false));
+        assert!(
+            last.get("next_offset").is_none(),
+            "the final page must not advertise a next_offset"
+        );
     }
 
     #[test]

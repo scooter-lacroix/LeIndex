@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 /// Upper bound on diff bytes read from git (the patch is bounded again for output).
-const MAX_DIFF_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const MAX_DIFF_BYTES: u64 = 8 * 1024 * 1024;
 const DEFAULT_PATCH_CHARS: usize = 20_000;
 
 /// Handler for PDG-enriched `git diff`.
@@ -195,7 +195,10 @@ fn is_body_resync(line: &str, body_old: usize, body_new: usize, remaining: usize
 /// current file and silently dropped every remaining hunk of that file;
 /// see [`is_body_resync`] for how a crafted count is prevented from
 /// swinging to the opposite failure mode.
-fn parse_hunks(patch: &str) -> BTreeMap<String, Vec<(usize, usize)>> {
+///
+/// `pub(crate)`: the git status handler reuses this parser so both surfaces
+/// agree on what a hunk is (§3.11 hunk-level symbol attribution).
+pub(crate) fn parse_hunks(patch: &str) -> BTreeMap<String, Vec<(usize, usize)>> {
     let mut hunks: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
     let mut current: Option<String> = None;
     // Lines still expected inside the current hunk body (old-side and
@@ -281,7 +284,7 @@ fn parse_hunks(patch: &str) -> BTreeMap<String, Vec<(usize, usize)>> {
 }
 
 /// Byte offset of the start of each 1-based line in `content`.
-fn line_starts(content: &[u8]) -> Vec<usize> {
+pub(crate) fn line_starts(content: &[u8]) -> Vec<usize> {
     let mut starts = vec![0usize];
     for (index, byte) in content.iter().enumerate() {
         if *byte == b'\n' {
@@ -292,7 +295,12 @@ fn line_starts(content: &[u8]) -> Vec<usize> {
 }
 
 /// Byte range covered by 1-based inclusive lines `start..=end`.
-fn lines_to_bytes(starts: &[usize], total: usize, start: usize, end: usize) -> (usize, usize) {
+pub(crate) fn lines_to_bytes(
+    starts: &[usize],
+    total: usize,
+    start: usize,
+    end: usize,
+) -> (usize, usize) {
     let from = starts.get(start - 1).copied().unwrap_or(total);
     let to = starts.get(end).copied().unwrap_or(total);
     (from, to.max(from))
@@ -305,14 +313,26 @@ fn lines_to_bytes(starts: &[usize], total: usize, start: usize, end: usize) -> (
 /// and a runaway command is killed instead of buffered without bound.
 /// `GIT_TERMINAL_PROMPT=0` keeps a command that would ask for credentials
 /// (`push`, a `fetch` triggered by `pull`) from blocking the server forever.
+///
+/// The inherited repository-location overrides are SCRUBBED here too. Without
+/// that, `current_dir(root)` is not enough: a `GIT_DIR` / `GIT_WORK_TREE`
+/// inherited from a hook that launched this process wins over the working
+/// directory, so `git diff`, `git status` and every other live read reported a
+/// DIFFERENT repository than the caller named. The write path was fixed for
+/// this in round 10 (id 4697090106); the read path was missed, and the hole
+/// was reproducible: with `GIT_DIR` pointed at a decoy, a read of the real
+/// repository failed with "not a git repository", and the preview token bound
+/// the decoy's HEAD and index, so every mutation of the real repo was then
+/// rejected on a token that could never match.
 pub(crate) fn run_git_capped(
     root: &Path,
     args: &[String],
     cap: u64,
 ) -> Result<(Vec<u8>, bool), std::io::Error> {
-    let child = Command::new("git")
-        .args(args)
-        .current_dir(root)
+    let mut command = Command::new("git");
+    command.args(args).current_dir(root);
+    super::git_apply_exec::scrub_std(&mut command);
+    let child = command
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -466,7 +486,7 @@ impl GitDiffHandler {
                 "range": { "type": "string", "description": "Revision range, e.g. main..feature or HEAD~3..HEAD" },
                 "staged": { "type": "boolean", "default": false, "description": "Diff the index against HEAD instead of the working tree" },
                 "stat_only": { "type": "boolean", "default": false, "description": "Per-file statistics only; no patch, no hunk-level symbol mapping" },
-                "include_patch": { "type": "boolean", "default": true, "description": "Include the (bounded) unified patch" },
+                "include_patch": { "type": "boolean", "default": false, "description": "Include the (bounded) unified patch; the compact default reports per-file stats plus hunk summaries instead" },
                 "max_patch_chars": { "type": "integer", "default": DEFAULT_PATCH_CHARS, "minimum": 0, "maximum": 200000, "description": "Patch size bound" },
                 "enrich_pdg": { "type": "boolean", "default": true, "description": "Map changed hunks to PDG symbols and compute impact" },
                 "scope": { "type": "string", "description": "Only report files under this project-relative path" },
@@ -563,7 +583,10 @@ fn parse_args(args: &Value) -> Result<DiffArgs, JsonRpcError> {
     Ok(DiffArgs {
         spec,
         stat_only,
-        include_patch: extract_bool(args, "include_patch", true) && !stat_only,
+        // §4.5: compact by default — the full patch is opt-in. Symbol/hunk
+        // summaries still run (they are bounded by the hunk count, not the
+        // patch size); `include_patch: true` restores the old full-patch view.
+        include_patch: extract_bool(args, "include_patch", false) && !stat_only,
         enrich: extract_bool(args, "enrich_pdg", true),
         max_patch_chars: extract_usize(args, "max_patch_chars", DEFAULT_PATCH_CHARS)?.min(200_000),
         budget: WorkBudget {
@@ -652,6 +675,10 @@ async fn attach_patch_and_enrich(
         let (text, cut) = bound_chars(&readable, max_patch_chars);
         result["patch"] = Value::String(text);
         result["patch_truncated"] = Value::Bool(cut || *truncated || readable_truncated);
+    } else if let Some((raw_patch, _)) = &patch {
+        // §4.5 compact default: summarize long hunks instead of printing
+        // them, using the enclosing function git names in the hunk header.
+        result["changes"] = hunk_summaries(raw_patch);
     }
     if !enrich || stat_only || files.is_empty() {
         return result;
@@ -749,6 +776,99 @@ fn bound_chars(text: &str, max: usize) -> (String, bool) {
         return (text.to_string(), false);
     }
     (text.chars().take(max).collect(), true)
+}
+
+/// Hunks over the summary threshold as one bounded record each (§4.5).
+///
+/// Git writes the enclosing function into the hunk header when it can detect
+/// one (`@@ -10,7 +10,40 @@ fn name(..)`), so the "in fn …" attribution comes
+/// free from the same `-U0` patch that drives symbol mapping — no second
+/// pass, no graph dependency. Short hunks are not listed: the per-file stat
+/// line already covers them.
+fn hunk_summaries(patch: &str) -> Value {
+    /// New-side line count above which a hunk is summarized instead of being
+    /// left to the per-file stat.
+    const LONG_HUNK_LINES: usize = 20;
+    const MAX_ENTRIES: usize = 50;
+
+    let mut current: Option<String> = None;
+    let mut entries = Vec::new();
+    let mut total_long = 0usize;
+    for line in patch.lines() {
+        if let Some(path) = line.strip_prefix("+++ ") {
+            current = path
+                .strip_prefix("b/")
+                .map(str::to_string)
+                .filter(|p| p != "/dev/null");
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("@@ ") else {
+            continue;
+        };
+        let Some(file) = current.as_ref() else {
+            continue;
+        };
+        let mut parts = rest.splitn(2, " @@");
+        let (Some(ranges), context) = (parts.next(), parts.next().unwrap_or_default()) else {
+            continue;
+        };
+        let new_side = ranges
+            .split_whitespace()
+            .find(|part| part.starts_with('+'))
+            .unwrap_or("+1");
+        let spec = new_side.trim_start_matches('+');
+        let (start, count) = match spec.split_once(',') {
+            Some((start, count)) => (
+                start.parse::<usize>().unwrap_or(1),
+                count.parse::<usize>().unwrap_or(1),
+            ),
+            None => (spec.parse::<usize>().unwrap_or(1), 1usize),
+        };
+        let old_side = ranges
+            .split_whitespace()
+            .find(|part| part.starts_with('-') && *part != "--")
+            .unwrap_or("-1");
+        let old_count = old_side
+            .trim_start_matches('-')
+            .split_once(',')
+            .and_then(|(_, count)| count.parse::<usize>().ok())
+            .unwrap_or(1);
+        if count <= LONG_HUNK_LINES {
+            continue;
+        }
+        total_long += 1;
+        if entries.len() >= MAX_ENTRIES {
+            continue;
+        }
+        let kind = if old_count == 0 {
+            "new"
+        } else if count == 0 {
+            "removed"
+        } else {
+            "modified"
+        };
+        let inside = context
+            .split_whitespace()
+            .find(|token| {
+                token.starts_with("fn ")
+                    && token.chars().all(|c| {
+                        c.is_alphanumeric() || c == '_' || c == ':' || c == '<' || c == '>'
+                    })
+            })
+            .map(str::to_string);
+        entries.push(json!({
+            "path": file,
+            "lines": count,
+            "at": start,
+            "kind": kind,
+            "in": inside,
+        }));
+    }
+    let mut value = json!({ "long_hunks": entries, "long_hunk_count": total_long });
+    if total_long > entries.len() {
+        value["omitted_long_hunks"] = json!(total_long - entries.len());
+    }
+    value
 }
 
 fn file_json(file: &ChangedFile) -> Value {
@@ -1044,9 +1164,14 @@ mod tests {
     }
 
     fn git(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .args(args)
-            .current_dir(dir)
+        let mut command = Command::new("git");
+        command.args(args).current_dir(dir);
+        // Fixtures use the SAME scrub as the code under test: the poisoned
+        // window opened by `test_an_inherited_git_dir_cannot_redirect_a_live_read`
+        // is process-global, so an unscrubbed setup command would be redirected
+        // into that test's decoy and fail here for the wrong reason.
+        super::super::git_apply_exec::scrub_std(&mut command);
+        let status = command
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@t")
             .env("GIT_COMMITTER_NAME", "t")
@@ -1054,6 +1179,120 @@ mod tests {
             .status()
             .expect("git available");
         assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// Names a builder has been told to CLEAR (`env_remove`).
+    fn cleared<'a>(
+        pairs: impl Iterator<Item = (&'a std::ffi::OsStr, Option<&'a std::ffi::OsStr>)>,
+    ) -> Vec<String> {
+        pairs
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().to_string())
+            .collect()
+    }
+
+    /// Round 13: the READ path never scrubbed `GIT_DIR` / `GIT_WORK_TREE`.
+    ///
+    /// The write path was scrubbed in round 10 (id 4697090106); every live
+    /// read was not, so `git status` / `git diff` against the named repository
+    /// resolved the INHERITED one instead. Two consequences, both silent: the
+    /// read reported another worktree's contents, and the preview token bound
+    /// that other repository's HEAD and index — after which every mutation of
+    /// the real repository was rejected on a token that could never match.
+    ///
+    /// Red-verified: with `scrub_std` bodied out to a no-op the CHILD reports
+    /// `left: 0, right: 1` — the diff describes the decoy's CLEAN tree.
+    ///
+    /// The poisoned window runs in a fresh CHILD process. `EnvLock` serialises
+    /// the tests that WRITE the environment; it cannot exclude the threads that
+    /// READ it (this binary's other tests, their git children, Rust's own
+    /// runtime), and Rust 1.88 documents `set_var`/`remove_var` racing such a
+    /// reader as undefined behaviour — not merely a data race. So the parent
+    /// sets the decoy on the CHILD's `Command` and never touches its own
+    /// environment, which also removes the need to restore anything.
+    #[test]
+    fn test_an_inherited_git_dir_cannot_redirect_a_live_read() {
+        // CHILD: poisoned environment already in place, set by the parent.
+        // Only the assertions run here.
+        if let Some(real) = std::env::var_os(crate::test_env::SELF_TEST_PROJECT_ROOT) {
+            let real = std::path::PathBuf::from(real);
+            let diff = collect_diff(&real, &DiffSpec::WorkingTree, false)
+                .map(|working| working.files.len());
+            assert_eq!(
+                diff.expect("the named repository must stay readable"),
+                1,
+                "the diff must describe the REAL working tree, not the decoy's clean one"
+            );
+            let status = crate::cli::git::status(&real)
+                .expect("the named repository must keep a live status");
+            assert_eq!(
+                status.modified,
+                vec![std::path::PathBuf::from("a.rs")],
+                "the status must report the REAL repository's dirty file"
+            );
+            return;
+        }
+
+        // PARENT: build both repositories with the scrubbed fixture git, then
+        // hand the decoy to a child through `Command::env`.
+        let real = tempfile::tempdir().unwrap();
+        let decoy = tempfile::tempdir().unwrap();
+        git(real.path(), &["init", "-q"]);
+        std::fs::write(real.path().join("a.rs"), "fn a() {}\n").unwrap();
+        git(real.path(), &["add", "."]);
+        git(real.path(), &["commit", "-q", "-m", "real"]);
+        // The REAL tree is dirty; the decoy is clean, so the two are
+        // distinguishable without reading any oid.
+        std::fs::write(real.path().join("a.rs"), "fn a() { let _x = 1; }\n").unwrap();
+        git(decoy.path(), &["init", "-q"]);
+        std::fs::write(decoy.path().join("a.rs"), "fn decoy() {}\n").unwrap();
+        git(decoy.path(), &["add", "."]);
+        git(decoy.path(), &["commit", "-q", "-m", "decoy"]);
+
+        let decoy_git = decoy.path().join(".git");
+        let child = crate::test_env::run_self_test_with_env(
+            "cli::mcp::git_diff_handler::tests::test_an_inherited_git_dir_cannot_redirect_a_live_read",
+            &[
+                (
+                    crate::test_env::SELF_TEST_PROJECT_ROOT,
+                    real.path().as_os_str(),
+                ),
+                (
+                    crate::test_env::SELF_TEST_DECOY_ROOT,
+                    decoy.path().as_os_str(),
+                ),
+                ("GIT_DIR", decoy_git.as_os_str()),
+                ("GIT_WORK_TREE", decoy.path().as_os_str()),
+            ],
+        );
+        assert!(
+            child.status.success(),
+            "the child must observe the REAL repository despite the inherited GIT_DIR\n\
+             stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+    }
+
+    /// The scrub list is the seam: a variable dropped from it would be patched
+    /// in one spawn site and silently inherited in another.
+    ///
+    /// `tokio::process::Command` has no `get_envs`, so the async builder is not
+    /// introspectable. The blocking one is, and it shares the constant with
+    /// `run_git_capped`; the async builder clears the same list through
+    /// `scrub_async`, and `test_an_inherited_git_dir_cannot_redirect_a_live_read`
+    /// proves the read path's behaviour end to end.
+    #[test]
+    fn test_the_blocking_builder_clears_the_shared_override_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let builder = super::super::git_apply_exec::git_command_sync(dir.path());
+        let present = cleared(builder.get_envs());
+        for variable in super::super::git_apply_exec::REPOSITORY_LOCATION_OVERRIDES {
+            assert!(
+                present.iter().any(|key| key == variable),
+                "{variable} must be cleared by the blocking builder: {present:?}"
+            );
+        }
     }
 
     #[test]

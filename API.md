@@ -1,4 +1,4 @@
-# LeIndex API Reference (v1.5.2)
+# LeIndex API Reference (v2.2.0)
 
 ## CLI
 
@@ -31,22 +31,27 @@ Transport:
 
 ### Tool Names
 
-- `leindex_index`
-- `leindex_search`
-- `leindex_deep_analyze`
-- `leindex_context`
-- `leindex_diagnostics`
-- `leindex_phase_analysis`
-- `phase_analysis`
-- `leindex_file_summary`
-- `leindex_symbol_lookup`
-- `leindex_project_map`
-- `leindex_grep_symbols`
-- `leindex_read_symbol`
-- `leindex_edit_preview`
-- `leindex_edit_apply`
-- `leindex_rename_symbol`
-- `leindex_impact_analysis`
+`tools/list` advertises five routers. The `mode` / `action` argument selects the
+operation; every other argument is forwarded unchanged to the branch.
+
+- `leindex_explore` — `mode`: `search` (default), `find`, `structural`,
+  `symbol_lookup`, `read_file`, `read_symbol`, `project_map`, `file_summary`,
+  `context`
+- `leindex_analyze` — `mode`: `deep` (default), `impact`, `diagnostics`, `phase`
+- `leindex_edit` — `action` (required): `preview`, `apply`, `rename`, `write`
+- `leindex_manage` — `action`: `index` (default), `state`, `projects`, `evict`,
+  `lease`, `cleanup`, `run`, `how_to_test`
+- `leindex_git` — `action`: `status`, `diff`, `log`, `show`, `blame`, `branch`,
+  `remote`, `add`, `commit`, `checkout`, `stash`, `tag`, `merge`, `rebase`,
+  `push`, `reset`, `force` (mutations are plan-gated: a bare call returns a plan
+  plus a `preview_token` bound to HEAD and the index; re-send it to apply, or pass
+  `confirm: true` for the safe subset — `add`, `commit`, `push` without force)
+
+The original per-operation names (`leindex_search`, `leindex_deep_analyze`,
+`leindex_edit_apply`, …) remain callable but are not advertised;
+`LEINDEX_MCP_LEGACY_TOOLS=1` advertises them. `LEINDEX_MCP_SCHEMA=oneof` switches
+`tools/list` to `oneOf` + `discriminator` schemas. Every branch also accepts
+`tier` (`l0` identity card · `l1` overview · `l2` full detail).
 
 ### Request/Response Notes
 

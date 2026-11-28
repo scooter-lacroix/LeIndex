@@ -312,6 +312,78 @@ fn test_freshness_advisory_is_once_per_session_and_generation() {
     );
 }
 
+/// Brief §3.2/§3.3: the advisory text reaches the TEXT surface at most once
+/// per session and generation. The first stale response renders the advisory
+/// footer (incremental wording only); the second renders the one compact
+/// stale line with no advisory and no `force_reindex` anywhere.
+#[test]
+fn test_stale_advisory_renders_on_text_surface_once_per_session() {
+    let registry = Arc::new(ProjectRegistry::new(5));
+    let server = McpServer {
+        config: McpServerConfig::default(),
+        _registry: registry,
+        handshake_complete: Arc::new(AtomicBool::new(false)),
+        session_handshakes: Arc::new(DashMap::new()),
+        in_flight: Arc::new(DashMap::new()),
+        freshness_advisories: Arc::new(DashMap::new()),
+    };
+    let (_, session_id) = handle_initialize_for_test(&server);
+
+    let stale_response = || {
+        serde_json::json!({
+            "project_path": "/tmp/project",
+            "count": 1,
+            "results": [{"file_path": "/p.rs", "symbol_name": "f", "score": 0.5}],
+            "_meta": {"freshness": {
+                "generation": 7,
+                "status": "stale",
+                "warning": crate::cli::mcp::helpers::STALE_ADVISORY
+            }}
+        })
+    };
+
+    let mut first = stale_response();
+    server.apply_freshness_advisory(&session_id, None, &mut first);
+    let first_text = crate::cli::mcp::output::render_tool_output(
+        "leindex.search",
+        &first,
+        &serde_json::json!({"query": "q"}),
+    );
+    assert!(
+        first_text.contains("Advisory:"),
+        "first call surfaces the advisory on the text surface: {first_text}"
+    );
+    assert!(
+        first_text.contains("leindex_manage action=index to refresh"),
+        "the recommendation is the incremental path: {first_text}"
+    );
+    assert!(
+        !first_text.contains("force"),
+        "no force_reindex on the text surface, ever: {first_text}"
+    );
+
+    let mut second = stale_response();
+    server.apply_freshness_advisory(&session_id, None, &mut second);
+    assert!(second["_meta"]["freshness"]["advisory"].is_null());
+    let second_text = crate::cli::mcp::output::render_tool_output(
+        "leindex.search",
+        &second,
+        &serde_json::json!({"query": "q"}),
+    );
+    assert!(
+        !second_text.contains("Advisory:"),
+        "second call must not repeat the advisory: {second_text}"
+    );
+    assert!(
+        second_text.contains("[index: stale gen=7]"),
+        "stale still shows exactly the one compact line: {second_text}"
+    );
+    assert!(
+        !second_text.contains("force"),
+        "no force_reindex on the text surface, ever: {second_text}"
+    );
+}
+
 /// VAL-APLUS-025 variant: stale session cleanup removes only expired sessions.
 #[test]
 fn test_stale_session_cleanup() {

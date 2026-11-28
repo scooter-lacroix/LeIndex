@@ -76,6 +76,7 @@ impl StructuralHandler {
                 "exclude_globs": { "type": "array", "items": { "type": "string" }, "description": "Skip these, e.g. [\"vendor/\"]" },
                 "limit": { "type": "integer", "default": DEFAULT_LIMIT, "minimum": 0, "maximum": MAX_LIMIT, "description": "Matches per page; 0 = ceiling (10000)" },
                 "offset": { "type": "integer", "default": 0, "minimum": 0, "maximum": MAX_LIMIT, "description": "Matches to skip" },
+                "next": { "type": "string", "description": "Continuation token from a previous page's `next`; pass it (plus project_path) alone to continue without re-sending the query" },
                 "per_file_cap": { "type": "integer", "default": DEFAULT_PER_FILE, "minimum": 0, "maximum": MAX_LIMIT, "description": "Shown per file; 0 = no cap" },
                 "timeout_ms": { "type": "integer", "default": DEFAULT_TIMEOUT_MS, "minimum": 0, "description": "Time budget; partial results + has_more. 0 = none" },
                 "project_path": { "type": "string", "description": "Project directory; omit to use the current project" }
@@ -159,6 +160,21 @@ async fn search(
 ) -> Result<Value, JsonRpcError> {
     use crate::search::textsearch::{StructuralOptions, search_structural};
 
+    // §6.8: `next` alone (with project_path) continues a previous call
+    // without re-sending the query.
+    if let Some(token) = args
+        .get("next")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+    {
+        let resumed = crate::cli::mcp::find_paging::resume("leindex_structural", token).map_err(
+            |reason| JsonRpcError::invalid_params_with_suggestion(reason, "Re-send the full query"),
+        )?;
+        let merged =
+            crate::cli::mcp::find_paging::merge(&resumed.args, args, resumed.offset, &Value::Null);
+        return Box::pin(search(registry, &merged)).await;
+    }
+
     let pattern_text = parse_pattern(args)?;
     let (limit, offset, per_file_cap, timeout_ms) = parse_paging(args)?;
 
@@ -178,7 +194,7 @@ async fn search(
             .await
             .map_err(|e| JsonRpcError::internal_error(format!("structural search failed: {e}")))?;
 
-    Ok(shape(pattern_text, language_name, &output))
+    Ok(shape(pattern_text, language_name, offset, &output, args))
 }
 
 /// Validate the required pattern, accepting the query alias.
@@ -457,12 +473,16 @@ fn build_filter(args: &Value) -> crate::search::textsearch::FileFilter {
     )
 }
 
-/// Render the search output for the model.
+/// Render the search output for the model. `offset` and `args` feed the
+/// §6.8 continuation token: a page with more emits `next` so the caller can
+/// continue without re-sending the pattern.
 #[cfg(feature = "structural-search")]
 fn shape(
     pattern: &str,
     language: &str,
+    offset: usize,
     output: &crate::search::textsearch::StructuralOutput,
+    args: &Value,
 ) -> Value {
     let files: Vec<Value> = output
         .files
@@ -518,6 +538,36 @@ fn shape(
             "millis": output.stats.millis,
         },
     });
+    // A continuation is only useful when replaying it makes progress within
+    // the paging ceiling `parse_paging` enforces.
+    let next_offset = offset + output.returned;
+    let can_advance = output.has_more && next_offset > offset && next_offset <= MAX_LIMIT;
+    if can_advance {
+        let token = crate::cli::mcp::find_paging::issue("leindex_structural", args, next_offset);
+        value["next_offset"] = json!(next_offset);
+        if !token.is_empty() {
+            value["next"] = json!(token);
+        }
+    } else if output.has_more {
+        // `has_more` is kept (the result IS partial), but a token that cannot
+        // advance or would be rejected on replay is withheld, with the reason.
+        let note = if next_offset > MAX_LIMIT {
+            format!(
+                "Results are partial and the next page would start past the offset \
+                 ceiling of {MAX_LIMIT}; narrow the query (path/lang/include) rather than \
+                 paging deeper"
+            )
+        } else {
+            "Results are partial but this page advanced by nothing: the remaining \
+             candidates could not be read. Check file permissions or narrow the \
+             query (path/lang/include)"
+                .to_string()
+        };
+        value["note"] = json!(match value.get("note").and_then(Value::as_str) {
+            Some(existing) => format!("{existing}. {note}"),
+            None => note,
+        });
+    }
     if output.stats.files_capped > 0 {
         value["note"] = json!(format!(
             "{} file(s) held more matches than per_file_cap; those extra matches appear on no \
@@ -549,13 +599,91 @@ mod tests {
         };
         for capped in [0, 1] {
             output.stats.files_capped = capped;
-            let value = shape("fn $NAME() {}", "rust", &output);
+            let value = shape(
+                "fn $NAME() {}",
+                "rust",
+                0,
+                &output,
+                &json!({ "pattern": "fn $NAME() {}" }),
+            );
             assert_eq!(value["stopped_by_deadline"], true);
             assert_eq!(value["has_more"], true);
             let note = value["note"].as_str().unwrap();
             assert!(note.contains("results are partial"));
             assert_eq!(note.contains("per_file_cap"), capped > 0);
         }
+    }
+
+    /// A page that reaches the offset ceiling must not emit a continuation
+    /// that `parse_paging` rejects on replay: with 10,002 matches, offset
+    /// 10,000 and limit 1, the engine returns one hit and `has_more`, but the
+    /// next page would start at 10,001.
+    #[test]
+    fn test_shape_withholds_a_token_past_the_offset_ceiling() {
+        let output = crate::search::textsearch::StructuralOutput {
+            returned: 1,
+            has_more: true,
+            ..Default::default()
+        };
+        let value = shape(
+            "fn $NAME() {}",
+            "rust",
+            MAX_LIMIT,
+            &output,
+            &json!({ "pattern": "fn $NAME() {}" }),
+        );
+        assert_eq!(value["has_more"], true, "the result is still partial");
+        assert!(
+            value.get("next").is_none(),
+            "token issued past the ceiling: {value}"
+        );
+        assert!(value.get("next_offset").is_none(), "{value}");
+        let note = value["note"].as_str().unwrap();
+        assert!(note.contains("offset ceiling"), "{note}");
+        // A page whose next offset is exactly the ceiling still continues.
+        let value = shape(
+            "fn $NAME() {}",
+            "rust",
+            MAX_LIMIT - 1,
+            &output,
+            &json!({ "pattern": "fn $NAME() {}" }),
+        );
+        assert_eq!(value["next_offset"], MAX_LIMIT);
+        assert!(
+            value["next"].as_str().is_some_and(|t| !t.is_empty()),
+            "{value}"
+        );
+    }
+
+    /// If the only candidates were unreadable the engine reports
+    /// `has_more` with zero hits; the old token restored the same offset and
+    /// replayed the same response forever.
+    #[test]
+    fn test_shape_withholds_a_token_that_cannot_advance() {
+        let output = crate::search::textsearch::StructuralOutput {
+            returned: 0,
+            has_more: true,
+            stats: crate::search::textsearch::StructuralStats {
+                unreadable: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let value = shape(
+            "fn $NAME() {}",
+            "rust",
+            40,
+            &output,
+            &json!({ "pattern": "fn $NAME() {}" }),
+        );
+        assert_eq!(value["has_more"], true, "the partial-result signal is kept");
+        assert!(
+            value.get("next").is_none(),
+            "non-advancing token issued: {value}"
+        );
+        let note = value["note"].as_str().unwrap();
+        assert!(note.contains("advanced by nothing"), "{note}");
+        assert!(note.contains("permissions"), "{note}");
     }
 
     /// `per_file_cap` must not be a back door around the documented

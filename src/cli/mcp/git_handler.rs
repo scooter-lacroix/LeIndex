@@ -7,16 +7,23 @@
 //!
 //! ## Mutation policy (this is the security-relevant part)
 //!
-//! A mutating operation never runs. Issuing one returns a *plan*: whether the
-//! operation mutates, the exact argv that would run, what a read-only probe
-//! says about the current state, and a `preview_token` derived from
-//! `(repository, operation, argv)`.
+//! A mutating operation returns a *plan*: whether the operation mutates, the
+//! exact argv that would run, what a read-only probe says about the current
+//! state, what a bulk add would stage (post-exclusion), and a `preview_token`
+//! derived from `(repository, operation, argv, HEAD oid, index digest)`.
 //!
-//! The token is an IDENTITY, not an authorisation. There is no `confirm`
-//! argument and no apply side: an MCP surface should not commit, push or rewrite
-//! history until its executor has been reviewed on its own. Advertising a
-//! `confirm` that could only ever refuse was worse than advertising nothing —
-//! it made a permanent limitation look like a transient failure to retry.
+//! The plan is the review surface; the executor in [`super::git_apply`] is the
+//! apply side. A plan is applied by re-sending the call with its
+//! `preview_token`; `confirm: true` skips the plan round-trip for the safe
+//! subset only (`add`, `commit`, `push` without force). Destructive shapes are
+//! never reachable on `confirm` alone: force-push additionally needs
+//! `force: true` plus a `confirm_text` equal to the string the plan printed;
+//! `reset --hard`, `clean -fd` and branch delete need their explicit flags and
+//! are token-only (`plan_argv` refuses to build them without the flag, so plan
+//! and apply cannot disagree about what is destructive).
+//!
+//! The token binds argv AND repository state, so a plan reviewed against one
+//! state cannot be replayed against another (HEAD moved, index changed).
 //!
 //! ## Ref validation
 //!
@@ -106,62 +113,67 @@ const OPS: [Op; 17] = [
     },
     Op {
         name: "add",
-        summary: "PREVIEW ONLY: stage the given paths",
-        args: &["paths"],
+        summary: "Stage the given paths (apply via preview_token or confirm); bulk adds exclude secrets/runtime artefacts by default",
+        args: &["paths", "allow_sensitive"],
         mutating: true,
     },
     Op {
         name: "commit",
-        summary: "PREVIEW ONLY: commit the staged changes",
-        args: &["message"],
+        summary: "Commit (optionally exactly `paths`); returns <shorthash> <oneline> + files-changed",
+        args: &["message", "paths", "trailers"],
         mutating: true,
     },
     Op {
         name: "checkout",
-        summary: "PREVIEW ONLY: switch to a branch or commit",
+        summary: "Switch to a branch or commit (apply via preview_token)",
         args: &["target"],
         mutating: true,
     },
     Op {
         name: "stash",
-        summary: "PREVIEW ONLY: stash working-tree changes",
+        summary: "Stash working-tree changes (apply via preview_token)",
         args: &[],
         mutating: true,
     },
     Op {
         name: "tag",
-        summary: "PREVIEW ONLY: create a tag",
+        summary: "Create a tag (apply via preview_token)",
         args: &["target", "message"],
         mutating: true,
     },
     Op {
         name: "merge",
-        summary: "PREVIEW ONLY: merge a branch into the current one",
+        summary: "Merge a branch into the current one (apply via preview_token)",
         args: &["target"],
         mutating: true,
     },
     Op {
         name: "rebase",
-        summary: "PREVIEW ONLY: rebase the current branch onto a target",
+        summary: "Rebase the current branch onto a target (non-interactive; apply via preview_token)",
         args: &["target"],
         mutating: true,
     },
     Op {
         name: "push",
-        summary: "PREVIEW ONLY: push the current branch to its remote",
+        summary: "Push the current branch (confirm:true allowed); returns the remote ref range + ahead/behind",
         args: &[],
         mutating: true,
     },
     Op {
         name: "reset",
-        summary: "PREVIEW ONLY: move the current branch to a commit",
-        args: &["target"],
+        summary: "Move the current branch to a commit (--hard needs hard:true and a preview_token)",
+        // `clean` and `delete` are advertised in the schema and accepted by
+        // `plan_argv`, so the validator must know them too: without them here
+        // `argument_warnings` refused the very flags the operation needs, and
+        // the caller could never obtain the token (CodeRabbit round 10, id
+        // 4697090199).
+        args: &["target", "hard", "clean", "delete"],
         mutating: true,
     },
     Op {
         name: "force",
-        summary: "PREVIEW ONLY: force-push (requires a target ref)",
-        args: &["target"],
+        summary: "Force-push (needs force:true + confirm_text from the plan, plus its preview_token)",
+        args: &["target", "force", "confirm_text"],
         mutating: true,
     },
 ];
@@ -199,10 +211,13 @@ impl GitHandler {
 
     /// Tool description.
     pub fn description(&self) -> &str {
-        "Live Git: status, diff, log, show, blame, branch and remote (read); add, commit, \
-         checkout, stash, tag, merge, rebase, push, reset and force NEVER run — each returns a \
-         dry-run plan (argv + read-only probe) and a preview_token that identifies the plan. \
-         There is no confirm argument and no apply side."
+        "Live Git: status, diff, log, show, blame, branch and remote (read); mutations \
+         (add, commit, checkout, stash, tag, merge, rebase, push, reset, force) return a \
+         dry-run plan (argv + probe + a preview_token bound to argv/HEAD/index). Apply by \
+         re-sending the call with preview_token; confirm:true applies the safe subset \
+         (add, commit, push) directly. Force-push needs force:true + confirm_text; \
+         reset --hard / clean -fd / branch delete need hard:true / clean:true / delete:true \
+         and are token-only."
     }
 
     /// Argument schema: every git argument plus the `action` selector.
@@ -214,7 +229,7 @@ impl GitHandler {
                     "type": "string",
                     "enum": OPS.iter().map(|op| op.name).collect::<Vec<_>>(),
                     "description": format!(
-                        "Git operation. Mutating operations never apply: they return a plan. \
+                        "Git operation. Mutating operations return a plan; apply via preview_token or confirm:true (safe subset). \
                          Args per operation: {}",
                         OPS.iter().map(Op::usage).collect::<Vec<_>>().join(" | ")
                     ),
@@ -234,11 +249,54 @@ impl GitHandler {
                 "paths": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Project-relative paths to stage (add)"
+                    "description": "Project-relative paths: to stage (add) or to commit exactly (commit, pathspec commit; other staged files stay staged)"
                 },
                 "message": {
                     "type": "string",
                     "description": "Commit message (commit) or tag message (tag)"
+                },
+                "trailers": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Commit trailer lines, e.g. 'Co-Authored-By: Name <email>' (commit; passed as --trailer)"
+                },
+                "confirm": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Apply without a prior plan. Safe subset only: add, commit, push (without force). Everything else needs the plan's preview_token."
+                },
+                "preview_token": {
+                    "type": "string",
+                    "description": "The token from a mutation plan; binds the argv AND the repository state (HEAD, index), so a plan reviewed against one state cannot be applied against another."
+                },
+                "force": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "force branch: allow rewriting the remote (additionally requires confirm_text)"
+                },
+                "confirm_text": {
+                    "type": "string",
+                    "description": "force branch: must equal the string the plan printed, e.g. 'force-push origin/branch'"
+                },
+                "hard": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "reset branch: allow --hard (discards working tree; requires hard:true and a preview_token)"
+                },
+                "clean": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "reset branch: allow clean -fd (untracked removal; requires clean:true and a preview_token)"
+                },
+                "delete": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "reset branch (target -d <branch>): allow branch deletion (requires delete:true and a preview_token)"
+                },
+                "allow_sensitive": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "add branch: stage directory-discovered secrets/runtime artefacts instead of excluding them (explicit paths always stage, with a warning)"
                 },
                 "max_count": {
                     "type": "integer",
@@ -259,7 +317,7 @@ impl GitHandler {
                 "include_patch": {
                     "type": "boolean",
                     "default": false,
-                    "description": "Return the patch rather than a stat summary (show)"
+                    "description": "Include the full patch (show defaults to the commit's stat plus its message; set true for the patch text)"
                 },
                 "max_chars": {
                     "type": "integer",
@@ -299,7 +357,23 @@ impl GitHandler {
         let root = resolve_root(registry, &args).await?;
 
         if op.mutating {
-            return mutation_plan(op, &root, &args).await;
+            // Validate arguments BEFORE either branch (CodeRabbit round 10,
+            // id 4697090213). `argument_warnings` used to run only on the plan
+            // path, so a confirmed commit carrying `pths:["a.txt"]` ignored the
+            // typo and committed the ENTIRE index — the same key was refused on
+            // the plan path. The plan path re-runs this to collect the warnings
+            // it reports; the apply path runs it purely to refuse.
+            argument_warnings(op, &args)?;
+            return if args.get("preview_token").and_then(Value::as_str).is_some()
+                || args
+                    .get("confirm")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            {
+                crate::cli::mcp::git_apply::handle(op.name, &root, &args).await
+            } else {
+                mutation_plan(op, &root, &args).await
+            };
         }
 
         // `status` and `diff` are the pre-existing PDG-enriched handlers; the
@@ -331,7 +405,14 @@ impl GitHandler {
 
 /// Keys the router or transport legitimately adds, so an operation must accept
 /// them even when it does not read them.
-const SHARED_KEYS: [&str; 2] = ["project_path", "max_latency_ms"];
+///
+/// `_session` is injected by the transport on every `tools/call` that carries
+/// a session id and forwarded here untouched. Treating it as an unknown
+/// operation argument failed `log`, `show`, `blame`, `branch`, `remote` and
+/// every bare mutation plan for any session-scoped caller (CodeRabbit round
+/// 10, outside-diff comment at git_handler.rs:394-400). The transport owns it;
+/// it is accepted and never read.
+const SHARED_KEYS: [&str; 3] = ["project_path", "max_latency_ms", "_session"];
 
 /// Keys hoisted to the top level of the router's advertised schema from a
 /// sub-tool's schema, and therefore seen by every git operation.
@@ -355,6 +436,24 @@ fn any_op_reads(key: &str) -> bool {
     OPS.iter().any(|op| op.args.contains(&key))
 }
 
+/// Test-only seam: `commit_argv` is private to the handler.
+#[cfg(test)]
+pub(crate) fn commit_argv_for_test(root: &Path, args: &Value) -> Result<Vec<String>, JsonRpcError> {
+    commit_argv(root, args)
+}
+
+/// Test-only seam: the argument validator takes a parsed [`Op`], which is
+/// module-private, so the regression tests reach it by operation name.
+#[cfg(test)]
+pub(crate) fn argument_warnings_for_test(
+    op_name: &str,
+    args: &Value,
+) -> Result<Vec<String>, JsonRpcError> {
+    let op = Op::parse(op_name)
+        .ok_or_else(|| JsonRpcError::internal_error(format!("unknown op {op_name}")))?;
+    argument_warnings(op, args)
+}
+
 /// Refuse unknown keys, and name the known-but-ignored ones.
 ///
 /// Nothing used to look at unrecognized arguments: `{"max_chars": 10}` on
@@ -376,12 +475,33 @@ fn argument_warnings(op: &Op, args: &Value) -> Result<Vec<String>, JsonRpcError>
     // Transport/router keys are consumed by the server before the operation
     // ever runs, so they are never "ignored" — warning about them would train
     // the caller to ignore warnings.
+    // `preview_token` and `confirm` are the APPLY authorization fields: the
+    // plan path never sees them, but the apply path always does, so the
+    // validator — now run on both — must accept them or refuse every apply.
+    // A READ has no apply path, so there they really are ignored and the
+    // caller is told (Kilo round 11, id 4698809176): `confirm:true` on `log`
+    // used to be swallowed without a word.
+    const AUTHORIZATION_KEYS: [&str; 2] = ["preview_token", "confirm"];
     let is_transport = |key: &str| {
-        SHARED_KEYS.contains(&key) || ROUTER_KEYS.contains(&key) || SILENTLY_HONORED.contains(&key)
+        SHARED_KEYS.contains(&key)
+            || ROUTER_KEYS.contains(&key)
+            || SILENTLY_HONORED.contains(&key)
+            || (op.mutating && AUTHORIZATION_KEYS.contains(&key))
     };
     let mut warnings = Vec::new();
     for key in object.keys() {
         if op.args.contains(&key.as_str()) || is_transport(key) {
+            continue;
+        }
+        // Authorization keys on a READ are real keys the router knows — just
+        // not for this operation. They are reported, never refused: a
+        // session-scoped client that habitually sends `confirm` must not have
+        // its `log` call rejected over a field that is simply inert here.
+        if !op.mutating && AUTHORIZATION_KEYS.contains(&key.as_str()) {
+            warnings.push(format!(
+                "git {} ignores '{key}' (it has no apply step)",
+                op.name
+            ));
             continue;
         }
         if any_op_reads(key) {
@@ -416,7 +536,27 @@ fn with_warnings(mut payload: Value, warnings: &[String]) -> Value {
         return payload;
     }
     if let Some(object) = payload.as_object_mut() {
-        object.insert("warnings".to_string(), json!(warnings));
+        // MERGE with any warnings already attached (CodeRabbit round 10, id
+        // 4697090251). A bulk add that stopped at the walk limit carries an
+        // INCOMPLETE staging warning; a recognised-but-ignored argument adds
+        // another. Replacing dropped the first, so the plan looked complete
+        // while it omitted files.
+        match object.get_mut("warnings").and_then(Value::as_array_mut) {
+            // Deduplicated on insert (Kilo round 11, id 4698809186): the
+            // same key can be reported from more than one path, and a
+            // duplicated warning reads as two separate problems.
+            Some(existing) => {
+                for warning in warnings {
+                    let warning = Value::String(warning.clone());
+                    if !existing.contains(&warning) {
+                        existing.push(warning);
+                    }
+                }
+            }
+            None => {
+                object.insert("warnings".to_string(), json!(warnings));
+            }
+        }
     }
     payload
 }
@@ -459,7 +599,12 @@ async fn read_operation(op: &Op, root: &Path, args: &Value) -> Result<Value, Jso
     Ok(clip_payload(result?, max_chars))
 }
 
-/// `git log` as structured entries.
+/// `git log` as structured entries, each with a files-changed count (§4.5).
+///
+/// `--name-only` appends each commit's file list after its header line; the
+/// parser splits records on the header shape (40-hex oid + tab), so a file
+/// list can never be mistaken for a header and a header can never be a file
+/// line (subjects cannot contain the tab separator).
 fn git_log(root: &Path, args: &Value) -> Result<Value, JsonRpcError> {
     let count = extract_bounded_u64(args, "max_count", DEFAULT_COUNT, MAX_COUNT)?;
     let target = optional_rev(args)?;
@@ -470,6 +615,7 @@ fn git_log(root: &Path, args: &Value) -> Result<Value, JsonRpcError> {
         format!("--max-count={count}"),
         "--date=iso-strict".to_string(),
         "--format=%H%x09%ad%x09%an%x09%s".to_string(),
+        "--name-only".to_string(),
         target.unwrap_or_else(|| "HEAD".to_string()),
     ];
     if let Some(path) = path {
@@ -477,19 +623,43 @@ fn git_log(root: &Path, args: &Value) -> Result<Value, JsonRpcError> {
         argv.push(path);
     }
     let (text, truncated) = run_text(root, &argv)?;
-    let commits = text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            let mut fields = line.splitn(4, '\t');
-            json!({
-                "oid": fields.next().unwrap_or_default(),
-                "date": fields.next().unwrap_or_default(),
-                "author": fields.next().unwrap_or_default(),
-                "subject": fields.next().unwrap_or_default(),
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut commits: Vec<Value> = Vec::new();
+    let mut files = 0usize;
+    for line in text.lines() {
+        // ONE split serves both the probe and the record (Kilo round 11, id
+        // 4698809192): a commit header is
+        // `<oid>\t<date>\t<author>\t<subject>`, so a header always has a
+        // second field after the oid. `--name-only` emits bare file records,
+        // and a file whose name is exactly 40 hex characters is legal —
+        // matching on shape alone invented a phantom commit for it
+        // (CodeRabbit round 10, id 4697090225). Require the separator.
+        let mut fields = line.splitn(4, '\t');
+        let oid = fields.next().unwrap_or_default();
+        let date = fields.next();
+        // `is_oid` accepts 40 or 64 hex digits (CodeRabbit round 11, id
+        // 4698955173): a SHA-256 repository's commit ids are 64 long, and a
+        // 40-only test read every one of them as a FILENAME.
+        let is_header = date.is_some() && super::git_apply::is_oid(oid);
+        if is_header {
+            let author = fields.next().unwrap_or_default();
+            let subject = fields.next().unwrap_or_default();
+            if let Some(commit) = commits.last_mut() {
+                commit["files_changed"] = json!(files);
+            }
+            files = 0;
+            commits.push(json!({
+                "oid": oid,
+                "date": date.unwrap_or_default(),
+                "author": author,
+                "subject": subject,
+            }));
+        } else if !line.trim().is_empty() {
+            files += 1;
+        }
+    }
+    if let Some(commit) = commits.last_mut() {
+        commit["files_changed"] = json!(files);
+    }
     Ok(json!({
         "action": "log",
         "count": commits.len(),
@@ -498,26 +668,50 @@ fn git_log(root: &Path, args: &Value) -> Result<Value, JsonRpcError> {
     }))
 }
 
-/// `git show` for one commit: patch or stat.
+/// `git show` for one commit: compact by default (§4.5) — per-file stat plus
+/// a files-changed count — with the full patch only on `include_patch: true`.
 fn git_show(root: &Path, args: &Value) -> Result<Value, JsonRpcError> {
     let target = optional_rev(args)?.unwrap_or_else(|| "HEAD".to_string());
     let include_patch = args
         .get("include_patch")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let mut argv = vec!["show".to_string(), "--no-color".to_string()];
-    if !include_patch {
-        argv.push("--stat".to_string());
-    }
-    argv.push(target.clone());
-    let (text, truncated) = run_text(root, &argv)?;
-    Ok(json!({
+    // Resolve the target to ONE object id and use it for BOTH probes
+    // (CodeRabbit round 10, id 4697090236). Resolving `HEAD` separately per
+    // probe let HEAD advance between the stat and the patch, presenting the
+    // stat of commit A with the patch of commit B.
+    let resolved = super::git_apply::resolve_to_oid(root, &target)?;
+    let (stat, stat_truncated) = run_text(
+        root,
+        &[
+            "show".to_string(),
+            "--no-color".to_string(),
+            "--format=medium".to_string(),
+            "--stat".to_string(),
+            resolved.clone(),
+        ],
+    )?;
+    let mut payload = json!({
         "action": "show",
         "target": target,
         "include_patch": include_patch,
-        "text": text,
-        "truncated": truncated,
-    }))
+        "stat": stat,
+        "truncated": stat_truncated,
+    });
+    if include_patch {
+        let (patch, patch_truncated) = run_text(
+            root,
+            &[
+                "show".to_string(),
+                "--no-color".to_string(),
+                "--format=fuller".to_string(),
+                resolved.clone(),
+            ],
+        )?;
+        payload["patch"] = Value::String(patch);
+        payload["truncated"] = Value::Bool(stat_truncated || patch_truncated);
+    }
+    Ok(payload)
 }
 
 /// `git blame` for one file, bounded.
@@ -674,56 +868,83 @@ fn git_remote(root: &Path) -> Result<Value, JsonRpcError> {
 
 /// Guidance attached to every mutation plan.
 ///
-/// This used to tell the caller to re-send the call with `confirm`, which is
-/// precisely the path that always refuses (the apply side is not wired). A
-/// model following it hit an error and could read that error as a plumbing
-/// hiccup rather than "this never runs". It must never advertise `confirm`
-/// while confirming cannot work; `test_plan_next_never_advertises_confirm`
-/// pins that.
-const PLAN_NEXT_HINT: &str = "Nothing was changed. This build cannot apply git mutations: \
-     reviewing the plan and running the command yourself is the only way to perform it.";
+/// A plan without a token/confirm changes nothing; the hint says what to do
+/// next for each path. The `confirm` wording is deliberately included for the
+/// safe subset — that path now works — while destructive shapes are steered to
+/// the token plus their rails (`test_plan_hint_says_how_to_apply` pins it).
+const PLAN_NEXT_HINT: &str = "Nothing was changed. To apply: re-send this call with \
+     preview_token (add/commit/push may use confirm:true). Destructive shapes \
+     (force-push, reset --hard, clean -fd, branch delete) additionally need their \
+     explicit flags and are token-only.";
 
 /// Build the dry-run plan for a mutating operation.
 ///
-/// Nothing here spawns a mutating git command: [`plan_argv`] only *describes*
-/// the argv, and every probe it runs is read-only.
-///
-/// There is deliberately no `confirm` argument. It used to exist and could only
-/// ever refuse — the apply side is not wired — so it advertised a capability
-/// that did not exist and turned one guaranteed error into a second one. A
-/// schema that names an argument the server refuses is a lie; the argument is
-/// gone, and `preview_token` is documented as an identity hash rather than an
-/// authorisation.
+/// The plan is the review surface: the exact argv, what a bulk add would stage
+/// (post-exclusion, so the plan lists exactly what will be staged), a
+/// read-only probe, and the token the executor validates against the LIVE
+/// state. Nothing here spawns a mutating git command: [`plan_argv`] only
+/// *describes* the argv, and every probe it runs is read-only.
 async fn mutation_plan(op: &Op, root: &Path, args: &Value) -> Result<Value, JsonRpcError> {
-    let argv = plan_argv(op, root, args)?;
-    let token = preview_token(root, op.name, &argv);
+    let (argv, staging) = if op.name == "add" {
+        // Compute the staging outcome ONCE: the shared helper builds the argv
+        // from it AND it is the report the plan shows, so a second call could
+        // disagree with the argv the token binds. Run off the async worker:
+        // the ignore probe polls a child for up to ten seconds (CodeRabbit
+        // round 11, id 4698955145).
+        let outcome = super::git_apply::staging_outcome_async(root, args).await?;
+        (super::git_apply::add_argv(&outcome), Some(outcome))
+    } else {
+        (plan_argv(op, root, &args.clone())?, None)
+    };
+    // Issued through the SAME function the executor validates with: the plan's
+    // token must be the apply's token, or every token-only operation is
+    // unreachable (the plan reports a token the executor can never accept).
+    let token = super::git_apply::token_now(root, op.name, &argv)?;
     let warnings = argument_warnings(op, args)?;
-    let root = root.to_path_buf();
+    let root_buf = root.to_path_buf();
     let probe_args = args.clone();
     let op_name = op.name;
 
-    let probe = tokio::task::spawn_blocking(move || probe_state(op_name, &root, &probe_args))
+    let probe = tokio::task::spawn_blocking(move || probe_state(op_name, &root_buf, &probe_args))
         .await
         .map_err(|error| JsonRpcError::internal_error(format!("git task failed: {error}")))?;
 
-    Ok(with_warnings(
-        json!({
-            "action": op.name,
-            "mutating": true,
-            "applied": false,
-            "dry_run": true,
-            "argv": argv,
-            "preview_token": token,
-            "probe": probe,
-            "next": PLAN_NEXT_HINT,
-        }),
-        &warnings,
-    ))
+    let mut payload = json!({
+        "action": op.name,
+        "mutating": true,
+        "applied": false,
+        "dry_run": true,
+        "argv": argv,
+        "preview_token": token,
+        "probe": probe,
+        "next": PLAN_NEXT_HINT,
+    });
+    // The plan shows what an apply would attach, so the reviewer sees the
+    // exclusions and warnings before committing to anything.
+    if let Some(outcome) = staging {
+        payload["will_stage"] = json!(outcome.staged);
+        payload["excluded"] = json!(
+            outcome
+                .excluded
+                .iter()
+                .map(|(path, reason)| json!({ "path": path, "reason": reason }))
+                .collect::<Vec<_>>()
+        );
+        payload["warnings"] = json!(outcome.warnings);
+    }
+    Ok(with_warnings(payload, &warnings))
 }
 
 /// Validate the optional `target` argument once, before any op-specific work.
-fn plan_target(args: &Value) -> Result<Option<String>, JsonRpcError> {
+///
+/// `reset` may carry flag-shaped targets (`-d`, `-fd`, `-d <branch>`) whose
+/// rails live in [`plan_argv`]; those bypass the ref gate here and are
+/// accepted or refused there, so the destructive shapes stay in one place.
+fn plan_target(op: &Op, args: &Value) -> Result<Option<String>, JsonRpcError> {
     match args.get("target").and_then(Value::as_str) {
+        Some(target) if op.name == "reset" && target.starts_with('-') => {
+            Ok(Some(target.trim().to_string()))
+        }
         Some(target) => Ok(Some(super::git_ref::validate_ref_or_error(target)?)),
         None => Ok(None),
     }
@@ -743,6 +964,61 @@ fn require_target(
     })
 }
 
+/// The argv for a force-push to `target`.
+///
+/// `git push` takes `[<repository> [<refspec>...]]`, so a single
+/// `origin/main` argument is parsed as a REPOSITORY and git refuses it
+/// ("fatal: 'origin/main' is not a valid push target", verified on git
+/// 2.56.1). The `remote/branch` form the plan advertises is therefore split
+/// into the two arguments git wants, pushing the local HEAD to that branch.
+/// A bare remote name keeps git's own upstream resolution.
+///
+/// ## The lease carries the REVIEWED remote oid (id 4691119074)
+///
+/// `--force-with-lease` with no expected value is an IMPLICIT lease against
+/// the remote-tracking ref AS IT STANDS WHEN THE PUSH RUNS. A background
+/// `git fetch` between plan and apply advances that ref to someone else's
+/// commit, the lease is then satisfied by exactly that commit, and the push
+/// silently replaces their work — local HEAD and index never moved, so the
+/// token still matched. Reproduced against git 2.56.1:
+/// `+ 1a989c8...027b451 (forced update)`.
+///
+/// `lease` is the remote-tracking oid captured at plan time, so the command
+/// states the precondition instead of inferring it. A remote that has moved
+/// since then is rejected by git itself (`stale info`) even if a fetch
+/// updated the tracking ref; the same oid is also bound into the token
+/// (`git_apply::state_binding`), so plan and apply cannot disagree.
+///
+/// `lease` is `None` for a bare remote (git's upstream resolution names no
+/// branch to pin) — the lease then stays implicit for that shape only.
+pub(crate) fn force_push_argv(target: &str, lease: Option<&str>) -> Vec<String> {
+    let mut argv = vec!["push".to_string()];
+    match target.split_once('/') {
+        Some((remote, branch)) if !remote.is_empty() && !branch.is_empty() => {
+            match lease {
+                Some(oid) if oid.len() == 40 && oid.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                    argv.push(format!("--force-with-lease=refs/heads/{branch}:{oid}"));
+                }
+                // No oid to pin (unborn branch, or resolution failed): fall
+                // back to the implicit lease rather than skipping the guard
+                // entirely. The token still binds the (un)resolution.
+                _ => argv.push("--force-with-lease".to_string()),
+            }
+            argv.push(remote.to_string());
+            argv.push(format!("HEAD:refs/heads/{branch}"));
+        }
+        _ => {
+            // A bare remote keeps git's upstream resolution and names no
+            // branch to pin, but the force still needs its lease guard: a
+            // push with no `--force-with-lease` here would be an unguarded
+            // force (caught by the bare-remote shape test).
+            argv.push("--force-with-lease".to_string());
+            argv.push(target.to_string());
+        }
+    }
+    argv
+}
+
 /// `<subcommand> [flag] <target>` — the shape every single-target op shares.
 fn target_argv(subcommand: &str, flag: Option<&str>, target: String) -> Vec<String> {
     let mut argv = vec![subcommand.to_string()];
@@ -753,8 +1029,24 @@ fn target_argv(subcommand: &str, flag: Option<&str>, target: String) -> Vec<Stri
     argv
 }
 
-/// `commit --no-gpg-sign -m <message>`, rejecting an empty or oversized subject.
-fn commit_argv(args: &Value) -> Result<Vec<String>, JsonRpcError> {
+/// `commit --no-gpg-sign -m <message> [--trailer <line>]... [-- <paths>]`.
+///
+/// Commit `paths` uses git's native **pathspec commit** semantics rather than a
+/// temporary index — chosen deliberately:
+/// * `git commit -- <paths>` commits the updated working-tree contents of
+///   exactly those paths and *disregards contents staged for other paths*,
+///   which is the brief's "don't sweep other staged changes in" — guaranteed
+///   by git instead of simulated by us.
+/// * One atomic git invocation; no lockfile/index juggling that could leave a
+///   torn state if the process dies between the two steps.
+/// * Untracked files are NOT silently added by a pathspec commit — only `add`
+///   brings new files into the repository. The plan's probe reports which
+///   requested paths are untracked so the caller can stage them explicitly.
+///
+/// Trailers ride git's `--trailer` (one flag per line), so git validates and
+/// places them per its own rules. Trailer lines are single-line by contract;
+/// a newline would smuggle a second message paragraph past the caller.
+fn commit_argv(root: &Path, args: &Value) -> Result<Vec<String>, JsonRpcError> {
     let message = args
         .get("message")
         .and_then(Value::as_str)
@@ -766,12 +1058,64 @@ fn commit_argv(args: &Value) -> Result<Vec<String>, JsonRpcError> {
                 "Provide message: the commit subject and body".to_string(),
             )
         })?;
-    Ok(vec![
+    let mut argv = vec![
+        // A GLOBAL option (before the subcommand): `--` stops option parsing
+        // but NOT pathspec expansion, so a validated path whose name happens
+        // to be `*` would otherwise be treated as a wildcard and commit other
+        // modified tracked files the caller never named — contradicting this
+        // function's own contract (CodeRabbit round 8, id 4691119081).
+        "--literal-pathspecs".to_string(),
         "commit".to_string(),
         "--no-gpg-sign".to_string(),
         "-m".to_string(),
         message.to_string(),
-    ])
+    ];
+    if let Some(trailers) = args.get("trailers").and_then(Value::as_array) {
+        if trailers.len() > 20 {
+            return Err(JsonRpcError::invalid_params(
+                "at most 20 trailer lines are accepted".to_string(),
+            ));
+        }
+        for trailer in trailers {
+            let line = trailer.as_str().unwrap_or_default().trim();
+            if line.is_empty() {
+                return Err(JsonRpcError::invalid_params(
+                    "trailer lines must be non-empty, e.g. 'Co-Authored-By: Name <email>'"
+                        .to_string(),
+                ));
+            }
+            if line.contains('\n') || line.contains('\r') {
+                return Err(JsonRpcError::invalid_params(
+                    "each trailer must be a single line".to_string(),
+                ));
+            }
+            argv.push("--trailer".to_string());
+            argv.push(line.to_string());
+        }
+    }
+    if let Some(value) = args.get("paths") {
+        // A string (or any non-array) used to skip this block entirely, so the
+        // argv carried no `--`, `commits_whole_index` saw a whole-index commit,
+        // and ALL staged content was committed while the caller believed only
+        // `paths` was (CodeRabbit round 10, id 4697090265). `add` already
+        // refuses this shape; `commit` must too.
+        let paths = value.as_array().ok_or_else(|| {
+            JsonRpcError::invalid_params_with_suggestion(
+                "'paths' must be an array of project-relative files, or be omitted".to_string(),
+                "Pass paths:[\"a.txt\"] — a single string is not a path list".to_string(),
+            )
+        })?;
+        if paths.is_empty() {
+            return Err(JsonRpcError::invalid_params(
+                "'paths' must name at least one file, or be omitted".to_string(),
+            ));
+        }
+        // Same gate as `add`: project-relative, no escapes, no option shapes.
+        let validated = staged_paths(root, args)?;
+        argv.push("--".to_string());
+        argv.extend(validated);
+    }
+    Ok(argv)
 }
 
 /// `tag <name>`, annotated only when a non-blank message is supplied.
@@ -789,21 +1133,138 @@ fn tag_argv(args: &Value, name: String) -> Vec<String> {
     argv
 }
 
+/// The explicit `delete: true` gate for branch deletion.
+fn delete_flag(args: &Value) -> bool {
+    args.get("delete").and_then(Value::as_bool).unwrap_or(false)
+}
+
 /// Describe the argv a mutation would run, validating every argument first.
 ///
-/// This is the only place a mutation's command line is decided; the plan, the
-/// token and the (future) executor all consume this one definition.
+/// This is the single place a mutation's command line is decided, with one
+/// documented exception: `add` is built by
+/// [`super::git_apply::add_argv`] from a `StagingOutcome` the caller already
+/// has, because the stage list IS the reviewer-facing report and recomputing
+/// it here would let the plan and the payload disagree. Its arm below routes
+/// through that same helper, so the definition still has one owner.
+/// Crate callers go through [`plan_argv_for`]; [`Op`] stays module-private.
+/// The argv for `reset`/`clean`/branch-delete, with their rails.
+///
+/// The destructive shapes are only BUILDABLE when the explicit flag is set — an
+/// unset flag cannot produce a plan that the executor could then token-validate
+/// into running.
+fn reset_argv(args: &Value, target: String) -> Result<Vec<String>, JsonRpcError> {
+    let clean = args.get("clean").and_then(Value::as_bool).unwrap_or(false);
+    if clean {
+        // Only the DOCUMENTED targets are buildable (CodeRabbit round 11, id
+        // 4698955227). Any other flag-shaped target reached apply as well —
+        // `-n` made a dry run report `applied: true` having removed nothing,
+        // and `-x` would delete IGNORED files (a local `.env`, say) that
+        // neither documented form touches.
+        return match target.as_str() {
+            "-d" | "-fd" => Ok(vec![
+                "clean".to_string(),
+                target.to_string(),
+                "-f".to_string(),
+            ]),
+            other => Err(JsonRpcError::invalid_params_with_suggestion(
+                format!(
+                    "'{other}' is not a supported clean target: clean:true accepts \
+                     target '-d' or '-fd'"
+                ),
+                "Use target:'-fd' to remove untracked files and directories".to_string(),
+            )),
+        };
+    }
+    if target.starts_with('-') {
+        return delete_branch_argv(args, &target);
+    }
+    let hard = args.get("hard").and_then(Value::as_bool).unwrap_or(false);
+    let flag = if hard { "--hard" } else { "--mixed" };
+    Ok(target_argv("reset", Some(flag), target))
+}
+
+/// Branch deletion: `target: "-d <branch>"` plus `delete:true`.
+///
+/// The one legal flag-shaped reset target. Everything else flag-shaped is a
+/// refusal, and with `delete:true` the executor makes it token-only.
+fn delete_branch_argv(args: &Value, target: &str) -> Result<Vec<String>, JsonRpcError> {
+    let Some(branch) = target
+        .strip_prefix("-d ")
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+    else {
+        return Err(JsonRpcError::invalid_params_with_suggestion(
+            format!("'{target}' is not a revision"),
+            "reset takes a commit/branch; branch deletion is target:'-d <branch>' with delete:true"
+                .to_string(),
+        ));
+    };
+    if !delete_flag(args) {
+        return Err(JsonRpcError::invalid_params_with_suggestion(
+            format!("branch deletion refused: '{branch}' needs delete:true (and is token-only)"),
+            "Pass target:'-d <branch>' with delete:true; a preview_token from its plan applies it"
+                .to_string(),
+        ));
+    }
+    Ok(vec![
+        "branch".to_string(),
+        "-d".to_string(),
+        branch.to_string(),
+    ])
+}
+
+/// The argv for a force-push: `force:true`, a `confirm_text` copied verbatim from
+/// the plan, and a lease pinned to the reviewed remote oid.
+///
+/// The lease oid is resolved from the SAME refspec shape the final argv carries:
+/// build the argv once without a pin, read its `<remote>, <branch>` pair, then
+/// rebuild with the reviewed oid. Plan and apply both run this, so the token
+/// binds the oid the command actually carries (id 4691119074).
+fn force_argv(
+    root: &Path,
+    args: &Value,
+    branch_target: String,
+) -> Result<Vec<String>, JsonRpcError> {
+    let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+    if !force {
+        return Err(JsonRpcError::invalid_params_with_suggestion(
+            "force-push refused: set force:true to allow rewriting the remote".to_string(),
+            format!("Set force:true and confirm_text:\"force-push {branch_target}\""),
+        ));
+    }
+    let printed = format!("force-push {branch_target}");
+    let supplied = args
+        .get("confirm_text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if supplied != printed {
+        return Err(JsonRpcError::invalid_params_with_suggestion(
+            format!("confirm_text does not match the plan's confirmation string ('{supplied}')"),
+            format!("Copy it verbatim from the plan: confirm_text:\"{printed}\""),
+        ));
+    }
+    let bare = force_push_argv(&branch_target, None);
+    let lease = super::git_apply::force_lease_oid(root, &bare);
+    Ok(force_push_argv(&branch_target, lease.as_deref()))
+}
+
 fn plan_argv(op: &Op, root: &Path, args: &Value) -> Result<Vec<String>, JsonRpcError> {
-    let target = plan_target(args)?;
+    let target = plan_target(op, args)?;
     let required = |field: &str| require_target(&target, op.name, field);
 
+    // The planner is a pure argv builder, so it cannot await; on the `add`
+    // path it therefore reaches the synchronous staging helper directly.
+    // That is acceptable here — `mutation_plan` and `handle` already staged
+    // through `staging_outcome_async` before calling in, and the executor's
+    // own path is off the async worker — but a future caller must not treat
+    // this fn as a safe place to block.
     match op.name {
-        "add" => {
-            let mut argv = vec!["add".to_string(), "--".to_string()];
-            argv.extend(staged_paths(root, args)?);
-            Ok(argv)
-        }
-        "commit" => commit_argv(args),
+        // `add` is planned over the exact post-exclusion path list the
+        // guardrails produce, so the plan's staged list is the truth.
+        "add" => Ok(super::git_apply::add_argv(
+            &super::git_apply::staging_outcome(root, args)?,
+        )),
+        "commit" => commit_argv(root, args),
         "checkout" => Ok(target_argv(
             "checkout",
             Some("--no-guess"),
@@ -816,20 +1277,52 @@ fn plan_argv(op: &Op, root: &Path, args: &Value) -> Result<Vec<String>, JsonRpcE
         ]),
         "tag" => Ok(tag_argv(args, required("target")?)),
         "merge" => Ok(target_argv("merge", Some("--no-edit"), required("target")?)),
+        // Non-interactive only (brief §5): no editor, no interactive rebase.
+        // `git rebase` has NO `--no-edit` flag (git rejects it with exit
+        // 129 "unknown option"), and a non-`-i` rebase opens no editor
+        // anyway — the executor's `GIT_EDITOR=true` covers the todo-list
+        // case. The argv is deliberately bare: `git rebase <target>`.
         "rebase" => Ok(target_argv("rebase", None, required("target")?)),
         "push" => Ok(vec!["push".to_string(), "--porcelain".to_string()]),
-        "reset" => Ok(target_argv("reset", Some("--mixed"), required("target")?)),
+        "reset" => reset_argv(args, required("target")?),
         // `force` is a force-push; naming it in the plan makes the destructive
         // shape explicit instead of hiding it behind `push`.
-        "force" => Ok(target_argv(
-            "push",
-            Some("--force-with-lease"),
-            required("target")?,
-        )),
+        "force" => force_argv(root, args, required("target")?),
         other => Err(JsonRpcError::internal_error(format!(
             "git operation '{other}' has no plan"
         ))),
     }
+}
+
+/// Validate the arguments of a named operation — the executor's entry point,
+/// so a mutation refuses unrecognized keys whoever calls it.
+///
+/// The handler's `execute` already runs this before the plan/apply split
+/// (4697090213), but `git_apply::handle` is the mutation gate itself and
+/// must not depend on its caller's hygiene: reaching it directly with a
+/// typo'd `pths` key still committed the whole index. Exposed beside
+/// [`plan_argv_for`] for the same reason — the `Op` table stays here.
+pub(crate) fn argument_warnings_for(
+    op_name: &str,
+    args: &Value,
+) -> Result<Vec<String>, JsonRpcError> {
+    let op = Op::parse(op_name).ok_or_else(|| {
+        JsonRpcError::internal_error(format!("git operation '{op_name}' has no arguments"))
+    })?;
+    argument_warnings(op, args)
+}
+
+/// Resolve an action NAME to its plan argv — the executor's entry point, so
+/// the private [`Op`] table stays encapsulated in this module.
+pub(crate) fn plan_argv_for(
+    op_name: &str,
+    root: &Path,
+    args: &Value,
+) -> Result<Vec<String>, JsonRpcError> {
+    let op = Op::parse(op_name).ok_or_else(|| {
+        JsonRpcError::internal_error(format!("git operation '{op_name}' has no plan"))
+    })?;
+    plan_argv(op, root, args)
 }
 
 /// Read-only probe run alongside a plan, so the plan describes the real state.
@@ -941,15 +1434,25 @@ fn staged_paths(root: &Path, args: &Value) -> Result<Vec<String>, JsonRpcError> 
     Ok(validated)
 }
 
-/// Token that identifies exactly one `(repository, operation, argv)` triple.
+/// Preview token identifying exactly one `(repository, operation, argv, state)`
+/// tuple.
 ///
-/// An IDENTITY, not an authorisation: it lets a caller tell two plans apart and
-/// detect that the plan it reviewed is not the plan it would run. Nothing
-/// consumes it to permit an execution — there is no apply side.
-fn preview_token(root: &Path, op: &str, argv: &[String]) -> String {
-    blake3::hash(format!("{}\u{0}{op}\u{0}{}", root.display(), argv.join("\u{0}")).as_bytes())
-        .to_hex()
-        .to_string()
+/// `state` is the repository binding ([`super::git_apply::state_binding`]:
+/// HEAD oid + index digest). Both ends of the seam go through
+/// [`super::git_apply::token_now`] — the plan issues the token with it and the
+/// executor recomputes it — so a plan's token is always the one the executor
+/// accepts, and a moved HEAD or a changed index still invalidates it.
+pub(crate) fn preview_token(root: &Path, op: &str, argv: &[String], state: &str) -> String {
+    blake3::hash(
+        format!(
+            "{}\u{0}{op}\u{0}{}\u{0}{state}",
+            root.display(),
+            argv.join("\u{0}")
+        )
+        .as_bytes(),
+    )
+    .to_hex()
+    .to_string()
 }
 
 /// Run a read-only git command and return its text.
@@ -1060,325 +1563,5 @@ fn extract_bounded_usize(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_every_op_is_selectable_and_documented() {
-        for op in &OPS {
-            assert!(!op.summary.is_empty(), "{} has no summary", op.name);
-            assert!(Op::parse(op.name).is_some(), "{} does not parse", op.name);
-        }
-        assert!(Op::parse("nope").is_none());
-    }
-
-    #[test]
-    fn test_mutations_are_marked_mutating_and_reads_are_not() {
-        for op in &OPS {
-            let expected = !matches!(
-                op.name,
-                "status" | "diff" | "log" | "show" | "blame" | "branch" | "remote"
-            );
-            assert_eq!(op.mutating, expected, "{} mutation flag", op.name);
-        }
-    }
-
-    /// The whole mutation policy in one assertion: with no `confirm`, a
-    /// mutating op returns a plan and does not run.
-    #[test]
-    fn test_mutation_default_is_a_plan_not_an_execution() {
-        let root = Path::new("/tmp/project");
-        let op = Op::parse("commit").unwrap();
-        let argv = plan_argv(op, root, &json!({ "message": "hi" })).unwrap();
-        assert_eq!(argv, ["commit", "--no-gpg-sign", "-m", "hi"]);
-        let token = preview_token(root, op.name, &argv);
-        assert!(!token.is_empty());
-        // A different message must not share the token.
-        let other = plan_argv(op, root, &json!({ "message": "bye" })).unwrap();
-        assert_ne!(token, preview_token(root, op.name, &other));
-    }
-
-    #[test]
-    fn test_plan_next_never_advertises_confirm() {
-        // The plan's `next` field is the instruction a caller actually follows.
-        // It used to say "re-send this call with `confirm`" — which is exactly
-        // the path that always refuses, because the apply side is not wired.
-        // That sent models into a guaranteed error and made a permanent
-        // limitation look like a transient hiccup. While confirming cannot
-        // succeed, the hint must not mention it, and must say nothing changed.
-        assert!(
-            !PLAN_NEXT_HINT.contains("confirm"),
-            "the plan hint must not advertise a path that always refuses: {PLAN_NEXT_HINT}"
-        );
-        assert!(
-            PLAN_NEXT_HINT.contains("Nothing was changed"),
-            "the hint must state that no state changed: {PLAN_NEXT_HINT}"
-        );
-    }
-
-    #[test]
-    fn test_mutation_requiring_a_target_refuses_to_default() {
-        let root = Path::new("/tmp/project");
-        for name in ["checkout", "merge", "rebase", "reset", "force", "tag"] {
-            let op = Op::parse(name).unwrap();
-            let error = plan_argv(op, root, &json!({})).unwrap_err();
-            assert!(
-                error.message_with_hint().contains("requires 'target'"),
-                "{name}: {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_revisions_cannot_smuggle_options_or_paths() {
-        for bad in ["-u", "--upload-pack=x", "HEAD:../../etc/passwd", "", "a b"] {
-            assert!(
-                super::super::git_ref::validate_ref(bad).is_err(),
-                "{bad} must be rejected"
-            );
-        }
-        for good in [
-            "HEAD",
-            "main",
-            "origin/main",
-            "v1.2.3",
-            "HEAD~3",
-            "a1b2c3d^",
-            "cw32/30b-admission",
-        ] {
-            assert!(
-                super::super::git_ref::validate_ref(good).is_ok(),
-                "{good} must be accepted"
-            );
-        }
-    }
-
-    /// The plan validates its revision; the probe must use the SAME gate rather
-    /// than rebuilding argv from the caller's raw string.
-    ///
-    /// This asserts on `probe_rev_argv` directly. An earlier version asserted on
-    /// `probe_state` against a nonexistent repository and passed even with the
-    /// guard removed — git failed for an unrelated reason — so it proved
-    /// nothing.
-    #[test]
-    fn test_probe_validates_the_revision_before_building_argv() {
-        let error = probe_rev_argv("-u").expect_err("a leading '-' must be rejected");
-        assert!(
-            error.message_with_hint().contains("not valid ref syntax"),
-            "{error}"
-        );
-        assert!(
-            probe_rev_argv("HEAD:../../etc/passwd").is_err(),
-            "rev:path syntax must be rejected"
-        );
-        assert_eq!(
-            probe_rev_argv("HEAD").unwrap(),
-            ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]
-        );
-    }
-
-    /// The schema must not name an argument the server cannot honour.
-    ///
-    /// `confirm` was advertised while its only possible outcome was a refusal,
-    /// so a model that followed the schema hit a guaranteed error.
-    #[test]
-    fn test_schema_does_not_advertise_confirm() {
-        let schema = GitHandler.argument_schema();
-        let properties = schema["properties"].as_object().expect("properties");
-        assert!(
-            !properties.contains_key("confirm"),
-            "confirm is not implemented and must not be advertised: {properties:?}"
-        );
-        assert_eq!(schema["required"].as_array().map(Vec::len), Some(0));
-    }
-
-    /// Unknown keys are refused; known-but-ignored ones are reported.
-    ///
-    /// Nothing used to look at unrecognized arguments, so a typo and a bound
-    /// that applied were indistinguishable.
-    #[test]
-    fn test_argument_hygiene_refuses_unknown_and_warns_on_ignored() {
-        let branch = Op::parse("branch").unwrap();
-        // A typo must not be silently dropped.
-        let error = argument_warnings(branch, &json!({ "max_cnt": 5 })).unwrap_err();
-        assert!(error.message_with_hint().contains("max_cnt"), "{error}");
-        assert!(
-            error.message_with_hint().contains("name_prefix"),
-            "the hint must list what branch accepts: {error}"
-        );
-
-        // A key another operation reads is reported, not obeyed silently.
-        let warnings = argument_warnings(branch, &json!({ "target": "HEAD" })).unwrap();
-        assert_eq!(warnings, vec!["git branch ignores 'target'".to_string()]);
-
-        // Router/transport keys are legitimate and produce nothing.
-        assert!(
-            argument_warnings(
-                branch,
-                &json!({ "project_path": "/x", "max_latency_ms": 5, "token_budget": 10 })
-            )
-            .unwrap()
-            .is_empty()
-        );
-        // `max_chars` truncates every response, so it is honored everywhere.
-        assert!(
-            argument_warnings(Op::parse("show").unwrap(), &json!({ "max_chars": 10 }))
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn test_bounds_are_clamped() {
-        assert_eq!(
-            extract_bounded_u64(&json!({ "max_count": 10_000 }), "max_count", 20, MAX_COUNT)
-                .unwrap(),
-            MAX_COUNT
-        );
-        assert_eq!(
-            extract_bounded_usize(&json!({}), "max_chars", DEFAULT_MAX_CHARS, MAX_MAX_CHARS)
-                .unwrap(),
-            DEFAULT_MAX_CHARS
-        );
-        assert!(
-            extract_bounded_u64(&json!({ "max_count": "x" }), "max_count", 20, MAX_COUNT).is_err()
-        );
-    }
-
-    #[test]
-    fn test_remote_parsing_tolerates_an_empty_repository() {
-        // A repo with no remotes prints nothing; that is an answer, not a failure.
-        let parsed = "".lines().filter(|line| !line.trim().is_empty()).count();
-        assert_eq!(parsed, 0);
-    }
-
-    /// Helper: a scratch repository with one commit on branch `master`.
-    fn scratch_repo() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        let git = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir.path())
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@t")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@t")
-                .status()
-                .expect("git available");
-            assert!(status.success(), "git {args:?}");
-        };
-        git(&["init", "-q", "-b", "master"]);
-        std::fs::write(dir.path().join("f.txt"), "a\nb\n").unwrap();
-        git(&["add", "."]);
-        git(&["commit", "-q", "-m", "one"]);
-        dir
-    }
-
-    /// Regression: blame passed `--no-color`, which git-blame reads as an
-    /// ambiguous option prefix and rejects with exit 129 — so every blame call
-    /// failed. Color is now suppressed with `-c color.ui=false`.
-    ///
-    /// Both shapes are exercised: with a `target` (argv carries the rev before
-    /// `--`) and without (no rev at all).
-    #[test]
-    fn test_blame_works_with_and_without_a_target() {
-        let repo = scratch_repo();
-        for args in [
-            json!({ "path": "f.txt" }),
-            json!({ "path": "f.txt", "target": "HEAD" }),
-        ] {
-            let value =
-                git_blame(repo.path(), &args).unwrap_or_else(|error| panic!("{args}: {error}"));
-            assert_eq!(value["line_count"], 2, "{args}: {value}");
-            // Each blamed line carries the abbreviated commit oid and the
-            // blamed source text. `git blame` prints no commit SUBJECT, so
-            // asserting on one tests a feature blame does not have. A boundary
-            // commit (the root, which every line here is) is prefixed with
-            // `^`, so that marker is part of valid output.
-            let text = value["text"].as_str().unwrap_or_default();
-            for line in text.lines() {
-                let oid = line
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or_default()
-                    .trim_start_matches('^');
-                assert!(
-                    oid.len() >= 7 && oid.chars().all(|c| c.is_ascii_hexdigit()),
-                    "each line must name its last-touching commit: {line}"
-                );
-            }
-            assert!(text.contains(") a"), "line 1 content missing: {value}");
-            assert!(text.contains(") b"), "line 2 content missing: {value}");
-            // The reported target defaults to HEAD when none was supplied.
-            assert_eq!(value["target"], "HEAD");
-        }
-    }
-
-    /// Regression: `branch` returned every entry it found, ignoring `max_count`,
-    /// with a `truncated` flag that only tracked the byte cap — so a capped list
-    /// looked complete.
-    #[test]
-    fn test_branch_honours_max_count_and_reports_the_dropped_tail() {
-        let repo = scratch_repo();
-        for name in ["cw32/30b-admission", "cw32/31c-other", "feature/x"] {
-            let status = std::process::Command::new("git")
-                .args(["branch", name])
-                .current_dir(repo.path())
-                .status()
-                .unwrap();
-            assert!(status.success());
-        }
-
-        let value = git_branch(repo.path(), &json!({ "max_count": 2 })).unwrap();
-        assert_eq!(value["count"], 2, "{value}");
-        assert_eq!(value["total"], 4, "master + three branches: {value}");
-        assert_eq!(value["truncated"], true);
-        assert_eq!(
-            value["branches"].as_array().map(Vec::len),
-            Some(2),
-            "max_count is a real bound: {value}"
-        );
-
-        // A generous bound is not truncated.
-        let full = git_branch(repo.path(), &json!({ "max_count": 20 })).unwrap();
-        assert_eq!(full["total"], 4);
-        assert_eq!(full["truncated"], false);
-
-        // The prefix filter is a prefix, not a substring.
-        let filtered = git_branch(
-            repo.path(),
-            &json!({ "name_prefix": "cw32/", "max_count": 20 }),
-        )
-        .unwrap();
-        let names: Vec<&str> = filtered["branches"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|branch| branch["name"].as_str())
-            .collect();
-        assert_eq!(names.len(), 2, "{filtered}");
-        assert!(names.iter().all(|name| name.starts_with("cw32/")));
-        assert_eq!(filtered["total"], 2);
-
-        let substring = git_branch(
-            repo.path(),
-            &json!({ "name_prefix": "30b", "max_count": 20 }),
-        )
-        .unwrap();
-        assert_eq!(
-            substring["count"], 0,
-            "'30b' is not a prefix of cw32/30b-admission: {substring}"
-        );
-
-        // Local-only is the default; `local_only: false` adds remote-tracking
-        // refs, so the default must NOT be `--all`.
-        let local = git_branch(repo.path(), &json!({ "max_count": 20 })).unwrap();
-        assert_eq!(local["local_only"], true);
-        assert!(local["branches"].as_array().unwrap().iter().all(|branch| {
-            !branch["name"]
-                .as_str()
-                .unwrap_or_default()
-                .starts_with("remotes/")
-        }));
-    }
-}
+#[path = "git_handler_test.rs"]
+mod tests;

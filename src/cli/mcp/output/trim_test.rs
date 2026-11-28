@@ -77,6 +77,85 @@ fn test_trim_symbol_lookup_keeps_actual_fields() {
     assert!(t.get("signature").is_none());
 }
 
+/// The handler PAGES the caller list and reports the continuation through
+/// `callers_total` / `callers_next_offset` / `callers_truncated`. The L1 trim
+/// dropped all three, so a budget-limited response looked complete and the
+/// `caller_offset` argument was unreachable from the answer that documented it.
+#[test]
+fn test_trim_symbol_lookup_keeps_caller_continuation_metadata() {
+    let input = v(r#"{
+            "symbol": "hub",
+            "type": "function",
+            "file": "src/hub.rs",
+            "callers": [{"name": "a"}, {"name": "b"}],
+            "callers_total": 9,
+            "callers_next_offset": 2,
+            "callers_truncated": true,
+            "callees": [],
+            "callees_truncated": false,
+            "impact_radius": {"affected_symbols": 9, "affected_files": 4}
+        }"#);
+    let t = trim_symbol_lookup(&input);
+    assert_eq!(
+        t["callers_total"], 9,
+        "the overflow total must survive: {t}"
+    );
+    assert_eq!(
+        t["callers_next_offset"], 2,
+        "the next-page offset must survive so `caller_offset` is reachable: {t}"
+    );
+    assert_eq!(t["callers_truncated"], true);
+    assert_eq!(t["callees_truncated"], false);
+}
+
+/// The §6.3 usage bodies and the §6.4 tests body REPLACE the relations body,
+/// so the L1 trim must carry them or the default tier answers with metadata
+/// only. Red-verified: removing the alternate keys from the allowlist makes
+/// every assertion below fail.
+#[test]
+fn test_trim_symbol_lookup_keeps_the_alternate_usage_and_tests_bodies() {
+    let construct = v(r#"{
+            "symbol": "Shade",
+            "file": "src/shade.rs",
+            "kind": "construct",
+            "sites": [{"file": "src/a.rs", "line": 7, "site_line": "Shade { }", "form": "struct literal"}],
+            "sites_total": 1,
+            "sites_truncated": false,
+            "languages_covered": ["rust"],
+            "files_scanned": 3,
+            "language_coverage": "rust, python",
+            "index_freshness": "fresh"
+        }"#);
+    let t = trim_symbol_lookup(&construct);
+    assert_eq!(t["kind"], "construct");
+    assert_eq!(t["sites"][0]["line"], 7, "usage sites must survive: {t}");
+    assert_eq!(t["sites_total"], 1);
+    assert_eq!(t["sites_truncated"], false);
+    assert_eq!(t["files_scanned"], 3);
+    assert_eq!(t["languages_covered"][0], "rust");
+    assert!(
+        t["language_coverage"].as_str().is_some(),
+        "coverage note must survive: {t}"
+    );
+
+    let tests = v(r#"{
+            "symbol": "helper",
+            "file": "src/lib.rs",
+            "kind": "tests",
+            "tests": [{"name": "test_helper", "file": "tests/h_test.rs", "type": "test", "call_depth": 1, "evidence": "direct call", "command": "cargo test --test h_test test_helper"}],
+            "tests_total": 1,
+            "tests_truncated": false
+        }"#);
+    let t = trim_symbol_lookup(&tests);
+    assert_eq!(t["kind"], "tests");
+    assert_eq!(
+        t["tests"][0]["command"], "cargo test --test h_test test_helper",
+        "the executable command must survive: {t}"
+    );
+    assert_eq!(t["tests_total"], 1);
+    assert_eq!(t["tests_truncated"], false);
+}
+
 #[test]
 fn test_trim_symbol_lookup_keeps_degradation_fields() {
     // N-15: the honest-degradation fields must survive trimming so the LLM
@@ -195,6 +274,7 @@ fn test_trim_edit_keeps_structured_diff() {
             "affected_symbols": ["main"],
             "affected_files": ["src/foo.rs"],
             "breaking_changes": [],
+            "risk": {"level": "high", "reason": "pub signature changed"},
             "risk_level": "low",
             "change_count": 1,
             "validation": {"x": 1}
@@ -202,13 +282,17 @@ fn test_trim_edit_keeps_structured_diff() {
     let t = trim_edit(&input);
     assert_eq!(t["preview_token"], "tok");
     assert!(t["diff"].is_object());
-    assert_eq!(t["risk_level"], "low");
-    assert_eq!(t["change_count"], 1);
+    // §3.6: the real-signal risk object survives; the legacy no-info
+    // scalars (`risk_level`, `change_count`) are dropped.
+    assert_eq!(t["risk"]["level"], "high");
+    assert!(t.get("risk_level").is_none());
+    assert!(t.get("change_count").is_none());
     assert_eq!(t["affected_symbols"][0], "main");
     // diff_text is now preserved so the LLM can see the unified diff
     assert!(t.get("diff_text").is_some());
-    // validation subtree is dropped (internal detail)
-    assert!(t.get("validation").is_none());
+    // §3.6: the validation artifact survives trimming (lane E — the model
+    // needs it to judge whether the edit is safe to apply).
+    assert_eq!(t["validation"]["x"], 1);
 }
 
 #[test]
@@ -389,7 +473,9 @@ fn test_trim_llm_payload_dispatches() {
     let out = trim_llm_payload("leindex.edit_preview", &edit_data);
     assert!(out.get("diff").is_some());
     assert!(out.get("diff_text").is_some());
-    assert!(out.get("validation").is_none());
+    // §3.6: the validation artifact survives trimming — the model needs it
+    // to judge whether the previewed edit is safe to apply.
+    assert_eq!(out["validation"], serde_json::json!({}));
 
     // Unknown tool passes through unchanged
     let raw = v(r#"{"any": "value", "x": 1}"#);
@@ -1201,4 +1287,93 @@ fn test_trim_git_status_preserves_the_pdg_status_the_handlers_emit() {
     let t = trim_git_status(&failed);
     assert_eq!(t["pdg_status"], "failed");
     assert_eq!(t["pdg_error"], "no nodes");
+}
+
+/// Regression (lane E): `trim_edit` must keep the validation artifact —
+/// `validation` plus the syntax/check surfaces — so the LLM can judge
+/// whether a previewed edit is safe before applying it.
+#[test]
+fn test_trim_edit_keeps_validation_artifact() {
+    let input = v(r#"{
+            "preview_token": "tok1",
+            "diff": {"file_path": "src/foo.rs"},
+            "validation": {
+                "is_valid": false,
+                "syntax_errors": [{"line": 3, "message": "expected `;`"}]
+            },
+            "syntax": "ok",
+            "check": "passed"
+        }"#);
+    let t = trim_edit(&input);
+    assert_eq!(t["validation"]["is_valid"], false);
+    assert_eq!(
+        t["validation"]["syntax_errors"][0]["message"],
+        "expected `;`"
+    );
+    assert_eq!(t["syntax"], "ok");
+    assert_eq!(t["check"], "passed");
+}
+
+/// Codex round 7 (id 4690978440): the read overlay attaches the scoped
+/// check's findings as `diagnostics`, but `trim_read_file` built a fresh
+/// object from an allowlist that did not include it. The MCP L1 transport
+/// trims BEFORE rendering, so `render_read_diagnostics` never saw a
+/// diagnostic and the overlay disappeared on every normal read.
+#[test]
+fn test_trim_read_file_keeps_the_diagnostics_overlay() {
+    let input = serde_json::json!({
+        "file_path": "src/lib.rs",
+        "start_line": 1,
+        "end_line": 2,
+        "content": "fn f() {}\n",
+        "handle": "src/lib.rs",
+        "diagnostics": [
+            { "file": "src/lib.rs", "line": 1, "severity": "error", "code": "E0308", "message": "mismatched types" }
+        ]
+    });
+    let trimmed = trim_read_file(&input);
+    let diagnostics = trimmed
+        .get("diagnostics")
+        .and_then(|v| v.as_array())
+        .expect("the overlay must survive trimming");
+    assert_eq!(diagnostics.len(), 1, "{trimmed}");
+    assert_eq!(diagnostics[0]["code"], "E0308");
+    // Still absent when the handler attached none — never an empty array.
+    let plain = serde_json::json!({ "file_path": "a.rs", "content": "x" });
+    assert!(trim_read_file(&plain).get("diagnostics").is_none());
+}
+
+/// Codex round 7 (id 4690978440): the finding asked for the check-to-read flow through the
+/// TRANSPORT, not just the raw handler response. The MCP L1 path is `trim_llm_payload` ->
+/// `render_tool_output_plain`; this test closes the chain so a diagnostic attached to a read
+/// reaches the text the LLM sees.
+#[test]
+fn test_read_diagnostics_overlay_survives_the_l1_transport_chain() {
+    let raw = serde_json::json!({
+        "file_path": "/p/src/lib.rs",
+        "start_line": 1,
+        "end_line": 5,
+        "language": "rust",
+        "content": "1 fn a() {}\n2 fn b() {}\n",
+        "diagnostics": [
+            { "file": "/p/src/lib.rs", "line": 2, "severity": "error", "code": "E0308", "message": "mismatched types" }
+        ]
+    });
+    let trimmed = trim_llm_payload("leindex_read_file", &raw);
+    assert!(
+        trimmed
+            .get("diagnostics")
+            .and_then(|v| v.as_array())
+            .is_some(),
+        "trim must keep the overlay: {trimmed}"
+    );
+    let rendered = crate::cli::mcp::output::render_tool_output_plain(
+        "leindex_read_file",
+        &trimmed,
+        &serde_json::Value::Null,
+    );
+    assert!(
+        rendered.contains("/p/src/lib.rs:2 error E0308 mismatched types"),
+        "the overlay must reach the rendered payload: {rendered}"
+    );
 }

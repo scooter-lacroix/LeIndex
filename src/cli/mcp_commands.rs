@@ -1078,9 +1078,11 @@ async fn handle_mcp_request(
             handle_prompt_get(&request),
         ))),
         "resources/list" => Ok(Some(JsonRpcResponse::success(id, list_resources_json()))),
+        // stdio is single-client: no per-connection session id exists, so the
+        // ledger resource renders the process-default view.
         "resources/read" => Ok(Some(JsonRpcResponse::from_result(
             id,
-            handle_resource_read(&request),
+            handle_resource_read(&request, None),
         ))),
         _ => Ok(Some(JsonRpcResponse::error(
             id,

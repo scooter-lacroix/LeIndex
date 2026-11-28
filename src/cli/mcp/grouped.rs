@@ -11,9 +11,10 @@
 //   leindex_analyze  (mode)    deep | impact | diagnostics | phase
 //   leindex_edit     (action)  apply | preview | rename | write        (action REQUIRED)
 //   leindex_manage   (action)  index | state | projects | evict | lease | cleanup
+//                              | run | how_to_test
 //   leindex_git      (action)  status | diff | log | show | blame | branch | remote
 //                              | add | commit | checkout | stash | tag | merge
-//                              | rebase | push | reset | force   (mutations preview-only)
+//                              | rebase | push | reset | force   (mutations: plan -> apply)
 //
 // `leindex_edit` has no default on purpose: an ambiguous call must fail rather
 // than guess at a mutation. The other routers default to their most common
@@ -228,7 +229,7 @@ pub static GROUPS: [GroupSpec; 5] = [
     GroupSpec {
         name: "leindex_manage",
         title: "LeIndex [Manage]",
-        description: "Index lifecycle and state. action: index (build/refresh, pollable — default), state (usable? generation, phase, freshness), projects, evict, lease, cleanup (retention, dry-run).",
+        description: "Index lifecycle, state, commands. action: index (default, pollable), state (usable? generation/freshness), projects, evict, lease, cleanup (retention, dry-run), run (sandboxed build/test: summary + log handle), how_to_test (gate command for a path).",
         discriminator: "action",
         default_branch: Some("index"),
         branches: &[
@@ -268,12 +269,24 @@ pub static GROUPS: [GroupSpec; 5] = [
                 &["retention", "prune"],
                 "Retention report for the generation store (dry_run by default)",
             ),
+            branch(
+                "run",
+                "leindex_manage",
+                &["exec"],
+                "Sandboxed cargo/npm/pytest/go/make/just/script run: ~300-char summary + log://handle; log=, check=, diagnostics= modes",
+            ),
+            branch(
+                "how_to_test",
+                "leindex_manage",
+                &["howtotest", "test_command"],
+                "The gate command for a path (workspace member, docs, scripts)",
+            ),
         ],
     },
     GroupSpec {
         name: "leindex_git",
         title: "LeIndex [Git]",
-        description: "Live Git. action: status (default), diff, log, show, blame, branch, remote (read); add, commit, checkout, stash, tag, merge, rebase, push, reset, force (PREVIEW ONLY — each returns a dry-run plan and a preview_token).",
+        description: "Live Git. action: status (default), diff, log, show, blame, branch, remote (read); add, commit, checkout, stash, tag, merge, rebase, push, reset, force (mutations: bare call → plan + preview_token; re-send to apply; confirm:true for add/commit/push).",
         discriminator: "action",
         default_branch: Some("status"),
         branches: &[
@@ -314,63 +327,69 @@ pub static GROUPS: [GroupSpec; 5] = [
                 &[],
                 "Configured remotes and their URLs",
             ),
-            // Mutations: never fire from a default argument set. Each returns
-            // a dry-run plan plus a preview_token that identifies the plan.
-            // There is no `confirm` argument and no apply side.
+            // Mutations: never fire from a default argument set. A bare call
+            // returns a dry-run plan plus a preview_token bound to argv/HEAD/
+            // index; the executor (git_apply) applies it on the token path,
+            // and confirm:true covers the safe subset (add, commit, push).
             branch(
                 "add",
                 "leindex_git",
                 &["stage"],
-                "PREVIEW ONLY: stage the given paths",
+                "Stage paths (plan + preview_token, or confirm:true); bulk adds exclude secrets/runtime artefacts by default",
             ),
             branch(
                 "commit",
                 "leindex_git",
                 &[],
-                "PREVIEW ONLY: commit the staged changes",
+                "Commit staged changes or exactly `paths` (confirm:true allowed); returns <shorthash> <oneline> + files-changed",
             ),
             branch(
                 "checkout",
                 "leindex_git",
                 &["switch"],
-                "PREVIEW ONLY: switch to a branch or commit",
+                "Switch to a branch or commit (apply via preview_token)",
             ),
             branch(
                 "stash",
                 "leindex_git",
                 &[],
-                "PREVIEW ONLY: stash working-tree changes",
+                "Stash working-tree changes (apply via preview_token)",
             ),
-            branch("tag", "leindex_git", &[], "PREVIEW ONLY: create a tag"),
+            branch(
+                "tag",
+                "leindex_git",
+                &[],
+                "Create a tag (apply via preview_token)",
+            ),
             branch(
                 "merge",
                 "leindex_git",
                 &[],
-                "PREVIEW ONLY: merge a branch into the current one",
+                "Merge a branch into the current one (apply via preview_token)",
             ),
             branch(
                 "rebase",
                 "leindex_git",
                 &[],
-                "PREVIEW ONLY: rebase onto a target",
+                "Rebase onto a target, non-interactive (apply via preview_token)",
             ),
             branch(
                 "push",
                 "leindex_git",
                 &[],
-                "PREVIEW ONLY: push the current branch to its remote",
+                "Push the current branch (confirm:true allowed); returns the remote ref range + ahead/behind",
             ),
             branch(
                 "reset",
                 "leindex_git",
                 &[],
-                "PREVIEW ONLY: move the current branch to a commit",
+                "Move the current branch to a commit (--hard needs hard:true + preview_token)",
             ),
             branch(
                 "force",
                 "leindex_git",
                 &["force_push"],
-                "PREVIEW ONLY: force-push (requires a target ref)",
+                "Force-push (needs force:true + confirm_text from the plan, plus its preview_token)",
             ),
         ],
     },
@@ -754,10 +773,14 @@ fn tier_property() -> Value {
     })
 }
 
+/// Minimal description for the per-turn `tools/list` context: the value
+/// itself is obvious from the name, and every other router repeats it. The
+/// non-obvious part (indexing is NOT automatic) lives in the guide resource,
+/// which is read once instead of paid per turn.
 fn project_path_property() -> Value {
     json!({
         "type": "string",
-        "description": "Project directory (omit for current). Indexing is NOT automatic: an unindexed project answers with a 'project not indexed' error until you run the index action."
+        "description": "Project directory; defaults to the server's project."
     })
 }
 
@@ -1038,8 +1061,14 @@ pub fn tools_guide_markdown(handlers: &[ToolHandler]) -> String {
         "# LeIndex tool guide\n\nLeIndex exposes {} tools. Pick the tool, then the branch with \
          {selectors}; every other argument is forwarded \
          unchanged to that branch. `project_path` is accepted everywhere (omit it to use the \
-         server's project). `tier` (`l0` identity card, `l1` bounded overview — default, `l2` full \
-         detail) is accepted everywhere.\n\nThe individual tool names (`leindex_search`, \
+         server's project). Indexing is off by default: live reads (read_file, git \
+         status/diff, live text find) work on an unindexed project, while index-dependent \
+         operations (symbol_lookup, project_map, structural/graph queries) answer with a \
+         'project not indexed' error until you run the index action. Set \
+         `LEINDEX_AUTO_INDEX=1` or `[mcp] auto_index = true` to index on first use instead. \
+         `tier` (`l0` identity card, `l1` bounded overview — default, `l2` full detail) is \
+         accepted everywhere.\n\nThe \
+         individual tool names (`leindex_search`, \
          `leindex_edit_apply`, ...) still work as direct calls.\n",
         GROUPS.len()
     );
@@ -1504,7 +1533,7 @@ mod tests {
         let manage = group_by_name("leindex_manage").expect("manage router");
         let usage = branch_usage(manage, &handlers);
         assert!(
-            usage.contains("state,projects,evict,lease,cleanup:"),
+            usage.contains("state,projects,evict,lease,cleanup,run,how_to_test:"),
             "expected the shared branches folded into one entry: {usage}"
         );
         assert_eq!(
@@ -1567,28 +1596,64 @@ mod tests {
             grouped * 10 < legacy * 6,
             "router listing ({grouped} bytes) must stay under 60% of the flat listing ({legacy} bytes)"
         );
-        // 13_000 was the ceiling before `leindex_explore` gained its
-        // `structural` branch; that branch contributes a new `lang` argument
-        // plus one more entry in the per-branch arg map that `branch_usage`
-        // builds, which put the listing at 13_251 bytes (flat listing 24_546,
-        // ratio 0.54 — the 60% assertion above is the guard that actually
-        // bounds growth; this absolute ceiling is the backstop). Raised rather
-        // than dropped, per owner decision. If this number moves again, say
-        // which branch moved it.
-        // 14_000 -> 16_500: the FIFTH router `leindex_git` was added. It
-        // advertises 17 operations (7 reads + 10 preview-only mutations) and
-        // one `action` entry per operation in the arg map. The ratio guard
-        // STILL passes (the router surface remains far smaller than the flat
-        // per-tool listing), so growth is bounded; the absolute ceiling moves
-        // with it.
-        // 16_500 -> 17_500: `leindex_manage` went from ONE branch (`index`) to
-        // six, which on its own pushed the listing to 17_258 bytes because
-        // `branch_usage` emitted the shared handler's identical argument list
-        // once per branch. Folding branches that share a handler brought it
-        // back to 15_742 (flat 30_472, ratio 0.52), so the ceiling goes UP
-        // only to match the branch count, not to hide a regression: the next
-        // branch that lands here must not push past this without the same
-        // accounting.
-        assert!(grouped <= 17_500, "tools/list grew to {grouped} bytes");
+        // The ABSOLUTE payload ceiling is owned by
+        // `test_tools_list_payload_cannot_grow_past_measured_ceiling` (with its
+        // raise ledger). This test owns the RATIO guard only — the two used to
+        // assert the same number, so a raise had to be made twice and a real
+        // regression could pass in one place and fail in the other.
+    }
+
+    /// Absolute regression cap on the advertised `tools/list` payload (§6.10):
+    /// descriptions are per-turn context paid on every session. THIS test owns
+    /// the number; `test_benchmark_tools_list_sizes` owns only the ratio guard.
+    ///
+    /// Ledger: 16_800 measured 15_960 after lane A shrank the shared per-router
+    /// `project_path` boilerplate (16_510 before) and moved its non-obvious
+    /// detail into `leindex://tools/guide`. 16_800 -> 17_500 when the fifth
+    /// router `leindex_git` landed; -> 19_000 when git mutations became real
+    /// (plan -> apply: trailer/confirm_text/allow_sensitive/hard/clean/delete
+    /// arguments plus one summary line per operation); -> 20_900 on the
+    /// INTEGRATED roadmap tree, where lane F's `run`/`how_to_test` and lane G's
+    /// symbol-lookup usage kinds land on the same listing (measured 19,842).
+    /// If a legitimate change moves the payload past this line, name what moved
+    /// it and raise the ceiling consciously.
+    #[test]
+    fn test_tools_list_payload_cannot_grow_past_measured_ceiling() {
+        let handlers = all_tool_handlers();
+        let grouped = serde_json::to_string(&public_tools_json(&handlers))
+            .unwrap()
+            .len();
+        assert!(
+            grouped <= 20_900,
+            "tools/list grew to {grouped} bytes (ceiling 20,900 = measured 19,842 + ~5%)"
+        );
+    }
+
+    /// The detail dropped from the advertised schema must be recoverable:
+    /// `leindex://tools/guide` is the doc-of-record for argument semantics.
+    ///
+    /// The indexing sentence must be scoped to the operations that actually
+    /// need an index: live reads (read_file, git status/diff, live text find)
+    /// work on an unindexed project, and the opt-in auto-index setting exists.
+    /// Saying "every unindexed project errors" misdescribes both.
+    #[test]
+    fn test_guide_carries_the_project_path_detail() {
+        let guide = tools_guide_markdown(&all_tool_handlers());
+        assert!(
+            guide.contains("Indexing is off by default"),
+            "detail removed from tools/list must live in the guide:\n{guide}"
+        );
+        assert!(
+            guide.contains("live reads") && guide.contains("index-dependent operations"),
+            "the guide must say which operations need an index:\n{guide}"
+        );
+        assert!(
+            guide.contains("LEINDEX_AUTO_INDEX=1") && guide.contains("auto_index = true"),
+            "the guide must name the opt-in auto-index setting:\n{guide}"
+        );
+        assert!(
+            !guide.contains("Indexing is NOT automatic"),
+            "the over-broad claim must be gone:\n{guide}"
+        );
     }
 }

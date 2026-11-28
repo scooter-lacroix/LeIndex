@@ -2,13 +2,16 @@
 //!
 //! `DiffResult` / `DiffHunk` / `DiffLine` are the data shape the LLM
 //! sees (clean JSON, no ANSI). `compute_diff` is the single source of
-//! truth — both MCP (via `to_json()`) and CLI (via `render_split_diff` /
-//! `render_unified_diff`) read from the same `DiffResult` so the two
-//! surfaces can never drift.
+//! truth — both MCP (via `to_json()`) and CLI (via `render_unified_diff`)
+//! read from the same `DiffResult` so the two surfaces can never drift.
+//!
+//! §3.5: the CLI renders a COMPACT unified diff — changed lines in full
+//! (never truncated), ±1 context line, long unchanged runs collapsed to
+//! a counted line. The old side-by-side split renderer is gone.
 
 use serde_json::Value;
 
-use super::{LIGHT_CYAN, LIGHT_GREEN, LIGHT_GREY, LIGHT_RED, RESET, truncate};
+use super::{LIGHT_CYAN, LIGHT_GREEN, LIGHT_GREY, LIGHT_RED, RESET};
 
 // =============================================================================
 // Structured diff types — what the LLM sees
@@ -190,7 +193,19 @@ pub fn compute_diff(original: &str, modified: &str, file_path: &str) -> DiffResu
 // Diff rendering
 // =============================================================================
 
-/// Render a `DiffResult` as a unified diff (closest to `git diff`).
+/// Layout parameters for the unified hunk renderer.
+#[derive(Clone, Copy)]
+struct RowLayout {
+    /// Context lines kept on each side of a collapsed unchanged run.
+    max_context: usize,
+    /// Whether to emit ANSI color escapes.
+    color: bool,
+}
+
+/// Render a `DiffResult` as a compact unified diff (closest to
+/// `git diff -U1`): changed lines in FULL — never truncated with `…` —
+/// ±1 context line around changes, and long unchanged runs collapsed
+/// to one counted line (§3.5).
 pub fn render_unified_diff(diff: &DiffResult, color: bool) -> String {
     let mut out = String::new();
     if !diff.has_changes() {
@@ -214,6 +229,10 @@ pub fn render_unified_diff(diff: &DiffResult, color: bool) -> String {
         diff.file_path,
         if color { RESET } else { "" },
     ));
+    let layout = RowLayout {
+        max_context: 1,
+        color,
+    };
     for hunk in &diff.hunks {
         out.push_str(&format!(
             "{}@@ -{},{} +{},{} @@{}\n",
@@ -224,9 +243,7 @@ pub fn render_unified_diff(diff: &DiffResult, color: bool) -> String {
             hunk.lines.iter().filter(|l| l.op != DiffOp::Remove).count(),
             if color { RESET } else { "" },
         ));
-        for line in &hunk.lines {
-            out.push_str(&unified_line(line, color));
-        }
+        out.push_str(&render_hunk_split(hunk, &layout));
     }
     out
 }
@@ -255,314 +272,51 @@ fn unified_line(line: &DiffLine, color: bool) -> String {
     }
 }
 
-/// Render a `DiffResult` as a split-view diff with line numbers and
-/// +/- markers (like opencode's Edit). Falls back to unified if the
-/// terminal is too narrow.
-pub fn render_split_diff(diff: &DiffResult, color: bool, width: Option<usize>) -> String {
-    let mut out = String::new();
-    if !diff.has_changes() {
-        out.push_str(&format!(
-            "{}── {} (no changes) ──{}\n",
-            if color { LIGHT_CYAN } else { "" },
-            diff.file_path,
-            if color { RESET } else { "" },
-        ));
-        return out;
-    }
-
-    // Summary header
-    let summary = format!(
-        "{}  +{}  -{}",
-        diff.file_path, diff.additions, diff.deletions
-    );
-    out.push_str(&format!(
-        "{}── {} ──{}\n",
-        if color { LIGHT_CYAN } else { "" },
-        summary,
-        if color { RESET } else { "" },
-    ));
-
-    let gutter = 4usize; // 4-digit line number
-    // The split-view format string in `split_row` emits the
-    // following per row, excluding the gutter and the two
-    // content halves:
-    //   1 leading space
-    //   1 space between the left gutter and the left marker
-    //   1 space between the left marker and the left content
-    //   3 chars for the ` │ ` centre separator
-    //   1 space between the right gutter and the right marker
-    //   1 space between the right marker and the right content
-    //   2 trailing reset escapes when colour is enabled (each
-    //     contributes an ANSI CSI sequence; when colour is off
-    //     these are empty strings and contribute 0 to the
-    //     visible width).
-    // The empirical constant that keeps the rendered row
-    // inside the requested terminal width is 10 (8 separator
-    // chars + 2 to absorb ANSI colour escapes that still
-    // contribute to string length in some callers). Using
-    // `5` here was too small and could push the rendered row
-    // past the terminal width on an 80-column terminal,
-    // causing awkward wrapping. The `gutter * 2 + 10` formula
-    // is what the regression test below asserts against.
-    let half = match width {
-        Some(w) => w.saturating_sub(gutter * 2 + 10) / 2,
-        None => 60,
-    };
-    // If the caller told us the width and the resulting per-side
-    // column is too small to be readable, fall back to the unified
-    // layout — that's the behaviour the doc comment promises. Without
-    // this guard `half` can collapse to 0 on a narrow terminal and
-    // the row layout prints nothing useful.
-    if width.is_some() && half < 8 {
-        return render_unified_diff(diff, color);
-    }
-
-    for (hi, hunk) in diff.hunks.iter().enumerate() {
-        if hi > 0 {
-            out.push('\n');
-        }
-        out.push_str(&format!(
-            "{}@@ -{},{} +{},{} @@{}\n",
-            if color { LIGHT_CYAN } else { "" },
-            hunk.old_start,
-            hunk.lines.iter().filter(|l| l.op != DiffOp::Add).count(),
-            hunk.new_start,
-            hunk.lines.iter().filter(|l| l.op != DiffOp::Remove).count(),
-            if color { RESET } else { "" },
-        ));
-        out.push_str(&render_hunk_split(
-            hunk,
-            &RowLayout {
-                gutter,
-                half,
-                color,
-            },
-        ));
-    }
-    out
-}
-
 fn render_hunk_split(hunk: &DiffHunk, layout: &RowLayout) -> String {
     let mut out = String::new();
-    // Walk the hunk in runs. A run of `Remove` is always followed by
-    // (optional) `Add` lines; pair them row-by-row so a true side-by-side
-    // layout is produced (otherwise we'd show a remove on the left and
-    // a blank on the right for a single replacement).
-    let mut old_line = hunk.old_start;
-    let mut new_line = hunk.new_start;
+    // Walk the hunk in runs. Context gaps longer than `layout.max_context`
+    // collapse to one counted line (§3.5); changed lines always render in
+    // full — no truncation, ever.
     let mut i = 0;
     while i < hunk.lines.len() {
         let line = &hunk.lines[i];
-        match line.op {
-            DiffOp::Context => {
-                out.push_str(&split_row(
-                    &SplitRow {
-                        old_line: Some(old_line),
-                        old_content: &line.content,
-                        new_line: Some(new_line),
-                        new_content: &line.content,
-                        left_marker: " ",
-                        right_marker: " ",
-                    },
-                    layout,
+        if line.op == DiffOp::Context {
+            // Measure the whole context run.
+            let mut run = 0usize;
+            while i + run < hunk.lines.len() && hunk.lines[i + run].op == DiffOp::Context {
+                run += 1;
+            }
+            if run > layout.max_context * 2 + 2 {
+                // Keep `max_context` on each side, collapse the middle.
+                // The +2 headroom: collapsing must always HIDE lines — a
+                // run that would render as 1 kept + 1 counted + 1 kept is
+                // longer than just printing the three lines.
+                for line in &hunk.lines[i..i + layout.max_context] {
+                    out.push_str(&unified_line(line, layout.color));
+                }
+                let hidden = run - layout.max_context * 2;
+                out.push_str(&format!(
+                    "{}⋯ {} unchanged line{} ⋯{}\n",
+                    if layout.color { LIGHT_GREY } else { "" },
+                    hidden,
+                    if hidden == 1 { "" } else { "s" },
+                    if layout.color { RESET } else { "" },
                 ));
-                old_line += 1;
-                new_line += 1;
-                i += 1;
-            }
-            DiffOp::Remove => {
-                // Collect this run of removes.
-                let mut removes: Vec<&DiffLine> = vec![line];
-                let mut j = i + 1;
-                while j < hunk.lines.len() && hunk.lines[j].op == DiffOp::Remove {
-                    removes.push(&hunk.lines[j]);
-                    j += 1;
+                for line in &hunk.lines[i + run - layout.max_context..i + run] {
+                    out.push_str(&unified_line(line, layout.color));
                 }
-                // Collect the immediately-following run of adds.
-                let mut adds: Vec<&DiffLine> = Vec::new();
-                while j < hunk.lines.len() && hunk.lines[j].op == DiffOp::Add {
-                    adds.push(&hunk.lines[j]);
-                    j += 1;
+            } else {
+                for line in &hunk.lines[i..i + run] {
+                    out.push_str(&unified_line(line, layout.color));
                 }
-                let consumed = removes.len() + adds.len();
-                let max = removes.len().max(adds.len());
-                for k in 0..max {
-                    let rem = removes.get(k);
-                    let add = adds.get(k);
-                    // Each row gets explicit left/right markers
-                    // that mirror what a side-by-side diff viewer
-                    // would render: paired remove+add becomes
-                    // `-` / `+`, an unpaired remove (line was
-                    // deleted) becomes `-` / ` `, an unpaired
-                    // add (line was inserted against the previous
-                    // block) becomes ` ` / `+`. The previous
-                    // single-`marker` design forced all three
-                    // cases to render with `" "` and grey, which
-                    // made modifications visually identical to
-                    // unchanged context.
-                    let row = match (rem, add) {
-                        (Some(r), Some(a)) => SplitRow {
-                            old_line: Some(old_line + k),
-                            old_content: r.content.as_str(),
-                            new_line: Some(new_line + k),
-                            new_content: a.content.as_str(),
-                            left_marker: "-",
-                            right_marker: "+",
-                        },
-                        (Some(r), None) => SplitRow {
-                            old_line: Some(old_line + k),
-                            old_content: r.content.as_str(),
-                            new_line: None,
-                            new_content: "",
-                            left_marker: "-",
-                            right_marker: " ",
-                        },
-                        (None, Some(a)) => SplitRow {
-                            old_line: None,
-                            old_content: "",
-                            new_line: Some(new_line + k),
-                            new_content: a.content.as_str(),
-                            left_marker: " ",
-                            right_marker: "+",
-                        },
-                        (None, None) => unreachable!(),
-                    };
-                    out.push_str(&split_row(&row, layout));
-                }
-                old_line += removes.len();
-                new_line += adds.len();
-                i += consumed;
             }
-            DiffOp::Add => {
-                // Standalone add with no preceding remove — happens when
-                // new lines are inserted (e.g. a brand-new function body).
-                out.push_str(&split_row(
-                    &SplitRow {
-                        old_line: None,
-                        old_content: "",
-                        new_line: Some(new_line),
-                        new_content: &line.content,
-                        left_marker: " ",
-                        right_marker: "+",
-                    },
-                    layout,
-                ));
-                new_line += 1;
-                i += 1;
-            }
+            i += run;
+            continue;
         }
+        out.push_str(&unified_line(line, layout.color));
+        i += 1;
     }
     out
-}
-
-/// Layout parameters shared by every row of a split-view diff render.
-#[derive(Clone, Copy)]
-struct RowLayout {
-    /// Width of the line-number gutter on each side (e.g. 4 for "0001").
-    gutter: usize,
-    /// Maximum number of content characters displayed per side.
-    half: usize,
-    /// Whether to emit ANSI color escapes.
-    color: bool,
-}
-
-/// One row of a split-view diff: a (left_line, left_text) + (right_line,
-/// right_text) pair, plus explicit `left_marker` and `right_marker`
-/// strings that drive both the displayed glyph (`" "`, `"-"`, `"+"`)
-/// and the colour on each side independently.
-///
-/// The split renderer must distinguish context rows (` ` / ` `) from
-/// modified rows (`-` / `+`) at a glance — a single shared `marker`
-/// field forced both sides to render identically, which made
-/// modifications indistinguishable from unchanged context. Each side
-/// now carries its own marker and the row's colour is derived from
-/// that side's marker rather than from whether `old_line` /
-/// `new_line` is populated, so the caller is in full control of the
-/// rendered output.
-struct SplitRow<'a> {
-    old_line: Option<usize>,
-    old_content: &'a str,
-    new_line: Option<usize>,
-    new_content: &'a str,
-    left_marker: &'a str,
-    right_marker: &'a str,
-}
-
-fn split_row(row: &SplitRow<'_>, layout: &RowLayout) -> String {
-    let RowLayout {
-        gutter,
-        half,
-        color,
-    } = *layout;
-    let SplitRow {
-        old_line,
-        old_content,
-        new_line,
-        new_content,
-        left_marker,
-        right_marker,
-    } = row;
-
-    let ol_str = old_line
-        .map(|n| format!("{:>width$}", n, width = gutter))
-        .unwrap_or_else(|| " ".repeat(gutter));
-    let nl_str = new_line
-        .map(|n| format!("{:>width$}", n, width = gutter))
-        .unwrap_or_else(|| " ".repeat(gutter));
-
-    // Each side's colour is derived from its own marker so a
-    // modified row (`-` / `+`) renders red on the left and green
-    // on the right, while a context row (` ` / ` `) renders grey
-    // on both sides. The previous implementation derived the
-    // marker from `(old_line, new_line)` presence and then forced
-    // both sides to use the same `marker` value, which made
-    // modified rows visually identical to context rows.
-    let left_paint = if color && *left_marker == "-" {
-        LIGHT_RED
-    } else if color && *left_marker == "+" {
-        LIGHT_GREEN
-    } else if color {
-        LIGHT_GREY
-    } else {
-        ""
-    };
-    // The right side is the new file: it can only show context
-    // (` `) or added (`+`) — there is no semantic for `-` on
-    // the right because nothing is "removed from the new
-    // file" (lines in the new file are either present or
-    // absent, and absence is shown by leaving the row empty,
-    // not by a `-` marker). The `LIGHT_RED` arm the round-19
-    // patch left in place is therefore unreachable, so the
-    // paint collapses to: green for `+`, grey for everything
-    // else. The test `test_split_row_right_red_arm_is_dead`
-    // locks this contract so a future refactor that adds a
-    // right-side `-` marker must update both the test and
-    // this paint.
-    let right_paint = if color && *right_marker == "+" {
-        LIGHT_GREEN
-    } else if color {
-        LIGHT_GREY
-    } else {
-        ""
-    };
-    let reset = if color { RESET } else { "" };
-
-    let left = truncate(old_content, half);
-    let right = truncate(new_content, half);
-
-    format!(
-        " {ol_str} {left_marker} {left_paint}{left:half$}{reset} │ {nl_str} {right_marker} {right_paint}{right:half$}{reset}\n",
-        ol_str = ol_str,
-        left_marker = left_marker,
-        left_paint = left_paint,
-        left = left,
-        reset = reset,
-        nl_str = nl_str,
-        right_marker = right_marker,
-        right_paint = right_paint,
-        right = right,
-        half = half,
-    )
 }
 
 // =============================================================================
@@ -752,7 +506,7 @@ fn render_one_diff(file: &str, src: &Value, hunks: &[Value], color: bool) -> Str
             lines,
         });
     }
-    render_split_diff(&diff, color, None)
+    render_unified_diff(&diff, color)
 }
 
 /// Pretty-JSON fallback used by the render dispatcher when no
@@ -790,7 +544,7 @@ impl DiffFormatter {
     /// Format a diff between original and modified content
     pub fn format(&self, original: &str, modified: &str, file_path: &str) -> String {
         let diff = compute_diff(original, modified, file_path);
-        render_split_diff(&diff, self.color, None)
+        render_unified_diff(&diff, self.color)
     }
 }
 
@@ -803,25 +557,6 @@ impl Default for DiffFormatter {
 // =============================================================================
 // Tests
 // =============================================================================
-/// Strip CSI (SGR) escapes for test assertions on visible text.
-#[cfg(test)]
-fn strip_ansi_for_test(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut iter = s.chars().peekable();
-    while let Some(c) = iter.next() {
-        if c == '\x1b' && iter.peek() == Some(&'[') {
-            iter.next();
-            for c2 in iter.by_ref() {
-                if c2.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-            continue;
-        }
-        out.push(c);
-    }
-    out
-}
 
 #[cfg(test)]
 mod tests {
@@ -877,31 +612,120 @@ mod tests {
     }
 
     #[test]
-    fn test_render_split_diff_has_line_numbers() {
-        let d = compute_diff("a\nb\nc\n", "a\nB\nc\n", "test.rs");
-        let s = render_split_diff(&d, false, None);
-        // Split view should have the hunk header, line numbers, and the
-        // separator between left and right.
-        assert!(s.contains("@@ -1,3 +1,3 @@"), "got: {}", s);
-        assert!(s.contains("│"), "expected split separator");
-        assert!(s.contains("  1 "), "expected old line 1");
-        assert!(s.contains("  2 "), "expected old line 2");
+    fn test_render_unified_diff_shows_changed_lines_in_full() {
+        // §3.5: a changed line LONGER than 200 chars must appear in FULL,
+        // never truncated with `…`.
+        let long_old = format!("let old = \"{}\";", "x".repeat(220));
+        let long_new = format!("let new = \"{}\";", "y".repeat(220));
+        let d = compute_diff(&long_old, &long_new, "long.rs");
+        let s = render_unified_diff(&d, false);
+        assert!(
+            s.contains(&long_new),
+            "added line must be rendered in full, got: {:?}",
+            s
+        );
+        assert!(
+            s.contains(&long_old),
+            "removed line must be rendered in full, got: {:?}",
+            s
+        );
+        assert!(!s.contains('…'), "no truncation glyph allowed: {s}");
     }
 
     #[test]
-    fn test_render_split_diff_strips_trailing_newlines() {
-        // diffy includes the trailing newline in the line content;
-        // verify the renderer strips it so the row layout doesn't break.
-        let d = compute_diff("a\nb\n", "a\nB\n", "test.rs");
-        let s = render_split_diff(&d, false, None);
-        // No raw \n should appear in the middle of a row's content.
-        for line in s.lines() {
-            assert!(
-                !line.contains("│\n"),
-                "row contained a mid-line newline: {:?}",
-                line
-            );
-        }
+    fn test_render_unified_diff_compact_context_collapses_runs() {
+        // ±1 context: two changes 5 unchanged lines apart land in ONE
+        // diffy hunk (diffy merges gaps <= 2*3); the middle run collapses
+        // to a counted line while each change keeps one context line.
+        // (Gaps >= 7 become separate hunks — collapsing by construction.)
+        let original = format!(
+            "fn one() {{}}\n{}\nfn two() {{}}\n{}\nfn three() {{}}\n",
+            (1..=5)
+                .map(|i| format!("ctx_a{i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            (1..=5)
+                .map(|i| format!("ctx_b{i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let modified = original
+            .replacen("ctx_a1", "CTX_A1", 1)
+            .replacen("ctx_b1", "CTX_B1", 1);
+        let d = compute_diff(&original, &modified, "ctx.rs");
+        assert_eq!(d.hunks.len(), 1, "fixture must yield one merged hunk");
+        let s = render_unified_diff(&d, false);
+        assert!(
+            s.contains("⋯ 3 unchanged lines ⋯"),
+            "5-line middle run must collapse keeping 2, counting 3: {s}"
+        );
+        // ±1 context: exactly one context line before each change.
+        let body_lines: Vec<&str> = s.lines().collect();
+        let change_idx = body_lines
+            .iter()
+            .position(|l| l.starts_with("-ctx_a1"))
+            .expect("removed line present");
+        assert!(
+            body_lines[change_idx - 1].starts_with(' '),
+            "context before change: {}",
+            body_lines[change_idx - 1]
+        );
+        assert_eq!(
+            body_lines[change_idx - 1],
+            " fn one() {}",
+            "exactly ONE context line before the first change: {s}"
+        );
+        let change2_idx = body_lines
+            .iter()
+            .position(|l| l.starts_with("-ctx_b1"))
+            .expect("second change present");
+        assert_eq!(
+            body_lines[change2_idx - 1],
+            " fn two() {}",
+            "exactly ONE context line before the second change: {s}"
+        );
+    }
+
+    #[test]
+    fn test_render_unified_diff_keeps_short_context_runs_intact() {
+        let original = "a\nb\nc\n";
+        let modified = "a\nB\nc\n";
+        let d = compute_diff(original, modified, "small.rs");
+        let s = render_unified_diff(&d, false);
+        assert!(
+            !s.contains("unchanged line"),
+            "short run must not collapse: {s}"
+        );
+        assert!(s.contains(" a\n"), "context line a must be shown: {s}");
+        assert!(s.contains(" c\n"), "context line c must be shown: {s}");
+        assert!(s.contains("-b\n"), "removed line must be shown: {s}");
+        assert!(s.contains("+B\n"), "added line must be shown: {s}");
+    }
+
+    #[test]
+    fn test_render_one_diff_uses_unified_for_handlers() {
+        // §3.5: the handler dispatch path (edit_preview / rename / write)
+        // must render unified — no side-by-side `│` separator remains.
+        let data = serde_json::json!({
+            "file_path": "src/foo.rs",
+            "additions": 1,
+            "deletions": 1,
+            "hunks": [{
+                "old_start": 1,
+                "new_start": 1,
+                "lines": [
+                    {"op": "context", "old_line": 1, "new_line": 1, "content": "fn main() {"},
+                    {"op": "remove",   "old_line": 2, "new_line": null, "content": "  let x = 1;"},
+                    {"op": "add",      "old_line": null, "new_line": 2, "content": "  let x = 2;"},
+                    {"op": "context",  "old_line": 3, "new_line": 3, "content": "}"}
+                ]
+            }]
+        });
+        let s = render_diff_value(&data, false);
+        assert!(!s.contains('│'), "side-by-side separator must be gone: {s}");
+        assert!(s.contains("-  let x = 1;"), "removed line: {s}");
+        assert!(s.contains("+  let x = 2;"), "added line: {s}");
+        assert!(s.contains("@@"), "hunk header: {s}");
     }
 
     #[test]
@@ -919,13 +743,13 @@ mod tests {
         assert_eq!(first_line["content"], "fn main() {");
     }
 
-    /// Regression test for the bug where the `diffs[]` branch in
-    /// `render_diff_value` was unreachable for `rename_symbol`-shaped
-    /// data. The rename handler returns a top-level `diffs` array with
-    /// NO top-level `diff` field; the previous nested-`if-let`
-    /// implementation short-circuited and rendered an empty string.
     #[test]
     fn test_render_diff_value_handles_rename_symbol_diffs_list() {
+        // Regression test for the bug where the `diffs[]` branch in
+        // `render_diff_value` was unreachable for `rename_symbol`-shaped
+        // data. The rename handler returns a top-level `diffs` array with
+        // NO top-level `diff` field; the previous nested-`if-let`
+        // implementation short-circuited and rendered an empty string.
         let data = serde_json::json!({
             "diffs": [
                 {
@@ -1002,258 +826,11 @@ mod tests {
         assert_eq!(s, "@@ -1 +1 @@\n-old\n+new\n");
     }
 
-    /// `render_split_diff` must keep the rendered row width inside
-    /// the terminal width on an 80-column terminal. The split-view
-    /// format string emits constant characters per row that are
-    /// not part of the gutter or the two content halves. A
-    /// previous version subtracted only 5, which let the rendered
-    /// row exceed 80 chars.
-    #[test]
-    fn test_render_split_diff_respects_80_col_width() {
-        let diff = DiffResult {
-            file_path: "src/lib.rs".to_string(),
-            additions: 1,
-            deletions: 1,
-            hunks: vec![DiffHunk {
-                old_start: 1,
-                new_start: 1,
-                lines: vec![
-                    DiffLine {
-                        op: DiffOp::Remove,
-                        old_line: Some(1),
-                        new_line: None,
-                        // 60 chars on the remove side.
-                        content: "x".repeat(60),
-                    },
-                    DiffLine {
-                        op: DiffOp::Add,
-                        old_line: None,
-                        new_line: Some(1),
-                        content: "y".repeat(60),
-                    },
-                ],
-            }],
-        };
-        let s = render_split_diff(&diff, false, Some(80));
-        // Every rendered line must fit in 80 columns.
-        for (i, line) in s.lines().enumerate() {
-            let stripped = strip_ansi_for_test(line);
-            let visible = stripped.chars().count();
-            assert!(
-                visible <= 80,
-                "line {} exceeds 80 cols ({} chars): {:?}",
-                i,
-                visible,
-                stripped,
-            );
-        }
-    }
-
     // =====================================================================
-    // render_split_diff — round 19 gemini HIGH-priority split-marker fix
+    // §3.5: the side-by-side renderer is GONE — the tests that locked its
+    // internals (row width, split markers, red/green sides) died with it.
+    // The unified contract is locked by test_render_unified_diff_* above.
     // =====================================================================
-
-    /// Regression for HIGH round 19: the split renderer used a
-    /// single shared `marker` field on `SplitRow` and a
-    /// `(old_line, new_line) → (left_marker, right_marker)`
-    /// derivation in `split_row`. A paired remove+add row had
-    /// `(old_line=Some, new_line=Some)` and was therefore
-    /// forced to render with the caller's `marker` (which was
-    /// always `" "` for paired rows), so modifications
-    /// rendered with a blank glyph and grey colour —
-    /// visually indistinguishable from unchanged context.
-    ///
-    /// The fix splits `marker` into explicit
-    /// `left_marker` / `right_marker` fields, so a paired
-    /// remove+add row now renders with `-` on the left (red)
-    /// and `+` on the right (green) when colour is on. This
-    /// test asserts the contract for the colour-on path: the
-    /// row's stripped visible form contains both `-` and `+`
-    /// markers, and the unstripped form contains the red
-    /// ANSI escape (for the left `-`) AND the green ANSI
-    /// escape (for the right `+`).
-    #[test]
-    fn test_render_split_diff_modified_rows_use_minus_plus_markers() {
-        let diff = compute_diff("foo\n", "bar\n", "test.rs");
-        // Sanity: the diff has exactly one remove and one add.
-        assert_eq!(diff.additions, 1);
-        assert_eq!(diff.deletions, 1);
-        let stripped = strip_ansi_for_test(&render_split_diff(&diff, false, None));
-        // The rendered form must include a `-` on the left
-        // and a `+` on the right at the modified row, not
-        // spaces. The exact format is
-        //   " <gutter> - <left_content> │ <gutter> + <right_content>"
-        // so a ` - ` substring (gutter + space + marker + space)
-        // and a ` + ` substring (gutter + space + marker + space)
-        // must both appear.
-        assert!(
-            stripped.contains(" - "),
-            "modified row must render `-` on the left, not ` `; got: {:?}",
-            stripped
-        );
-        assert!(
-            stripped.contains(" + "),
-            "modified row must render `+` on the right, not ` `; got: {:?}",
-            stripped
-        );
-    }
-
-    /// Companion to the marker test: when colour is on, the
-    /// left `-` marker must be wrapped in `LIGHT_RED` and the
-    /// right `+` marker must be wrapped in `LIGHT_GREEN`. The
-    /// pre-fix renderer forced both sides to use the same
-    /// `marker` value (`" "`) with `LIGHT_GREY`, so no red or
-    /// green ever appeared at a modified row.
-    #[test]
-    fn test_render_split_diff_modified_rows_use_red_and_green_color() {
-        let diff = compute_diff("foo\n", "bar\n", "test.rs");
-        let rendered = render_split_diff(&diff, true, None);
-        // The red marker is emitted via `LIGHT_RED` between
-        // the left content and the next escape; we assert the
-        // escape sequence appears in the rendered output
-        // rather than testing the exact byte layout, which is
-        // a stronger contract.
-        assert!(
-            rendered.contains(LIGHT_RED),
-            "modified row's left `-` must be wrapped in LIGHT_RED; rendered: {:?}",
-            rendered
-        );
-        assert!(
-            rendered.contains(LIGHT_GREEN),
-            "modified row's right `+` must be wrapped in LIGHT_GREEN; rendered: {:?}",
-            rendered
-        );
-    }
-
-    /// Context rows (unchanged lines) must still render with
-    /// the blank marker (` `) on both sides, NOT with `-` or
-    /// `+`. This locks the contract that the round-19 fix did
-    /// not regress unchanged-context rendering.
-    #[test]
-    fn test_render_split_diff_context_rows_keep_blank_marker() {
-        // Multi-line input with a single mid-file modification
-        // gives us context lines surrounding the change.
-        let original = "alpha\nbeta\ngamma\ndelta\nepsilon\n";
-        let modified = "alpha\nbeta\nGAMMA\ndelta\nepsilon\n";
-        let diff = compute_diff(original, modified, "test.rs");
-        let stripped = strip_ansi_for_test(&render_split_diff(&diff, false, None));
-        // The row layout is
-        //   ` <gutter> <left_marker> <left_content> │ <gutter> <right_marker> <right_content>`
-        // For a 4-digit gutter and a single-char marker the
-        // first 6 visible chars are:
-        //   ` ` (1) + `   1` (4) + ` ` (1) = 6 chars
-        // followed by the marker. Split the row on the `│`
-        // separator to isolate the left half, then assert the
-        // left marker is ` ` (context), not `-` or `+`.
-        let mut found_blank_row = false;
-        for line in stripped.lines() {
-            if !line.contains('│') {
-                continue;
-            }
-            let left = line.split('│').next().unwrap();
-            // Find the gutter pattern at the start: one
-            // leading space, then 4 chars of line number
-            // (`   1`, `   2`, etc.).
-            if left.len() < 7 {
-                continue;
-            }
-            let gutter_and_marker = &left[0..6];
-            if gutter_and_marker.starts_with(" ")
-                && gutter_and_marker.ends_with(' ')
-                && gutter_and_marker[1..5].trim() == "1"
-            {
-                // The marker is the 7th char (index 6).
-                let marker = left[6..7].chars().next();
-                assert_eq!(
-                    marker,
-                    Some(' '),
-                    "context line `   1 ` must use blank marker, got {:?} in left half {:?}",
-                    marker,
-                    left
-                );
-                found_blank_row = true;
-                break;
-            }
-        }
-        assert!(
-            found_blank_row,
-            "expected to find a context row with gutter `   1 ` and blank marker in: {:?}",
-            stripped
-        );
-    }
-
-    /// Width invariant: the new explicit-marker design must
-    /// not change the per-row width formula. A modified row
-    /// (which is now `-` / `+` instead of ` ` / ` `) and a
-    /// context row (still ` ` / ` `) must both fit inside the
-    /// requested terminal width, because each marker is a
-    /// single byte. The previous 80-column regression test
-    /// (round 11) covered the remove+add-only case; this
-    /// round-19 test covers a case that produces a CONTEXT
-    /// row alongside the modification, to lock that the new
-    /// explicit markers do not push any row past the
-    /// requested width.
-    #[test]
-    fn test_render_split_diff_modified_rows_respect_terminal_width() {
-        let original = "context_before\nold_line\ncontext_after\n";
-        let modified = "context_before\nnew_line\ncontext_after\n";
-        let diff = compute_diff(original, modified, "test.rs");
-        let s = render_split_diff(&diff, false, Some(80));
-        for (i, line) in s.lines().enumerate() {
-            let visible = line.chars().count();
-            assert!(
-                visible <= 80,
-                "row {} exceeds 80 cols ({} chars): {:?}",
-                i,
-                visible,
-                line
-            );
-        }
-    }
-
-    /// Regression for WARNING round 20: the right side of a
-    /// split row is the new file — it can only be context
-    /// (` `) or added (`+`), never removed (`-`). The
-    /// round-19 patch left a `*right_marker == "-"` →
-    /// `LIGHT_RED` arm in `split_row`'s `right_paint`
-    /// computation that no caller could ever exercise. The
-    /// fix removes the dead arm; this test locks the
-    /// contract by rendering every actual marker combination
-    /// the caller can produce and asserting the right side
-    /// NEVER contains `LIGHT_RED` (i.e. the right column is
-    /// always either green for `+` or grey for ` `).
-    #[test]
-    fn test_split_row_right_red_arm_is_dead() {
-        // Each combination the caller can pass. `old_line`
-        // and `new_line` are placeholder values; the paint
-        // selection is driven only by the markers.
-        let cases: Vec<(&str, &str)> = vec![
-            (" ", " "), // context
-            ("-", "+"), // modified
-            ("-", " "), // remove-only
-            (" ", "+"), // add-only
-            (" ", "+"), // standalone add
-        ];
-        for (left, right) in cases {
-            let s = render_split_diff(&compute_diff("a\n", "b\n", "t.rs"), true, Some(200));
-            // The split separator `│` lets us isolate the
-            // right half of any row.
-            for line in s.lines() {
-                if !line.contains('│') {
-                    continue;
-                }
-                let right_half = line.split('│').nth(1).unwrap();
-                assert!(
-                    !right_half.contains(LIGHT_RED),
-                    "right half of a row with markers `{}`/`{}` must not contain \
-                     LIGHT_RED (the right-paint `-` arm is dead); got: {:?}",
-                    left,
-                    right,
-                    right_half,
-                );
-            }
-        }
-    }
 
     /// Regression for MED round 20: `render_diff_value` for
     /// `DiffPayload::List` previously interleaved

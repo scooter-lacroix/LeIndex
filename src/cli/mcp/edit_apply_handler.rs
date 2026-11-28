@@ -1,8 +1,10 @@
+use super::edit_batch;
 use super::edit_cache::{EditCacheEntry, GLOBAL_EDIT_CACHE};
-use super::edit_preview_handler::EditPreviewHandler;
+use super::edit_preview_handler::{EditPreviewHandler, file_summary};
+use super::edit_validate::{self, ValidateRequest};
 use super::helpers::{
-    apply_changes_in_memory, extract_bool, extract_string, parse_edit_changes,
-    validate_file_within_project, wrap_with_meta,
+    apply_changes_in_memory, extract_bool, parse_edit_changes, validate_file_within_project,
+    wrap_with_meta,
 };
 use super::protocol::JsonRpcError;
 use crate::cli::registry::{ProjectHandle, ProjectRegistry};
@@ -11,36 +13,59 @@ use crate::validation::validation_to_json;
 use serde_json::Value;
 use std::sync::Arc;
 
+/// Applied-line echo math (§4.3): original→final offset translation so the
+/// `Applied: path:Lx-Ly` echo never slices `modified` text at stale original
+/// byte offsets (multi-byte UTF-8 panic, wrong ranges).
+#[path = "edit_apply_applied.rs"]
+mod edit_apply_applied;
+use edit_apply_applied::applied_lines;
+
 type EditImpact = (Vec<String>, std::collections::HashSet<String>, Vec<String>);
 
-type PreparedEdit = (String, String, Vec<crate::edit::EditChange>);
-
-fn apply_request_args(
-    args: &Value,
-) -> Result<(String, Option<String>, Option<String>), JsonRpcError> {
-    Ok((
-        extract_string(args, "file_path")?,
-        args.get("project_path")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        args.get("preview_token")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-    ))
+/// What the caller asked `apply` to do. Token mode (preview_token, with or
+/// without file_path) is the ADVERTISED default; fresh mode resends the text.
+enum ApplyRequest {
+    /// Apply the cached preview identified by this token.
+    Token {
+        token: String,
+        /// Optional: cross-checks the cached preview's file when given.
+        file_path: Option<String>,
+    },
+    /// Apply the edit text directly (path resolved later).
+    Fresh { file_path: Option<String> },
 }
 
-fn cached_edit(entry: Option<EditCacheEntry>, token: &str) -> Result<PreparedEdit, JsonRpcError> {
-    let entry = entry.ok_or_else(|| {
-        JsonRpcError::invalid_params(
-            "No cached preview found for this file — either request a new LeIndex [Edit Preview], or resend the edit as FRESH MODE (file_path + old_text + new_text, without preview_token)",
-        )
-    })?;
-    if entry.preview_token != token {
-        return Err(JsonRpcError::invalid_params(
-            "preview token mismatch — the token does not match the cached preview for this file. Either request a new LeIndex [Edit Preview] and apply with its token, or resend the edit as FRESH MODE (file_path + old_text + new_text, without preview_token)",
-        ));
+fn apply_request_args(args: &Value) -> Result<ApplyRequest, JsonRpcError> {
+    let token = args
+        .get("preview_token")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let file_path = args
+        .get("file_path")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let has_text = args.get("old_text").is_some()
+        || args.get("old_str").is_some()
+        || args.get("new_text").is_some()
+        || args.get("new_str").is_some()
+        || args.get("changes").is_some();
+    match (token, has_text) {
+        (Some(_), true) => Err(JsonRpcError::invalid_params(
+            "Send EITHER preview_token OR the edit text (old_text/new_text/changes) — \
+             never both. The token already carries the previewed edit.",
+        )),
+        (Some(token), false) => Ok(ApplyRequest::Token { token, file_path }),
+        (None, _) => Ok(ApplyRequest::Fresh { file_path }),
     }
-    Ok((entry.original_text, entry.modified_text, entry.changes))
+}
+
+/// The session key the read ledger records edits under (§4.1): the transport
+/// injects `_session` (the MCP session id); direct CLI calls land under the
+/// process-scoped key, matching how reads record.
+fn session_id_for_ledger(args: &Value) -> &str {
+    args.get("_session")
+        .and_then(Value::as_str)
+        .unwrap_or("__process__")
 }
 
 async fn apply_atomic(
@@ -96,16 +121,6 @@ fn dry_run_envelope(preview: Value) -> Value {
     envelope
 }
 
-/// Resolve the request's file path and project handle in one step.
-async fn resolve_request_target(
-    registry: &Arc<ProjectRegistry>,
-    args: &Value,
-) -> Result<(String, Option<String>, ProjectHandle), JsonRpcError> {
-    let (file_path, project_path_arg, provided_token) = apply_request_args(args)?;
-    let handle = registry.get_or_create(project_path_arg.as_deref()).await?;
-    Ok((file_path, provided_token, handle))
-}
-
 /// Best-effort PDG load. Applying a plain text edit must never be blocked by a
 /// degraded/unavailable index: the atomic write + expected-content guard is the
 /// safety net, and impact/validation simply report as unavailable when no PDG
@@ -122,16 +137,6 @@ async fn load_pdg_best_effort(handle: &ProjectHandle) -> bool {
             false
         }
     }
-}
-
-/// Resolve the target file against the project root and read the storage path.
-async fn resolve_paths(
-    handle: &ProjectHandle,
-    file_path: &str,
-) -> Result<(std::path::PathBuf, std::path::PathBuf), JsonRpcError> {
-    let guard = handle.read().await;
-    let canonical = validate_file_within_project(file_path, guard.project_path())?;
-    Ok((canonical, guard.storage_path().to_path_buf()))
 }
 
 /// Wrap a response in the live project metadata.
@@ -228,11 +233,10 @@ fn validate_edit(
 fn edit_impact(
     pdg: Option<&crate::graph::pdg::ProgramDependenceGraph>,
     changes: &[crate::edit::EditChange],
-    path: &std::path::Path,
+    files: std::collections::HashSet<String>,
 ) -> EditImpact {
     let mut nodes = Vec::new();
-    let mut files = std::collections::HashSet::new();
-    files.insert(path.to_string_lossy().to_string());
+    let mut files = files;
     let mut breaking = Vec::new();
     let Some(pdg) = pdg else {
         return (nodes, files, breaking);
@@ -244,7 +248,7 @@ fn edit_impact(
         let node_id = pdg
             .find_by_symbol(old_name)
             .or_else(|| pdg.find_by_name(old_name))
-            .or_else(|| pdg.find_by_name_in_file(old_name, Some(&path.to_string_lossy())));
+            .or_else(|| pdg.find_by_name_in_file(old_name, None));
         let Some(node_id) = node_id else {
             continue;
         };
@@ -291,34 +295,477 @@ fn edit_region(original: &str, modified: &str) -> String {
         .join("\n")
 }
 
-fn edit_response(
-    path: &std::path::Path,
-    changes_applied: usize,
-    region: String,
-    impact: EditImpact,
-    validation: Option<Value>,
-) -> Value {
-    let (nodes, files, breaking) = impact;
-    let mut affected_files: Vec<_> = files.into_iter().collect();
-    affected_files.sort();
-    let mut response = serde_json::json!({
-        "success": true,
-        "changes_applied": changes_applied,
-        "file_path": path.to_string_lossy(),
-        "edit_region": region,
-        "affected_symbols": nodes,
-        "affected_files": affected_files,
-        "breaking_changes": breaking,
-    });
-    if let (Some(validation), Some(object)) = (validation, response.as_object_mut()) {
-        object.insert("validation".to_string(), validation);
-    }
-    response
-}
-
 /// Handler for LeIndex [edit_apply — atomic code modifications.
 #[derive(Clone)]
 pub struct EditApplyHandler;
+
+/// Drop a consumed preview from the cache.
+///
+/// A token-backed preview is stored under BOTH the path key and a token
+/// alias, so both must go: clearing only the path key would leave the alias
+/// replayable. Without a token there is only the path key.
+async fn clear_consumed_preview(
+    storage_path: &std::path::Path,
+    canonical: &std::path::Path,
+    token: Option<&String>,
+) {
+    match token {
+        Some(token) => {
+            GLOBAL_EDIT_CACHE
+                .clear_with_token_alias(storage_path, canonical, token)
+                .await
+        }
+        None => GLOBAL_EDIT_CACHE.clear(storage_path, canonical).await,
+    }
+}
+
+/// The canonical path of a batch plan's primary file (empty for a plan with no
+/// files, which no valid plan produces).
+fn primary_canonical(plan: &edit_batch::BatchEditPlan) -> std::path::PathBuf {
+    plan.files
+        .first()
+        .map(|f| f.canonical_path.clone())
+        .unwrap_or_else(|| std::path::PathBuf::from(""))
+}
+
+/// What a written edit produced, for the response stage.
+struct Applied {
+    plan: edit_batch::BatchEditPlan,
+    consumed_token: Option<String>,
+    changes_len: usize,
+    /// Single-file validator report plus its canonical path.
+    single_validation: Option<(Option<Value>, std::path::PathBuf)>,
+}
+
+/// The `changes_applied: 0` answer for an edit whose content is identical to
+/// what is on disk. The response is built here so both arms agree on it.
+fn noop_response(canonical: &std::path::Path) -> Value {
+    serde_json::json!({
+        "success": true,
+        "changes_applied": 0,
+        "file_path": canonical.to_string_lossy(),
+        "message": "No changes to apply (content identical)"
+    })
+}
+
+/// Write a single-file edit: validate, write atomically with the
+/// expected-content guard, drop the consumed preview, and describe it as a
+/// one-file plan. `Ok(None)` means the content was already identical.
+async fn write_single(
+    handle: &ProjectHandle,
+    storage_path: &std::path::Path,
+    canonical: std::path::PathBuf,
+    original: String,
+    modified: String,
+    changes: Vec<crate::edit::EditChange>,
+    token: Option<String>,
+) -> Result<Option<Applied>, JsonRpcError> {
+    if modified == original {
+        clear_consumed_preview(storage_path, &canonical, token.as_ref()).await;
+        return Ok(None);
+    }
+    let validation_json = {
+        let guard = handle.read().await;
+        validate_edit(guard.create_validator(), &canonical, &original, &modified)
+    };
+    let success = apply_atomic(&canonical, &original, &modified).await?;
+    ensure_write_succeeded(success, storage_path, &canonical).await?;
+    let plan = edit_batch::BatchEditPlan {
+        files: vec![edit_batch::BatchFileEdit {
+            canonical_path: canonical.clone(),
+            display_path: canonical.to_string_lossy().to_string(),
+            original,
+            modified,
+            changes: changes.clone(),
+        }],
+    };
+    clear_consumed_preview(storage_path, &canonical, token.as_ref()).await;
+    Ok(Some(Applied {
+        plan,
+        consumed_token: token,
+        changes_len: changes.len(),
+        single_validation: Some((validation_json, canonical)),
+    }))
+}
+
+/// Write a multi-file batch atomically, or report that nothing needed writing.
+/// `Ok(None)` means every file was already identical, so the parsed change
+/// count must not be reported as applied.
+async fn write_batch(
+    storage_path: &std::path::Path,
+    plan: edit_batch::BatchEditPlan,
+    token: Option<String>,
+) -> Result<Option<Applied>, JsonRpcError> {
+    if plan.files.iter().all(|f| f.modified == f.original) {
+        if let Some(token) = token.as_ref() {
+            let primary = primary_canonical(&plan);
+            GLOBAL_EDIT_CACHE
+                .clear_with_token_alias(storage_path, &primary, token)
+                .await;
+        }
+        return Ok(None);
+    }
+    let changes_len = plan.change_count();
+    edit_batch::apply_batch_atomic(&plan).await?;
+    if let Some(token) = token.as_ref() {
+        let primary = primary_canonical(&plan);
+        GLOBAL_EDIT_CACHE
+            .clear_with_token_alias(storage_path, &primary, token)
+            .await;
+    }
+    Ok(Some(Applied {
+        plan,
+        consumed_token: token,
+        changes_len,
+        single_validation: None,
+    }))
+}
+
+/// An edit resolved to text: either one file or a multi-file batch.
+enum Acquired {
+    /// Single file: (canonical, original, modified, changes, token)
+    Single(
+        std::path::PathBuf,
+        String,
+        String,
+        Vec<crate::edit::EditChange>,
+        Option<String>,
+    ),
+    /// Multi-file batch plan + token.
+    Batch(edit_batch::BatchEditPlan, Option<String>),
+}
+
+/// Resolve the caller's request into edit text: a cached preview (by token)
+/// or the fresh text it resent.
+///
+/// A token-backed preview must still be UNCHANGED on disk since it was
+/// generated (§3.4) — the hash check reads and hashes every touched file, so it
+/// runs on the blocking pool rather than parking the async executor behind disk
+/// I/O.
+async fn acquire_edit(
+    request: ApplyRequest,
+    args: &Value,
+    project_root: &std::path::Path,
+    storage_path: &std::path::Path,
+) -> Result<Acquired, JsonRpcError> {
+    match request {
+        ApplyRequest::Token { token, file_path } => {
+            acquire_from_token(token, file_path, project_root, storage_path).await
+        }
+        ApplyRequest::Fresh { file_path } => acquire_fresh(args, file_path, project_root).await,
+    }
+}
+
+/// Resolve a token to edit text.
+///
+/// Token-only is the advertised path; with `file_path` also given, resolve via
+/// the file (legacy clients) and verify the token.
+async fn acquire_from_token(
+    token: String,
+    file_path: Option<String>,
+    project_root: &std::path::Path,
+    storage_path: &std::path::Path,
+) -> Result<Acquired, JsonRpcError> {
+    let entry = match file_path.as_ref() {
+        Some(path) => {
+            let canonical = validate_file_within_project(path, project_root)?;
+            let entry = GLOBAL_EDIT_CACHE
+                .get(storage_path, &canonical)
+                .await
+                .ok_or_else(|| {
+                    JsonRpcError::invalid_params(
+                        "No cached preview found for this file — request a new \
+                         LeIndex [Edit Preview] and apply with its token",
+                    )
+                })?;
+            if entry.preview_token != token {
+                // The cached preview under this path belongs to a different
+                // token — discard BOTH lookup entries so the stale primary can
+                // never be replayed through a mismatched token.
+                GLOBAL_EDIT_CACHE
+                    .clear_with_token_alias(storage_path, &canonical, &token)
+                    .await;
+                return Err(JsonRpcError::invalid_params(
+                    "preview token mismatch — the token does not match the cached \
+                     preview for this file. Request a new LeIndex [Edit Preview] \
+                     and apply with its token",
+                ));
+            }
+            EditCacheEntry {
+                file_path: canonical,
+                ..entry
+            }
+        }
+        None => GLOBAL_EDIT_CACHE
+            .get_by_token(storage_path, &token)
+            .await
+            .ok_or_else(|| {
+                JsonRpcError::invalid_params(
+                    "Unknown preview_token — request a new LeIndex [Edit Preview] \
+                     and apply with its token (preview tokens are single-use and \
+                     expire with the cache)",
+                )
+            })?,
+    };
+    let entry_for_check = entry.clone();
+    let unchanged =
+        tokio::task::spawn_blocking(move || entry_for_check.files_unchanged_since_preview())
+            .await
+            .map_err(|e| {
+                JsonRpcError::internal_error(format!("Staleness check task failed: {e}"))
+            })?;
+    if !unchanged {
+        GLOBAL_EDIT_CACHE
+            .clear_with_token_alias(storage_path, &entry.file_path, &token)
+            .await;
+        return Err(JsonRpcError::invalid_params(
+            "Edit rejected: file content changed since this preview was generated \
+             (hash mismatch). Request a new LeIndex [Edit Preview]; the stale \
+             token was discarded.",
+        ));
+    }
+    let multi_file = entry.changes.iter().any(|c| {
+        matches!(
+            c,
+            crate::edit::EditChange::ReplaceText {
+                file_path: Some(_),
+                ..
+            }
+        )
+    });
+    if multi_file {
+        let plan = edit_batch::resolve_batch_from_changes(
+            &entry.changes,
+            &entry.original_hashes,
+            project_root,
+        )
+        .await?;
+        return Ok(Acquired::Batch(plan, Some(token)));
+    }
+    let canonical = validate_file_within_project(
+        // Token-alias entries carry the synthetic `__token__:` cache key in
+        // `file_path`; the real path is in the preview's original-hashes map.
+        &entry.real_file_path().to_string_lossy(),
+        project_root,
+    )?;
+    Ok(Acquired::Single(
+        canonical,
+        entry.original_text,
+        entry.modified_text,
+        entry.changes,
+        Some(token),
+    ))
+}
+
+/// Resolve resent edit text (no token): a batch when the changes[] entries
+/// span files, otherwise a single file read from disk.
+async fn acquire_fresh(
+    args: &Value,
+    file_path: Option<String>,
+    project_root: &std::path::Path,
+) -> Result<Acquired, JsonRpcError> {
+    let changes_val = fresh_changes_val(args)?;
+    if edit_batch::is_batch(&changes_val) {
+        let plan =
+            edit_batch::resolve_batch(&changes_val, file_path.as_deref(), project_root).await?;
+        return Ok(Acquired::Batch(plan, None));
+    }
+    let Some(path) = file_path.as_deref() else {
+        return Err(JsonRpcError::invalid_params(
+            "Missing required argument: file_path",
+        ));
+    };
+    let canonical = validate_file_within_project(path, project_root)?;
+    let original = tokio::fs::read_to_string(&canonical)
+        .await
+        .map_err(|e| JsonRpcError::invalid_params(format!("Cannot read file '{path}': {e}")))?;
+    let changes = parse_edit_changes(&changes_val, Some(&original))?;
+    let modified = apply_changes_in_memory(&original, &changes)?;
+    Ok(Acquired::Single(
+        canonical, original, modified, changes, None,
+    ))
+}
+
+/// `validate:"syntax"` echo: tree-sitter parse of every edited file, run AFTER
+/// the writes are durable.
+fn attach_syntax_validation(response: &mut Value, plan: &edit_batch::BatchEditPlan) {
+    let files_to_check: Vec<(String, std::path::PathBuf, String)> = plan
+        .files
+        .iter()
+        .map(|f| {
+            (
+                f.display_path.clone(),
+                f.canonical_path.clone(),
+                f.modified.clone(),
+            )
+        })
+        .collect();
+    let outcomes = edit_validate::validate_syntax(&files_to_check, 5);
+    response["syntax"] = serde_json::json!(
+        outcomes
+            .iter()
+            .map(|o| serde_json::json!({
+                "path": o.display_path,
+                "summary": o.summary,
+                "errors": o.errors,
+            }))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// `validate:"check"` echo: the scoped check (cargo/tsc) on the owning package
+/// of each edited file (§4.3, cross-lane contract).
+///
+/// Failures to RUN a check never fail an applied edit; they come back as
+/// per-file `error` entries. `check_scoped` is BLOCKING (it spawns its own
+/// runtime and waits on a child process), so it runs on the blocking pool,
+/// exactly like the sibling call site in `run::actions`.
+async fn attach_scoped_checks(
+    response: &mut Value,
+    plan: &edit_batch::BatchEditPlan,
+    project_root: &std::path::Path,
+) {
+    let mut checks = Vec::new();
+    for file in plan.files.iter().map(|f| f.canonical_path.clone()) {
+        let (root, target) = (project_root.to_path_buf(), file.clone());
+        let outcome = tokio::task::spawn_blocking(move || {
+            crate::cli::run::diagnostics::check_scoped(&root, &target, 10)
+        })
+        .await;
+        match outcome {
+            Ok(Ok(summary)) => checks.push(serde_json::json!({
+                "file": file.to_string_lossy(),
+                "exit_code": summary.exit_code,
+                "headline": summary.headline,
+                "failures": summary.failures.iter().map(|failure| serde_json::json!({
+                    "name": failure.name,
+                    "detail": failure.detail,
+                })).collect::<Vec<_>>(),
+                "error_count": summary.error_count,
+                "warning_counts": summary.warning_counts,
+            })),
+            Ok(Err(error)) => checks.push(serde_json::json!({
+                "file": file.to_string_lossy(),
+                "error": error.to_string(),
+            })),
+            Err(error) => checks.push(serde_json::json!({
+                "file": file.to_string_lossy(),
+                "error": format!("check task failed: {error}"),
+            })),
+        }
+    }
+    response["check"] = serde_json::json!({ "files": checks });
+}
+
+/// Everything after the write: staleness invalidation, the response payload,
+/// the optional validation echoes, the session ledger, and index maintenance.
+///
+/// The response is built and returned BEFORE the index refresh: the edit is
+/// already durable, so the caller must not wait on a reindex (see
+/// [`refresh_index_after_edit`]).
+#[allow(clippy::too_many_arguments)]
+async fn finish_apply(
+    registry: &Arc<ProjectRegistry>,
+    handle: &ProjectHandle,
+    project_root: &std::path::Path,
+    plan: edit_batch::BatchEditPlan,
+    changes_len: usize,
+    single_validation: Option<(Option<Value>, std::path::PathBuf)>,
+    pdg_snapshot: Option<crate::graph::pdg::ProgramDependenceGraph>,
+    pdg_loaded: bool,
+    had_validate_arg: bool,
+    validate_request: ValidateRequest,
+    args: &Value,
+) -> Result<Value, JsonRpcError> {
+    // Invalidate the registry's staleness cache so the next read tool re-runs
+    // `is_stale_fast` instead of reusing a pre-write `false` cached result.
+    registry.invalidate_stale_cache(project_root).await;
+
+    let validation_json = single_validation.and_then(|(validation, _path)| validation);
+    let impact = {
+        let guard = handle.read().await;
+        let files = plan
+            .files
+            .iter()
+            .map(|file| file.canonical_path.to_string_lossy().to_string())
+            .collect::<std::collections::HashSet<_>>();
+        edit_impact(
+            guard.pdg(),
+            &plan
+                .files
+                .iter()
+                .flat_map(|f| f.changes.clone())
+                .collect::<Vec<_>>(),
+            files,
+        )
+    };
+
+    let primary_path = plan
+        .files
+        .first()
+        .map(|f| f.canonical_path.clone())
+        .unwrap_or_else(|| std::path::PathBuf::from(""));
+    let mut response = serde_json::json!({
+        "success": true,
+        "changes_applied": changes_len,
+        "file_path": primary_path.to_string_lossy(),
+        "applied_lines": applied_lines(&plan.files, pdg_snapshot.as_ref()),
+        "files": plan.files.iter().map(file_summary).collect::<Vec<_>>(),
+        "multi_file": plan.files.len() > 1,
+    });
+    // §4.3: the surrounding-region echo is OFF by default — the caller just
+    // wrote that text. It comes back only on `tier=l2`.
+    if args
+        .get("tier")
+        .and_then(Value::as_str)
+        .is_some_and(|tier| tier.eq_ignore_ascii_case("l2"))
+    {
+        response["edit_region"] = serde_json::json!(
+            plan.files
+                .first()
+                .map(|f| edit_region(&f.original, &f.modified))
+                .unwrap_or_default()
+        );
+    }
+    if let (Some(validation), Some(obj)) = (validation_json, response.as_object_mut()) {
+        obj.insert("validation".to_string(), validation);
+    }
+    let (nodes, files, breaking) = impact;
+    let mut affected_files: Vec<_> = files.into_iter().collect();
+    affected_files.sort();
+    response["affected_symbols"] = serde_json::json!(nodes);
+    response["affected_files"] = serde_json::json!(affected_files);
+    response["breaking_changes"] = serde_json::json!(breaking);
+
+    // validate:"syntax" / "check" echoes, after the writes are durable.
+    if had_validate_arg {
+        match validate_request {
+            ValidateRequest::Syntax => attach_syntax_validation(&mut response, &plan),
+            ValidateRequest::Check => {
+                attach_scoped_checks(&mut response, &plan, project_root).await
+            }
+            ValidateRequest::None => {}
+        }
+    }
+
+    // §4.1/§6.9 (lane E): a durable edit invalidates this session's cached
+    // reads for every touched file. Fire-and-forget: ledger failures can never
+    // fail an edit.
+    let session = session_id_for_ledger(args);
+    for file in plan.files.iter().filter(|f| f.modified != f.original) {
+        crate::cli::mcp::read_paths::session_ledger().record_edit(session, &file.canonical_path);
+    }
+
+    if !pdg_loaded {
+        annotate_degraded_pdg(&mut response);
+    }
+    let response = wrap_with_current_meta(handle, response).await;
+
+    // Index maintenance AFTER the response value exists: the caller receives
+    // the response now, and the refresh never rides on its latency.
+    refresh_index_after_edit(registry, handle).await;
+    Ok(response)
+}
 
 #[allow(missing_docs)]
 impl EditApplyHandler {
@@ -331,12 +778,11 @@ impl EditApplyHandler {
     }
 
     pub fn description(&self) -> &str {
-        "PRIMARY file editor — use instead of edit_file. Two mutually exclusive modes: \
-(1) TOKEN MODE — after a LeIndex [Edit Preview], pass file_path + preview_token ONLY. \
-The token replaces the edit: do NOT repeat old_text/new_text/changes. Any text sent \
-alongside a token is ignored. (2) FRESH MODE — with no preview, pass file_path + \
-old_text + new_text for exact replacement (or changes[] for multiple or byte-offset \
-edits). Supports dry_run=true for preview."
+        "Apply a previewed edit with ONLY preview_token + project_path — the token \
+IS the edit (advertised default; do not resend old_text/new_text). Without a \
+preview: file_path + old_text + new_text, or a batch changes[] whose entries \
+carry their own file_path (atomic across files). validate:\"syntax\" runs a \
+tree-sitter parse of every edited file after the write."
     }
 
     pub fn argument_schema(&self) -> Value {
@@ -345,11 +791,11 @@ edits). Supports dry_run=true for preview."
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "Absolute or project-relative path. Relative paths resolve against the project root."
+                    "description": "Absolute or project-relative path. Optional in TOKEN MODE (preview_token alone identifies the edit); required in FRESH MODE."
                 },
                 "old_text": {
                     "type": "string",
-                    "description": "FRESH MODE: text to find and replace (exact match). Use only when no preview_token is sent; with a preview_token, omit this field."
+                    "description": "FRESH MODE: text to find and replace (exact match). Do NOT send alongside preview_token."
                 },
                 "old_str": {
                     "type": "string",
@@ -357,7 +803,7 @@ edits). Supports dry_run=true for preview."
                 },
                 "new_text": {
                     "type": "string",
-                    "description": "FRESH MODE: replacement text. Use only when no preview_token is sent; with a preview_token, omit this field."
+                    "description": "FRESH MODE: replacement text. Do NOT send alongside preview_token."
                 },
                 "new_str": {
                     "type": "string",
@@ -369,7 +815,7 @@ edits). Supports dry_run=true for preview."
                 },
                 "changes": {
                     "type": "array",
-                    "description": "Advanced mode: list of changes to apply. Each has type (replace_text/rename_symbol) and type-specific fields.",
+                    "description": "FRESH MODE batch: changes to apply, each optionally carrying its own 'file_path'. Entries across multiple files are applied atomically (all-or-nothing, rolled back on failure). Do NOT send alongside preview_token.",
                     "items": { "type": "object" }
                 },
                 "dry_run": {
@@ -378,12 +824,23 @@ edits). Supports dry_run=true for preview."
         Also accepts compatibility strings: 'true'/'false', '1'/'0', 'yes'/'no'.",
                     "default": false
                 },
+                "validate": {
+                    "type": "string",
+                    "enum": ["syntax", "check"],
+                    "description": "\"syntax\": tree-sitter-parse every edited file after the write and report errors (line:col). \"check\": run the package-scoped cargo/tsc check (lane F) and surface its diagnostics in the apply echo."
+                },
                 "preview_token": {
                     "type": "string",
-                    "description": "TOKEN MODE: the preview_token from a previous LeIndex [Edit Preview] (tool: leindex.edit-preview). When set, the token IS the edit: send file_path + preview_token only and omit old_text/new_text/changes (any text sent with a token is ignored). Unknown or mismatched token: request a new preview, or resend the edit as FRESH MODE without preview_token."
+                    "description": "TOKEN MODE (advertised default): the preview_token from LeIndex [Edit Preview]. Send preview_token + project_path ONLY — the token replaces the whole edit. The file must be unchanged since the preview or the apply is rejected."
+                },
+                "tier": {
+                    "type": "string",
+                    "enum": ["l1", "l2"],
+                    "description": "l1 (default): one-line apply result only. l2: also echoes the surrounding region of the primary file.",
+                    "default": "l1"
                 }
             },
-            "required": ["file_path"]
+            "required": []
         })
     }
 
@@ -401,152 +858,131 @@ edits). Supports dry_run=true for preview."
             return Ok(dry_run_envelope(preview));
         }
 
-        let (file_path, provided_token, handle) = resolve_request_target(registry, &args).await?;
+        // validate:"check" refuses here, before anything is written. This is
+        // the ONE integration point for lane F's check_scoped.
+        let validate_request = edit_validate::resolve_validate_arg(&args)?;
+        let had_validate_arg = args.get("validate").is_some();
+
+        // The `tier` argument is declared as an enum in the schema; validate
+        // it explicitly so an unknown value errors instead of silently
+        // downgrading to l1 (region echo skipped) with no signal to the caller.
+        if let Some(tier) = args.get("tier").and_then(Value::as_str)
+            && !tier.eq_ignore_ascii_case("l1")
+            && !tier.eq_ignore_ascii_case("l2")
+        {
+            return Err(JsonRpcError::invalid_params(format!(
+                "tier must be \"l1\" or \"l2\", got: {tier:?}"
+            )));
+        }
+
+        let request = apply_request_args(&args)?;
+        let project_path_arg = args.get("project_path").and_then(Value::as_str);
+        let handle = registry.get_or_create(project_path_arg).await?;
 
         // 0. Best-effort PDG load: applying a plain text edit must never be
         // blocked by a degraded/unavailable index.
         let pdg_loaded = load_pdg_best_effort(&handle).await;
-
-        // 1. Resolve path and check cache (avoid awaiting while holding lock)
-        let (canonical_path, storage_path) = resolve_paths(&handle, &file_path).await?;
-
-        let cached_entry = GLOBAL_EDIT_CACHE.get(&storage_path, &canonical_path).await;
-
-        let (original, modified, changes) = self
-            .get_edit_content(
-                provided_token,
-                cached_entry,
-                &canonical_path,
-                &file_path,
-                &args,
-            )
-            .await?;
-
-        // If no changes, nothing to do
-        if modified == original {
-            GLOBAL_EDIT_CACHE
-                .clear(&storage_path, &canonical_path)
-                .await;
-            let response = serde_json::json!({
-                "success": true,
-                "changes_applied": 0,
-                "message": "No changes to apply (content identical)"
-            });
-            return Ok(wrap_with_current_meta(&handle, response).await);
-        }
-
-        let validation_json = {
+        let pdg_snapshot = {
             let guard = handle.read().await;
-            validate_edit(
-                guard.create_validator(),
-                &canonical_path,
-                &original,
-                &modified,
+            guard.pdg().cloned()
+        };
+
+        let (project_root, storage_path) = {
+            let guard = handle.read().await;
+            (
+                guard.project_path().to_path_buf(),
+                guard.storage_path().to_path_buf(),
             )
         };
 
-        let success = apply_atomic(&canonical_path, &original, &modified).await?;
+        // 1. Acquire the edit: cached preview (token) or fresh text.
+        let acquired = acquire_edit(request, &args, &project_root, &storage_path).await?;
 
-        ensure_write_succeeded(success, &storage_path, &canonical_path).await?;
-
-        // 4. Clear cache after successful apply
-        GLOBAL_EDIT_CACHE
-            .clear(&storage_path, &canonical_path)
-            .await;
-
-        // 5. Invalidate the registry's staleness cache so the next
-        // read tool re-runs `is_stale_fast` instead of reusing a
-        // pre-write `false` cached result. The watcher (when enabled)
-        // does this on its own reindex path; this explicit call
-        // covers the watcher-disabled default mode where the
-        // 30-second negative-cache TTL would otherwise silently
-        // mask the edit.
-        let project_root = {
-            let guard = handle.read().await;
-            guard.project_path().to_path_buf()
-        };
-        registry.invalidate_stale_cache(&project_root).await;
-
-        // 6. Build the response NOW — the edit is durable and every field
-        // is already computed (impact runs against the pre-edit PDG loaded
-        // above; validation ran before the write). The MCP caller must
-        // receive this the moment it exists: the incremental reindex used
-        // to run inline here under the project write lock, holding the
-        // response for seconds-to-minutes (and queuing behind any other
-        // lock holder) until MCP clients timed out while the file had in
-        // fact been edited.
-        let impact = {
-            let guard = handle.read().await;
-            edit_impact(guard.pdg(), &changes, &canonical_path)
-        };
-
-        let mut response = edit_response(
-            &canonical_path,
-            changes.len(),
-            edit_region(&original, &modified),
-            impact,
-            validation_json,
-        );
-        if !pdg_loaded {
-            annotate_degraded_pdg(&mut response);
-        }
-
-        let response = wrap_with_current_meta(&handle, response).await;
-
-        // 7. Index maintenance AFTER the response value exists: the caller
-        // receives the response now, and the refresh never rides on its
-        // latency (see `refresh_index_after_edit`).
-        refresh_index_after_edit(registry, &handle).await;
-
-        Ok(response)
-    }
-
-    fn get_changes_from_args(&self, args: &Value) -> Result<Value, JsonRpcError> {
-        if let Some(changes) = args.get("changes").cloned() {
-            Ok(changes)
-        } else {
-            let old_text = args
-                .get("old_text")
-                .or_else(|| args.get("old_str"))
-                .and_then(|v| v.as_str());
-            let new_text = args
-                .get("new_text")
-                .or_else(|| args.get("new_str"))
-                .and_then(|v| v.as_str());
-            match (old_text, new_text) {
-                (Some(old), Some(new)) => Ok(serde_json::json!([{
-                    "type": "replace_text",
-                    "old_text": old,
-                    "new_text": new
-                }])),
-                _ => Err(JsonRpcError::invalid_params(
-                    "Provide either 'changes' array or 'old_text'+'new_text' for simple replacement",
-                )),
+        // 2. Write. Batches validate every file before the first write and
+        // roll back on failure; singles keep the expected-content guard.
+        // `single_validation` carries the single-file validator report plus
+        // its canonical path for the response.
+        let applied = match acquired {
+            Acquired::Single(canonical, original, modified, changes, token) => {
+                let noop_path = canonical.clone();
+                match write_single(
+                    &handle,
+                    &storage_path,
+                    canonical,
+                    original,
+                    modified,
+                    changes,
+                    token,
+                )
+                .await?
+                {
+                    Some(applied) => applied,
+                    None => {
+                        let response = noop_response(&noop_path);
+                        return Ok(wrap_with_current_meta(&handle, response).await);
+                    }
+                }
             }
-        }
-    }
+            Acquired::Batch(plan, token) => {
+                let noop_path = primary_canonical(&plan);
+                match write_batch(&storage_path, plan, token).await? {
+                    Some(applied) => applied,
+                    None => {
+                        let response = noop_response(&noop_path);
+                        return Ok(wrap_with_current_meta(&handle, response).await);
+                    }
+                }
+            }
+        };
+        let Applied {
+            plan,
+            consumed_token: _consumed_token,
+            changes_len,
+            single_validation,
+        } = applied;
 
-    async fn get_edit_content(
-        &self,
-        provided_token: Option<String>,
-        cached_entry: Option<EditCacheEntry>,
-        canonical_path: &std::path::Path,
-        file_path: &str,
-        args: &Value,
-    ) -> Result<PreparedEdit, JsonRpcError> {
-        if let Some(provided_token) = provided_token {
-            cached_edit(cached_entry, &provided_token)
-        } else {
-            let original = tokio::fs::read_to_string(canonical_path)
-                .await
-                .map_err(|e| {
-                    JsonRpcError::invalid_params(format!("Cannot read file '{}': {}", file_path, e))
-                })?;
-
-            let changes_val = self.get_changes_from_args(args)?;
-            let changes = parse_edit_changes(&changes_val, Some(&original))?;
-            let modified = apply_changes_in_memory(&original, &changes)?;
-            Ok((original, modified, changes))
-        }
+        finish_apply(
+            registry,
+            &handle,
+            &project_root,
+            plan,
+            changes_len,
+            single_validation,
+            pdg_snapshot,
+            pdg_loaded,
+            had_validate_arg,
+            validate_request,
+            &args,
+        )
+        .await
     }
 }
+
+/// Extract the FRESH-mode changes value (changes[] or old/new aliases).
+fn fresh_changes_val(args: &Value) -> Result<Value, JsonRpcError> {
+    if let Some(changes) = args.get("changes").cloned() {
+        return Ok(changes);
+    }
+    let old_text = args
+        .get("old_text")
+        .or_else(|| args.get("old_str"))
+        .and_then(Value::as_str);
+    let new_text = args
+        .get("new_text")
+        .or_else(|| args.get("new_str"))
+        .and_then(Value::as_str);
+    match (old_text, new_text) {
+        (Some(old), Some(new)) => Ok(serde_json::json!([{
+            "type": "replace_text",
+            "old_text": old,
+            "new_text": new
+        }])),
+        _ => Err(JsonRpcError::invalid_params(
+            "Provide either 'changes' array or 'old_text'+'new_text' for simple replacement",
+        )),
+    }
+}
+
+#[cfg(test)]
+#[path = "edit_apply_handler_test.rs"]
+mod edit_apply_tests;

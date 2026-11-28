@@ -47,6 +47,8 @@ pub mod system_one;
 /// Response detail tiers (`l0` identity card, `l1` overview, `l2` full detail).
 pub mod tier;
 
+/// Call-site geometry for symbol_lookup callers (brief §6.2).
+pub mod call_sites;
 /// Handler for LeIndex \[Context\] — PDG-based context expansion.
 pub mod context_handler;
 /// Handler for LeIndex [Deep Analyze] — deep code analysis.
@@ -55,14 +57,25 @@ pub mod deep_analyze_handler;
 pub mod diagnostics_handler;
 /// Handler for LeIndex [Edit Apply] — atomic code modifications.
 pub mod edit_apply_handler;
+/// Multi-file atomic batch edits.
+pub mod edit_batch;
 /// Disk-persistent cache for edit previews.
 pub mod edit_cache;
 /// Handler for LeIndex [Edit Preview] — dry-run code changes.
 pub mod edit_preview_handler;
+/// Edit risk from real PDG/visibility/test signals.
+pub mod edit_risk;
+/// Post-edit syntax validation (`validate: "syntax"`).
+pub mod edit_validate;
 /// Handler for LeIndex [File Summary] — structured file analysis.
 pub mod file_summary_handler;
 /// Handler for LeIndex \[Find\] — index-accelerated text/symbol search.
 pub mod find_handler;
+/// Stable `next` continuation tokens shared by the list-returning tools (§6.8).
+pub mod find_paging;
+/// Apply side for LeIndex [Git] mutations (token binding, rails, guardrails).
+pub mod git_apply;
+pub mod git_apply_exec;
 /// Handler for LeIndex [Git Diff] — PDG-enriched diff.
 pub mod git_diff_handler;
 /// Handler for LeIndex [Git] — live git reads plus preview-gated mutations.
@@ -81,6 +94,8 @@ pub mod phase_handler;
 pub mod project_map_handler;
 /// Handler for LeIndex [Read File] — PDG-annotated file read.
 pub mod read_file_handler;
+/// Read-path engine: handles, elided reads, session read ledger (lane E).
+pub mod read_paths;
 /// Handler for LeIndex [Read Symbol] — targeted symbol source read.
 pub mod read_symbol_handler;
 /// Handler for LeIndex [Rename Symbol] — cross-file symbol rename.
@@ -91,6 +106,10 @@ pub mod search_handler;
 pub mod structural_handler;
 /// Handler for LeIndex [Symbol Lookup] — full call graph lookup.
 pub mod symbol_lookup_handler;
+/// Test locator with exact run commands (brief §6.4).
+pub mod tests_mode;
+/// Construct and match usage sites (brief §6.3).
+pub mod usages;
 /// Handler for LeIndex \[Write\] — atomic file creation with PDG surfacing.
 pub mod write_handler;
 

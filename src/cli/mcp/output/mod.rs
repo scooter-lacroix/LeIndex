@@ -65,11 +65,6 @@ pub const LIGHT_MAGENTA: &str = "\x1b[95m";
 /// Light cyan foreground color
 pub const LIGHT_CYAN: &str = "\x1b[96m";
 
-/// Background highlight for added lines (split view)
-pub const BG_GREEN: &str = "\x1b[48;5;22m";
-/// Background highlight for removed lines (split view)
-pub const BG_RED: &str = "\x1b[48;5;52m";
-
 // =============================================================================
 // Cross-submodule utilities
 // =============================================================================
@@ -80,7 +75,10 @@ pub const BG_RED: &str = "\x1b[48;5;52m";
 
 /// `truncate` keeps `max - 1` characters and appends the single-char `…`
 /// (Unicode horizontal ellipsis) so the result is at most `max` characters
-/// wide. Used by the split-view diff layout to keep each side equal width.
+/// wide. Survives as a test-locked contract over `truncate_with_ellipsis`;
+/// §3.5 removed the split-view diff layout that was its only production
+/// caller (changed lines now render in full, never truncated).
+#[cfg(test)]
 fn truncate(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
@@ -168,8 +166,7 @@ pub fn lookup_args<'a>(_name: &str, args: Option<&'a Value>) -> &'a Value {
 // =============================================================================
 
 pub use diff::{
-    DiffFormatter, DiffHunk, DiffLine, DiffOp, DiffResult, compute_diff, render_split_diff,
-    render_unified_diff,
+    DiffFormatter, DiffHunk, DiffLine, DiffOp, DiffResult, compute_diff, render_unified_diff,
 };
 pub use render::{
     DiagnosticsFormatter, FileSummaryFormatter, GitStatusFormatter, ImpactFormatter,

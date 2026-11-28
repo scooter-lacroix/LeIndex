@@ -70,7 +70,8 @@ fn write_catalog(path: &Path, variant: u64) {
             3,
             120,
             480,
-            variant % 2,
+            // `rusqlite` 0.41 dropped `ToSql for u64`; the column is a 0/1 flag.
+            (variant % 2) as i64,
         ],
     )
     .unwrap();

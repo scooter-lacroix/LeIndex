@@ -2,7 +2,256 @@
 
 All notable changes to the LeIndex project are documented in this file.
 
+## [2.2.0] - 2026-11-27 - PR #117 review remediation: the five routers, finished
+
+96 commits since `v2.1.5`, spanning eight feature lanes merged into the router
+surface, review findings closed through round 21, and a dependency security sweep.
+About 33k lines land and under 4k are removed, nearly all of it new module code plus
+its tests under `src/cli/`, `src/search/` and the new `tools/tokbench` crate.
+
+### The routers were shells; this range fills them in
+
+`tools/list` already advertised the five routers at `v2.1.5` — `leindex_explore`
+(`mode`), `leindex_analyze` (`mode`), `leindex_edit` (`action`, required),
+`leindex_manage` (`action`), `leindex_git` (`action`) — and the branch lists were
+already the ones shipped today, with two exceptions noted below. What those branches
+did was thin: `leindex_git`'s own module doc said of the mutating actions *"There is
+no `confirm` argument and no apply side."* Eight lanes (`a-output`, `b-edit`,
+`c-find`, `d-git`, `e-read`, `f-run`, `g-symbols`, `h-bench`) were built and merged
+to give each branch real behaviour, with cross-lane contracts so one lane's
+renderers, budgets and diagnostics reach the others.
+
+- **`git` mutations apply for real.** A bare mutating call returns a dry-run plan
+  plus a `preview_token`; re-sending the call applies it. `confirm:true` covers the
+  safe subset (`add`, `commit`, `push`). New: `src/cli/mcp/git_apply.rs` and
+  `git_apply_exec.rs`, with `git_apply_test.rs`, `git_apply_binding_test.rs` and
+  `git_apply_exec_test.rs`.
+  - The token is bound to the argv, the HEAD commit and a hash of the `git ls-files
+    -s` inventory, so a plan cannot be replayed against a tree that moved; the
+    inventory hash refuses a truncated listing.
+  - `git add` runs under `--literal-pathspecs` (a *global* option, so it precedes
+    the subcommand): `--` stops option parsing but not pathspec expansion, so a
+    directory holding a file literally named `*` would otherwise have staged
+    everything — including the `.env` the guardrail had just excluded.
+  - Bulk adds consult `git check-ignore -z --stdin` so ignored paths are never
+    staged, with exit 1 read as "none of these are ignored" rather than as an error.
+  - Force-push binds an explicit `--force-with-lease` expected value instead of
+    the implicit lease against a remote-tracking ref that a background `fetch` can
+    advance — and force-push is never reachable on `confirm` alone: it needs
+    `force:true` plus a `confirm_text` equal to the string the plan printed, plus
+    the token.
+  - Bulk adds exclude likely secrets (`.env*`, `*.pem`, `id_rsa*`, `*.key`,
+    `credentials*.json`, `*secret*`) and runtime artefacts from directory
+    discoveries, listing them under `excluded` with a warning; an explicit path or
+    `allow_sensitive:true` stages them anyway.
+  - `commit` takes `paths` with git's native pathspec-commit semantics (untracked
+    files are not silently swept in) and `trailers`, one `--trailer` line each.
+  - Commit ids are validated against the repository's real object format, so a
+    SHA-256 repository's 64-digit oid is accepted instead of silently yielding no
+    lease; an unborn branch asks git rather than assuming SHA-1's 40 zeros.
+  - A timed-out child is killed by process group (`process_group(0)`, then
+    `kill(-pgid, SIGKILL)`), and `GIT_DIR` is cleared on every git child, not only
+    the mutation path.
+- **`leindex_manage` gains two branches.** `action=run` runs an allow-listed
+  command with no shell, a canonicalised cwd that must stay inside the project, one
+  deadline covering both the child and output collection, and a `~300`-character
+  summary plus a `log://` handle back into the capped, scrubbed log. `action=
+  how_to_test` resolves the gate command for a path, cached per project root against
+  the `(path, mtime)` of every manifest the discovery read, and honouring the
+  manifest's declared `[[test]]` targets and autolib rules.
+- **`explore mode=symbol_lookup` answers more.** New `call_sites.rs` ranks every
+  direct caller (site line plus test classification, non-test callers first, files
+  read and parsed through one cache); `usages.rs` answers "who constructs `Foo`"
+  and "who matches `Shade::Dark`" from the syntax tree — construction and
+  pattern positions only, never comments, strings, or type-position mentions —
+  and `tests_mode.rs`'s `tests_for` returns the tests that exercise the symbol with
+  the exact command that runs each, bounded and reporting truncation.
+- **Reads got their own module.** `read_paths.rs` adds stable handles
+  (`path#symbol`, `path#L600-800`), elided reads (focus span verbatim, sibling
+  top-level items collapsed to signature lines with `expand:` handles), and a
+  bounded per-session ledger that dedups served reads.
+- **`find` gained paging.** New `find_paging.rs`: a continuation token carries the
+  query and the exact position it resumes from (per-file cursors keyed by the
+  token's `next_offset`), so a page cannot silently re-derive its own position from
+  how the caller spelled the previous one — while a caller who prefers `offset`
+  keeps that, unchanged. `engine_paging.rs` and `engine_scan.rs` are splits of
+  `engine.rs`, not new behaviour: `engine.rs` had crossed the repository's line
+  budget, and the scan/windowing pipeline and the per-file hit construction moved
+  out into siblings that re-export through `super`.
+
+### Review remediation
+
+Every CodeRabbit / tzar / codex / gemini finding on this surface is fixed and pinned
+with a red-verified test, cited by round and comment id where the reviewer supplied
+one. `v2.1.5` already carried findings through round 20; this range adds rounds
+through 21 and closes the ones those rounds found on the new code. The ones that
+changed observable behaviour:
+
+- Blank lines survive numbering in a selected read range (#116).
+- Diagnostics resolve through a symlinked project root (#118).
+- Top-level spans are chosen by containment, not by name (#122) — a nested span
+  could otherwise be returned as "top level".
+- Applied-line offsets translate order-independently: replacements run in descending
+  start order, but the net shift at a boundary is computed from the spans that end
+  before it.
+- Symbol lookup keeps the alternate answers and matches variant payloads instead of
+  dropping answered rows.
+- Truncation notices state the true total; no listing invents a continuation, and
+  the phase-4 hotspot list is labelled as the ranked sample it is.
+- A failed git mutation passes its stderr through `LogScrubber` before it can reach
+  an MCP response, so hook chatter or URL-embedded credentials cannot leak.
+
+### tokbench: a task-3 parse miss now carries the output it failed to parse
+
+`test_task3_leindex_end_to_end_on_fixture` failed twice in 26 runs, both times
+while the machine was saturated with compiles: the fixture's `cargo test` output
+carried no `panicked at crates/provider-openai/src/lib.rs:LINE` text, so the
+parser returned `None`. The assertion was right to fail — it refuses to claim a
+located failure that is not there — but its note said only `failing line parsed
+as None, want Some(44)`, discarding the one artefact that identifies the cause,
+and the raw output lives in a per-session log that is gone before CI logs are
+read. Both task-3 arms (native and leindex) now append the last six non-empty
+lines of the output they searched to that note. Nothing about the pass/fail
+condition changed, and 24 subsequent runs of the suite passed.
+
+### Dependency security sweep: eight live RUSTSEC vulnerabilities retired, plus one "unsound"
+
+`cargo audit` reported eight live vulnerabilities on this tree — all eight on
+the QUIC stack — plus one informational `unsound` warning, which audit counts
+separately and leaves out of its failure gate. All nine are fixed by the
+patched release. `deny.toml` still carries `ignore = []`, so none is
+suppressed.
+
+- `quinn-proto` 0.11.16 -> 0.11.19. Seven advisories against the QUIC state
+  machine, each reachable only from a remote peer: zero-length STREAM frames
+  panicking the `RangeSet` during unordered reads (RUSTSEC-2026-0338),
+  `MAX_STREAM_DATA` opening streams beyond the negotiated limit (-0523),
+  a bypassed stream-reassembly memory guard (-0341), a long Retry token
+  panicking or exhausting memory in a client (-0524), unbounded growth of
+  pending connection-ID retirements (-0339), a peer's minimum ACK delay
+  panicking when ACK_FREQUENCY is transmitted (-0340), and zero-length
+  DATAGRAM frames bypassing the receive buffer limit (-0342). The fixes
+  landed in 0.11.18; 0.11.19 is the current release in that line.
+- `quinn-udp` 0.5.15 -> 0.5.16, and `quinn` 0.11.11 -> 0.11.12 to match. The
+  UDP receive loop could spin after a truncated datagram
+  (RUSTSEC-2026-0538); 0.5.16 is the patched release in that line.
+- `rustix` 1.1.4 -> 1.1.6. The `xattr` getters marked unwritten bytes as
+  initialised when handed a zero-length buffer, so a `Vec` sized to its
+  capacity had its length set past its capacity over memory that was never
+  written — undefined behaviour reachable from safe code
+  (RUSTSEC-2026-0486, informational `unsound`). Patched in 1.1.6, which is
+  what the resolver now selects.
+
+`quinn` reaches this tree only through `reqwest`'s `http3` feature edge
+(`cfg(not(target_arch = "wasm32"))`); `remote-embeddings` and `system-one`
+enable `reqwest`, and CI's `cargo deny check advisories` runs with
+`--all-features`, so the widest graph is the one the gate evaluates.
+
+The resolver re-derives nine `windows-sys` edges and one `getrandom` edge while
+it takes these bumps: `errno`, `tempfile` and `winapi-util` (plus the `windows-sys`
+selection for `anstyle-query`, `anstyle-wincon`, `nu-ansi-term`, `socket2`,
+`stacker` and `termina`) move to a lower `windows-sys` line already present in the
+lock. Every affected requirement admits it (`errno` and `rustix` `>=0.52, <0.62`,
+`tempfile` `>=0.52, <0.62`, `quinn-udp` `>=0.52, <=0.61`, `winapi-util`
+`>=0.48, <=0.61`), no `windows-sys` version leaves the graph, and none of it
+compiles on Linux.
+
+### Version parity, MSRV, and the release body rebuilt from three sources
+
+Every published surface read `2.1.5` at the tag and reads `2.2.0` now: `Cargo.toml`
+and `Cargo.lock`, the four `package.json` files (root, `dashboard/`, `pi/`,
+`packages/npm-leindex-mcp/`), PyPI's `pyproject.toml` and its runtime
+`__version__`, and the three installers. `release.yml`'s `detect` job compares all
+of them against `Cargo.toml` and exits 1 on the first mismatch, so a bump that
+touched only `Cargo.toml` would fail the release before any build started — the
+reason AGENTS.md calls this out as a same-change rule.
+
+The MSRV moved twice: `rust-version = "1.88"` at `v2.1.5`, then `1.89` with the
+`rusqlite` 0.41 / SQLite security bump, whose `libsqlite3-sys` 0.39 declares 1.88
+and `rusqlite` 0.41 declares 1.89. The installers' preflight floor followed —
+1.88 in all three at `v2.1.5`, 1.89 in all three now — and the Rust badge read
+`1.85` in three READMEs and `1.75` in the Chinese one; all four badges read `1.89`
+today, matching `Cargo.toml`.
+
+The release notes themselves were `git log --no-merges` output only, so they never
+named the version, dropped every lane/PR merge (the only top-level description of
+multi-lane work), listed `wip(...)` orchestrator safety snapshots as shipped
+changes, and truncated the tracked `CHANGELOG.md` in the process. `release.yml` now
+assembles the body from the curated `## [<version>]` section first, then merges
+(minus `Merge branch 'x' into y` integration steps), then individual commits (minus
+`wip(...)` and `chore(release)`), writing to a scratch `release-body.md`. Four new
+tests in `tests/release_bundle_packaging_test.rs` pin exactly that — the curated
+lead, merge inclusion minus integration steps, the `wip` filter, and a body path
+matching the file the step writes.
+
+### Setup: one quiet test fix in this range
+
+`test_layer_search_hydration_matches_graph_rebuild` now pins
+`LEINDEX_FEATURE_REMOTE_EMBEDDINGS` off alongside `NeuralSearch`, and sandboxes
+`LEINDEX_HOME` to an empty directory for the whole test. Both legs of the
+equivalence were resolving an embedder from the ambient config: the graph-rebuild
+leg asks the config alone, while the layer-restored leg uses the persisted
+embedder, so on a host whose config resolved any embedding route the rebuilt
+engine scored neurally while the restored one stayed TF-IDF. The same commit gates
+`build_neural_embedder` on the canonical `is_neural_enabled` switch, so a daemon
+client cached by an earlier caller can no longer re-arm local neural scoring for
+every later consumer of the process — which is what let a flag pinned off still
+score neurally in a test.
+
+The remaining setup entries that used to sit under this file's `[Unreleased]`
+heading describe work that was already in the `v2.1.5` tree, and are recorded
+there instead.
+
 ## [2.1.5]
+
+### Setup: embedding routes, managed llama.cpp, config subcommands
+
+- `leindex setup` gains route selection: local Qwen3 ONNX (`--embedding
+  qwen3`), a managed EmbeddingGemma2 GGUF service on Linux (`--embedding
+  embeddinggemma2` with an explicit `--llama-server` path or a verified
+  official `--download-llama cpu|vulkan|cuda` runtime), and external
+  OpenAI-compatible servers (`--embedding remote`). `--embedding keep`
+  preserves the existing route across reruns.
+- Official llama.cpp downloads pin tag `b11574` and verify the archive
+  against SHA256 metadata from GitHub's HTTPS release API before extraction.
+- New `leindex config` subcommands (path/show/get/set/unset/validate) expose
+  the shared config file without rerunning setup.
+- `--check` runs a bounded, never-spawning readiness probe (embeddings route
+  and System One gate) instead of only reporting static configuration.
+
+### Setup fixes: config escape hints, System One probe
+
+- `config set`/`config unset` failures caused by dangling cross-references
+  (`embeddings.remote_service`, `system_one.service`, `active_preset`,
+  `presets.<n>.service`) now name the exact `leindex config unset <key>` escape;
+  previously every `config set` failed while such a reference existed, with no
+  unstick path in the error.
+- `config unset` also repairs multi-dangling configurations: removing one
+  dangling reference no longer fails because another pre-existing one remains.
+  The repair saves only when nothing else is invalid — a pre-existing reference
+  never masks other violations, and the reported error is the masked one, not
+  the reference — while references the edit itself creates (deleting a service
+  that is still referenced) are still refused.
+- `leindex setup --check` no longer dies with "Cannot start a runtime from
+  within a runtime" when the System One laya probe runs. The CLI wraps every
+  command in a tokio runtime, so a `block_on` there panics, and a
+  `block_in_place` branch would panic too: inside a current-thread runtime
+  `Handle::try_current()` still answers `Ok`, but there is no blocking pool to
+  hop to. The probe therefore builds a scratch current-thread runtime and drives
+  the request on a thread that owns it (`std::thread::scope`, so the borrowed
+  `asker` and `request` need no clone) — the one shape correct from the
+  interactive wizard, a multi-threaded runtime, and a current-thread one.
+- Setup documentation overhauled: README (and package mirrors) document the
+  System One gate (experimental) with build/wizard/flag/verify steps and an
+  MCP `env` block; INSTALLATION and INSTALLATION_RUST cover managed services,
+  System One provisioning, expanded verification, and the sharp edges learned
+  during bring-up (all-or-nothing `config set`, GPU device pinning, one model
+  per llama-server, reindex-on-model-change, probe spawn semantics, release-LTO
+  memory pressure); NEURAL_SETUP expands Configuration and System One with mode
+  semantics, thresholds, and Laya GGUF sourcing.
+- `.env.example`'s feature-flag header already lists `RemoteEmbeddings` among the
+  flags that are ON by default — the value `FeatureFlag::default_value` returns —
+  so the header and the code agree without an edit.
 
 ### Added
 
@@ -66,56 +315,6 @@ All notable changes to the LeIndex project are documented in this file.
 - Installer scripts keep their executable bit; a committed-mode guard fails
   CI on any release bump that drops it (third recurrence), and
   `leindex_structural` is classified read-only for the System-One gate.
-
-## [Unreleased]
-
-### Setup fixes: config escape hints, hermetic hydration test, System One probe
-
-- `config set`/`config unset` failures caused by dangling cross-references
-  (`embeddings.remote_service`, `system_one.service`, `active_preset`,
-  `presets.<n>.service`) now name the exact `leindex config unset <key>`
-  escape; previously every `config set` failed while such a reference existed,
-  with no unstick path in the error.
-- `config unset` also repairs multi-dangling configurations: removing one
-  dangling reference no longer fails because another pre-existing one remains.
-  The repair saves only when nothing else is invalid — a pre-existing
-  reference never masks other violations, and the reported error is the
-  masked one, not the reference — while references the edit itself creates
-  (deleting a service that is still referenced) are still refused.
-- `leindex setup --check` no longer panics with "Cannot start a runtime from
-  within a runtime" when the System One laya probe runs: the CLI wraps every
-  command in a tokio runtime, and the probe's confirmation prompt now drives
-  the request on the ambient handle (`block_in_place`), building a private
-  runtime only when invoked standalone.
-- `test_layer_search_hydration_matches_graph_rebuild` pins
-  `LEINDEX_FEATURE_REMOTE_EMBEDDINGS=0`: the flag is default-ON, and a
-  resolvable remote route leaked into the layer-restored path only, making
-  the equivalence test fail on configured hosts.
-- `.env.example` corrected: `LEINDEX_FEATURE_REMOTE_EMBEDDINGS` is
-  default-ON, not default-OFF.
-- Setup documentation overhauled: README (and package mirrors) document the
-  System One gate (experimental) with build/wizard/flag/verify steps and an
-  MCP `env` block; INSTALLATION and INSTALLATION_RUST cover managed services,
-  System One provisioning, expanded verification, and the sharp edges learned
-  during bring-up (all-or-nothing `config set`, GPU device pinning, one
-  model per llama-server, reindex-on-model-change, probe spawn semantics,
-  release-LTO memory pressure); NEURAL_SETUP expands Configuration and
-  System One with mode semantics, thresholds, and Laya GGUF sourcing.
-
-### Setup: embedding routes, managed llama.cpp, config subcommands
-
-- `leindex setup` gains route selection: local Qwen3 ONNX (`--embedding
-  qwen3`), a managed EmbeddingGemma2 GGUF service on Linux (`--embedding
-  embeddinggemma2` with an explicit `--llama-server` path or a verified
-  official `--download-llama cpu|vulkan|cuda` runtime), and external
-  OpenAI-compatible servers (`--embedding remote`). `--embedding keep`
-  preserves the existing route across reruns.
-- Official llama.cpp downloads pin tag `b11574` and verify the archive
-  against SHA256 metadata from GitHub's HTTPS release API before extraction.
-- New `leindex config` subcommands (path/show/get/set/unset/validate) expose
-  the shared config file without rerunning setup.
-- `--check` runs a bounded, never-spawning readiness probe (embeddings route
-  and System One gate) instead of only reporting static configuration.
 
 ## [2.0.0] - 2026-09-30 - Four tools, native text search, millisecond cold starts
 

@@ -1,3 +1,6 @@
+use super::git_diff_handler::{
+    MAX_DIFF_BYTES, line_starts, lines_to_bytes, parse_hunks, run_git_capped,
+};
 use super::helpers::{
     extract_bool, extract_usize, get_direct_callers, node_type_str, wrap_live_with_meta,
     wrap_live_with_meta_status,
@@ -160,6 +163,7 @@ impl GitStatusHandler {
                     "affected_symbols_capped": enrichment.affected_symbols_capped,
                     "affected_files": enrichment.affected_files,
                     "pdg_enriched": true,
+                    "symbol_mapping": "hunk",
                 });
             }
             Err(error) => {
@@ -317,10 +321,30 @@ fn enrich_pdg(
         {
             nodes = pdg.nodes_in_file(&canonical.to_string_lossy());
         }
+        let hunks = symbol_hunk_ranges(root, &absolute, &path_string(&path));
         let symbols = nodes
             .iter()
             .filter_map(|node_id| {
                 let node = pdg.get_node(*node_id)?;
+                // §3.11: report only symbols whose bodies the changed HUNKS
+                // touch. Synthetic per-file summary nodes carry no source
+                // span, so they stay (the file did change); everything else
+                // is mapped against the hunk byte ranges read from disk.
+                let touched = match (&hunks, node.byte_range) {
+                    (Some(ranges), _) if ranges.is_empty() => true,
+                    (Some(ranges), (start, end)) => {
+                        end <= start
+                            || ranges
+                                .iter()
+                                .any(|(from, to)| start < *to.max(&(*from + 1)) && end > *from)
+                    }
+                    // No hunks (untracked file, unborn HEAD, unreadable
+                    // patch): file-level attribution, as before.
+                    (None, _) => true,
+                };
+                if !touched {
+                    return None;
+                }
                 roots.insert(*node_id);
                 let callers = get_direct_callers(pdg, *node_id);
                 Some(json!({
@@ -366,6 +390,44 @@ fn enrich_pdg(
         affected_symbols_capped,
         affected_files,
     })
+}
+
+/// Byte ranges of the working-tree hunks of one changed file, read from disk.
+///
+/// `None` when hunk mapping cannot run (untracked file — `git diff` never
+/// lists it — or the patch could not be captured): the caller then falls back
+/// to file-level attribution. An empty `Some` means "no hunks" and keeps the
+/// file's symbols (a modification whose diff is empty is still a change).
+///
+/// Reuses the diff handler's `-U0` hunk parser so both surfaces agree on what
+/// a hunk is; the enclosing-symbol test (hunk byte range overlaps the node's
+/// byte span) mirrors `git_diff_handler::enrich_files`.
+fn symbol_hunk_ranges(root: &Path, absolute: &Path, relative: &str) -> Option<Vec<(usize, usize)>> {
+    let (bytes, _) = run_git_capped(
+        root,
+        &[
+            "diff".to_string(),
+            "--no-color".to_string(),
+            "--no-ext-diff".to_string(),
+            "-U0".to_string(),
+            "-M".to_string(),
+            "HEAD".to_string(),
+            "--".to_string(),
+            relative.to_string(),
+        ],
+        MAX_DIFF_BYTES,
+    )
+    .ok()?;
+    let patch = String::from_utf8_lossy(&bytes).into_owned();
+    let ranges = parse_hunks(&patch).remove(relative)?;
+    let content = std::fs::read(absolute).ok()?;
+    let starts = line_starts(&content);
+    Some(
+        ranges
+            .iter()
+            .map(|(start, end)| lines_to_bytes(&starts, content.len(), *start, *end))
+            .collect(),
+    )
 }
 
 fn changed_paths(status: &GitStatus) -> Vec<(PathBuf, &'static str)> {

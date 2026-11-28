@@ -874,6 +874,73 @@ fn chained_method_name(callee: &str) -> Option<&str> {
 
 /// Extract function calls from a Rust node
 fn extract_rust_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
+    extract_rust_calls_depth(node, source, MACRO_REPARSE_DEPTH)
+}
+
+/// How many levels of nested macro token trees are re-parsed for calls.
+///
+/// The Rust grammar parses macro bodies as flat token trees, so `callee(1)`
+/// inside `assert_eq!(callee(1), 2)` is an identifier sequence, not a
+/// `call_expression` — every call made inside a macro (assert!, println!,
+/// vec!, tokio::spawn!, …) previously vanished from the call graph, leaving
+/// test functions (which are assert-heavy) with no outgoing call edges at
+/// all. The token-tree text is re-parsed as Rust and descended into,
+/// bounded by nesting depth to keep pathological inputs cheap.
+const MACRO_REPARSE_DEPTH: usize = 3;
+
+/// Standard macros whose arguments are tokens for the compiler, not code
+/// that runs at the call site. A function named inside `stringify!(leaf())`
+/// is NOT called, so recording `leaf` from its body would add a false `Call`
+/// edge (visible in caller lists and test lookups). The set is explicit:
+/// anything not listed is treated as evaluating its arguments, which is the
+/// conservative choice for `assert!`, `format!`, `vec!`, `tokio::spawn!`, …
+const MACROS_WHOSE_ARGUMENTS_ARE_NOT_EVALUATED: &[&str] = &[
+    "stringify",
+    "concat",
+    "concat_bytes",
+    "include",
+    "include_str",
+    "include_bytes",
+    "cfg",
+    "env",
+    "option_env",
+    "module_path",
+    "line",
+    "file",
+    "column",
+    "compile_error",
+    "asm",
+    "global_asm",
+    "naked_asm",
+];
+
+/// Rewrite a `token_tree`'s outer `(...)` or `{...}` delimiter to `[...]`,
+/// leaving `[...]` and anything malformed untouched. Used for `vec!` so the
+/// repeat form `vec![expr; n]` re-parses as an array expression.
+fn normalise_outer_delimiter_to_brackets(text: &str) -> String {
+    let bytes = text.as_bytes();
+    if bytes.len() < 2 {
+        return text.to_string();
+    }
+    let (open, close) = match (bytes[0], bytes[bytes.len() - 1]) {
+        (b'(', b')') => ("(", ")"),
+        (b'{', b'}') => ("{", "}"),
+        _ => return text.to_string(),
+    };
+    let inner = &text[1..text.len() - 1];
+    // Only a balanced outer pair is rewritten: a body that opens and closes
+    // differently is not a delimiter-wrapped token tree.
+    if inner.matches(open).count() > inner.matches(close).count() {
+        return text.to_string();
+    }
+    format!("[{inner}]")
+}
+
+fn extract_rust_calls_depth(
+    node: &tree_sitter::Node<'_>,
+    source: &[u8],
+    depth: usize,
+) -> Vec<String> {
     if crate::parse::traits::lite() {
         return Default::default();
     }
@@ -914,8 +981,99 @@ fn extract_rust_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
         }
     }
 
-    let mut stack = vec![*node];
-    while let Some(current) = stack.pop() {
+    /// Calls hidden inside a macro invocation's token tree.
+    ///
+    /// The grammar has no rules for macro bodies, so their contents parse as
+    /// flat tokens and `extract_call_expression` can never fire on them. The
+    /// `token_tree` text is re-parsed as Rust under three wrappers, tried in
+    /// order and only accepted on an error-free parse:
+    ///   1. a function block — statement-shaped bodies (`foo(x); let y = …`);
+    ///   2. a parenthesised expression — comma-separated argument lists
+    ///      (`assert_eq!(a, b)`, `println!("{} {}", f(), g())`);
+    ///   3. bare content — a single expression (`vec![…]`).
+    ///
+    /// A body that fits no wrapper (a custom DSL macro) is skipped silently:
+    /// recording nothing is the previous behaviour, and inventing calls from
+    /// DSL tokens would be worse. The wrapper ladder matters because a
+    /// multi-argument macro body (`callee(1), 2`) is not valid Rust at file
+    /// level, and a statement body is not valid inside parentheses.
+    ///
+    /// `macro_name` is the invoked macro's identifier (`vec`, `stringify`,
+    /// …) and drives two exceptions to the generic reparse:
+    ///
+    /// * [`MACROS_WHOSE_ARGUMENTS_ARE_NOT_EVALUATED`]: the body is tokens
+    ///   for the compiler, not code that runs, so nothing in it is a call.
+    /// * `vec`: the repeat form `vec![expr; n]` is valid, but the extracted
+    ///   `token_tree` text keeps its own delimiter. Every wrapper leaves the
+    ///   `;` inside those parentheses/braces, so none of the three
+    ///   candidates parses; the equivalent bracket form parses as an array
+    ///   expression. The outer delimiter is normalised to brackets first.
+    fn reparse_macro_calls(
+        token_tree: &tree_sitter::Node<'_>,
+        source: &[u8],
+        calls: &mut Vec<String>,
+        depth: usize,
+        macro_name: &str,
+    ) {
+        if depth == 0 {
+            return;
+        }
+        if MACROS_WHOSE_ARGUMENTS_ARE_NOT_EVALUATED.contains(&macro_name) {
+            return;
+        }
+        let Ok(text) = token_tree.utf8_text(source) else {
+            return;
+        };
+        let text = if macro_name == "vec" {
+            normalise_outer_delimiter_to_brackets(text)
+        } else {
+            text.to_string()
+        };
+        let candidates = [
+            format!("fn __leindex_macro_body() {{ {text} }}"),
+            format!("({text})"),
+            text.clone(),
+        ];
+        for (idx, candidate) in candidates.iter().enumerate() {
+            let mut parser = Parser::new();
+            if parser
+                .set_language(&crate::parse::traits::languages::rust::language())
+                .is_err()
+            {
+                return;
+            }
+            let Some(tree) = parser.parse(candidate.as_bytes(), None) else {
+                continue;
+            };
+            let root = tree.root_node();
+            if root.has_error() {
+                continue;
+            }
+            // Wrapper 1 hides the content inside a function_item, which the
+            // descent deliberately skips (its calls belong to themselves), so
+            // continue from the body block instead of the root.
+            let descend_from = if idx == 0 {
+                let Some(body) = root
+                    .child(0)
+                    .and_then(|fn_item| fn_item.child_by_field_name("body"))
+                else {
+                    continue;
+                };
+                body
+            } else {
+                root
+            };
+            calls.extend(extract_rust_calls_depth(
+                &descend_from,
+                candidate.as_bytes(),
+                depth - 1,
+            ));
+            return;
+        }
+    }
+
+    let mut stack = vec![(*node, depth)];
+    while let Some((current, depth)) = stack.pop() {
         match current.kind() {
             "call_expression" => {
                 extract_call_expression(&current, source, &mut calls, clean_call_text);
@@ -941,6 +1099,7 @@ fn extract_rust_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
                 }
             }
             "macro_invocation" => {
+                let mut macro_name = String::new();
                 if let Some(name_node) = current
                     .child_by_field_name("macro")
                     .or_else(|| current.child_by_field_name("name"))
@@ -948,8 +1107,22 @@ fn extract_rust_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
                 {
                     let name = clean_call_text(text);
                     if !name.is_empty() {
+                        // Keep only the final path segment: `std::stringify!`
+                        // and `stringify!` are the same textual macro.
+                        macro_name = name
+                            .rsplit("::")
+                            .next()
+                            .unwrap_or(&name)
+                            .trim_end_matches('!')
+                            .to_string();
                         calls.push(name);
                     }
+                }
+                if let Some(token_tree) = current
+                    .children(&mut current.walk())
+                    .find(|child| child.kind() == "token_tree")
+                {
+                    reparse_macro_calls(&token_tree, source, &mut calls, depth, &macro_name);
                 }
             }
             "struct_expression" => {
@@ -970,7 +1143,7 @@ fn extract_rust_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
             if child.kind() == "function_item" {
                 continue;
             }
-            stack.push(child);
+            stack.push((child, depth));
         }
     }
     calls
@@ -1285,568 +1458,8 @@ fn normalize_type_ref(raw: &str) -> Option<String> {
     Some(last.to_string())
 }
 
+/// The parser's tests live in `rust_test.rs` so this file stays under the
+/// repository's 2000-line budget (`Large File Detection`).
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_rust_function_extraction() {
-        let source = b"fn greet(name: &str) -> String {
-    format!(\"Hello, {}\", name)
-}";
-
-        let parser = RustParser::new();
-        let signatures = parser.get_signatures(source).unwrap();
-
-        assert_eq!(signatures.len(), 1);
-        let sig = &signatures[0];
-        assert_eq!(sig.name, "greet");
-        assert_eq!(sig.parameters.len(), 1);
-        assert_eq!(sig.parameters[0].name, "name");
-        assert_eq!(sig.return_type, Some("String".to_string()));
-        assert!(!sig.is_method);
-    }
-
-    #[test]
-    fn test_rust_async_function() {
-        let source = b"async fn fetch_data(url: &str) -> Result<String, Error> {
-    Ok(String::new())
-}";
-
-        let parser = RustParser::new();
-        let signatures = parser.get_signatures(source).unwrap();
-
-        assert_eq!(signatures.len(), 1);
-        let sig = &signatures[0];
-        assert_eq!(sig.name, "fetch_data");
-        assert!(sig.is_async);
-    }
-
-    #[test]
-    fn test_rust_method_extraction() {
-        let source = b"impl Server {
-    fn new() -> Self {
-        Server {}
-    }
-
-    pub fn start(&mut self) -> Result<(), Error> {
-        Ok(())
-    }
-}
-
-impl Client for Server {
-    fn connect(&self) -> bool {
-        true
-    }
-}";
-
-        let parser = RustParser::new();
-        let signatures = parser.get_signatures(source).unwrap();
-
-        // Should find methods from impl blocks
-        let methods: Vec<_> = signatures.iter().filter(|s| s.is_method).collect();
-        assert!(!methods.is_empty());
-        assert!(
-            methods
-                .iter()
-                .any(|sig| sig.qualified_name == "Server::new")
-        );
-        assert!(
-            methods
-                .iter()
-                .any(|sig| sig.qualified_name == "Server::start")
-        );
-        assert!(
-            methods
-                .iter()
-                .any(|sig| sig.qualified_name == "Server::connect")
-        );
-    }
-
-    #[test]
-    fn test_rust_struct_extraction() {
-        let source = b"struct Point {
-    x: f64,
-    y: f64,
-}
-
-pub struct Person {
-    pub name: String,
-    pub age: u32,
-}";
-
-        let parser = RustParser::new();
-        let signatures = parser.get_signatures(source).unwrap();
-
-        assert!(signatures.len() >= 2);
-
-        let point = signatures.iter().find(|s| s.name == "Point");
-        assert!(point.is_some());
-
-        let person = signatures.iter().find(|s| s.name == "Person");
-        assert!(person.is_some());
-    }
-
-    #[test]
-    fn test_rust_enum_extraction() {
-        let source = b"enum Option<T> {
-    Some(T),
-    None,
-}
-
-pub enum Result<T, E> {
-    Ok(T),
-    Err(E),
-}";
-
-        let parser = RustParser::new();
-        let signatures = parser.get_signatures(source).unwrap();
-
-        assert!(signatures.len() >= 2);
-
-        let option = signatures.iter().find(|s| s.name == "Option");
-        assert!(option.is_some());
-
-        let result = signatures.iter().find(|s| s.name == "Result");
-        assert!(result.is_some());
-        assert!(
-            signatures
-                .iter()
-                .any(|s| s.qualified_name == "Option::Some")
-        );
-        assert!(
-            signatures
-                .iter()
-                .any(|s| s.qualified_name == "Option::None")
-        );
-    }
-
-    #[test]
-    fn test_rust_trait_extraction() {
-        let source = b"trait Display {
-    fn fmt(&self, f: &mut Formatter) -> Result;
-}
-
-trait Iterator {
-    type Item;
-    fn next(&mut self) -> Option<Self::Item>;
-}";
-
-        let parser = RustParser::new();
-        let signatures = parser.get_signatures(source).unwrap();
-
-        // Should extract trait declarations
-        assert!(signatures.len() >= 2);
-
-        let display = signatures.iter().find(|s| s.name == "Display");
-        assert!(display.is_some());
-
-        let iterator = signatures.iter().find(|s| s.name == "Iterator");
-        assert!(iterator.is_some());
-    }
-
-    #[test]
-    fn test_rust_visibility_modifiers() {
-        let source = b"pub fn public_function() {}
-
-fn private_function() {}
-
-pub(crate) fn crate_function() {}";
-
-        let parser = RustParser::new();
-        let signatures = parser.get_signatures(source).unwrap();
-
-        assert_eq!(signatures.len(), 3);
-
-        let public = signatures.iter().find(|s| s.name == "public_function");
-        assert_eq!(public.unwrap().visibility, Visibility::Public);
-
-        let private = signatures.iter().find(|s| s.name == "private_function");
-        assert_eq!(private.unwrap().visibility, Visibility::Private);
-
-        let crate_fn = signatures.iter().find(|s| s.name == "crate_function");
-        assert!(crate_fn.is_some());
-    }
-
-    #[test]
-    fn test_rust_import_extraction() {
-        let source = b"use std::collections::HashMap;
-use crate::module::Item;
-
-fn main() {}";
-
-        let parser = RustParser::new();
-        let signatures = parser.get_signatures(source).unwrap();
-
-        // Should extract use declarations
-        let imports: Vec<_> = signatures
-            .iter()
-            .filter(|s| s.return_type.as_deref() == Some("use"))
-            .collect();
-
-        assert!(imports.len() >= 2);
-    }
-
-    #[test]
-    fn test_rust_self_parameter() {
-        let source = b"impl Foo {
-    fn by_ref(&self) -> i32 { 0 }
-    fn by_mut_ref(&mut self) -> i32 { 0 }
-    fn by_value(self) -> i32 { 0 }
-}";
-
-        let parser = RustParser::new();
-        let signatures = parser.get_signatures(source).unwrap();
-
-        assert_eq!(signatures.len(), 3);
-
-        for sig in &signatures {
-            assert!(sig.is_method);
-            assert!(!sig.parameters.is_empty());
-            assert!(sig.parameters[0].name.contains("self"));
-        }
-    }
-
-    #[test]
-    fn test_rust_complexity_calculation() {
-        let source = b"fn complex(x: i32) -> i32 {
-    if x > 0 {
-        for i in 0..x {
-            if i % 2 == 0 {
-                println!(\"{}\", i);
-            }
-        }
-    }
-    x
-}";
-
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .unwrap();
-        let tree = parser.parse(source, None).unwrap();
-        let root = tree.root_node();
-
-        let rust_parser = RustParser::new();
-        let metrics = rust_parser.extract_complexity(&root);
-
-        assert!(metrics.cyclomatic > 1);
-        assert!(metrics.nesting_depth > 0);
-    }
-
-    #[test]
-    fn test_rust_complexity_with_boolean_operators() {
-        let source = b"fn boolean_ops(x: i32, y: i32) -> bool {
-    if x > 0 && y > 0 {
-        return true;
-    }
-    if x < 0 || y < 0 {
-        return false;
-    }
-    x > 0 && y > 0 || x == 0 && y == 0
-}";
-
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .unwrap();
-        let tree = parser.parse(source, None).unwrap();
-        let root = tree.root_node();
-
-        let rust_parser = RustParser::new();
-        let metrics = rust_parser.extract_complexity(&root);
-
-        // Base complexity (1) + 2 if expressions (2) + 5 boolean operators (5) = 8
-        assert!(
-            metrics.cyclomatic >= 8,
-            "Expected cyclomatic complexity >= 8, got {}",
-            metrics.cyclomatic
-        );
-    }
-
-    #[test]
-    fn test_rust_complexity_with_try_expressions() {
-        let source = b"fn try_ops(result: Result<i32, Error>) -> Result<i32, Error> {
-    let x = result?;
-    let y = Some(2).ok_or(Error::NotFound)?;
-    Ok(x + y)
-}";
-
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .unwrap();
-        let tree = parser.parse(source, None).unwrap();
-        let root = tree.root_node();
-
-        let rust_parser = RustParser::new();
-        let metrics = rust_parser.extract_complexity(&root);
-
-        // Base complexity (1) + 2 try expressions (2) = 3
-        assert!(
-            metrics.cyclomatic >= 3,
-            "Expected cyclomatic complexity >= 3, got {}",
-            metrics.cyclomatic
-        );
-    }
-
-    #[test]
-    fn test_rust_complexity_combined() {
-        let source = b"fn combined(x: i32, y: i32) -> i32 {
-    if x > 0 && y > 0 {
-        return x + y;
-    }
-    if x < 0 || y < 0 {
-        return x - y;
-    }
-    0
-}";
-
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .unwrap();
-        let tree = parser.parse(source, None).unwrap();
-        let root = tree.root_node();
-
-        let rust_parser = RustParser::new();
-        let metrics = rust_parser.extract_complexity(&root);
-
-        // Base complexity (1) + 2 if expressions (2) + 2 boolean operators (2) = 5
-        // Note: tree-sitter might parse complex boolean expressions as nested binary expressions
-        assert_eq!(
-            metrics.cyclomatic, 5,
-            "Expected cyclomatic complexity = 5, got {}",
-            metrics.cyclomatic
-        );
-    }
-
-    #[test]
-    fn test_rust_complexity_with_try_and_bool() {
-        let source =
-            b"fn try_and_bool(x: Result<i32, Error>, y: Result<i32, Error>) -> Result<i32, Error> {
-    let a = x?;
-    let b = y?;
-    if a > 0 && b > 0 {
-        return Ok(a + b);
-    }
-    Ok(a - b)
-}";
-
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .unwrap();
-        let tree = parser.parse(source, None).unwrap();
-        let root = tree.root_node();
-
-        let rust_parser = RustParser::new();
-        let metrics = rust_parser.extract_complexity(&root);
-
-        // Base complexity (1) + 1 if expression (1) + 1 boolean operator (1) + 2 try expressions (2) = 5
-        assert_eq!(
-            metrics.cyclomatic, 5,
-            "Expected cyclomatic complexity = 5, got {}",
-            metrics.cyclomatic
-        );
-    }
-
-    #[test]
-    fn test_rust_cyclomatic_complexity_populated_in_signature() {
-        let source = b"fn complex_fn(x: i32) -> i32 {
-    if x > 0 {
-        return x * 2;
-    }
-    x + 1
-}";
-
-        let parser = RustParser::new();
-        let signatures = parser.get_signatures(source).unwrap();
-
-        assert_eq!(signatures.len(), 1);
-        let sig = &signatures[0];
-        assert_eq!(sig.name, "complex_fn");
-
-        // Verify that cyclomatic_complexity is populated
-        // The function has 1 if expression, so cyclomatic complexity should be 2 (base 1 + 1 if)
-        assert!(
-            sig.cyclomatic_complexity >= 1,
-            "cyclomatic_complexity should be >= 1, got {}",
-            sig.cyclomatic_complexity
-        );
-    }
-
-    #[test]
-    fn test_rust_struct_instantiation_calls() {
-        let source = b"fn create_structs() {
-    let x = MyStruct { field: 1 };
-    let y = AnotherStruct { value: compute() };
-    let z = GenericStruct::<i32> { data: 42 };
-}
-
-fn compute() -> i32 {
-    42
-}";
-
-        let parser = RustParser::new();
-        let signatures = parser.get_signatures(source).unwrap();
-
-        let create_structs_fn = signatures.iter().find(|s| s.name == "create_structs");
-        assert!(
-            create_structs_fn.is_some(),
-            "create_structs function not found"
-        );
-
-        let fn_sig = create_structs_fn.unwrap();
-
-        // Should detect struct instantiations
-        assert!(
-            fn_sig.calls.iter().any(|c| c.contains("MyStruct")),
-            "Should detect MyStruct instantiation, got calls: {:?}",
-            fn_sig.calls
-        );
-        assert!(
-            fn_sig.calls.iter().any(|c| c.contains("AnotherStruct")),
-            "Should detect AnotherStruct instantiation, got calls: {:?}",
-            fn_sig.calls
-        );
-        assert!(
-            fn_sig.calls.iter().any(|c| c.contains("GenericStruct")),
-            "Should detect GenericStruct instantiation, got calls: {:?}",
-            fn_sig.calls
-        );
-
-        // Should also detect function calls within struct fields
-        assert!(
-            fn_sig.calls.iter().any(|c| c.contains("compute")),
-            "Should detect compute() call within struct field, got calls: {:?}",
-            fn_sig.calls
-        );
-    }
-
-    #[test]
-    fn test_rust_scoped_identifier_extraction() {
-        let source = b"
-struct DeepThoughtManager {
-    answer: i32,
-}
-
-impl DeepThoughtManager {
-    fn new() -> Self {
-        DeepThoughtManager { answer: 42 }
-    }
-}
-
-fn test_function() {
-    let manager = DeepThoughtManager::new();
-    let another = DeepThoughtManager::new();
-}";
-
-        let parser = RustParser::new();
-        let signatures = parser.get_signatures(source).unwrap();
-
-        let test_fn = signatures.iter().find(|s| s.name == "test_function");
-        assert!(test_fn.is_some(), "test_function not found");
-
-        let fn_sig = test_fn.unwrap();
-
-        // Should detect the scoped function call DeepThoughtManager::new
-        assert!(
-            fn_sig
-                .calls
-                .iter()
-                .any(|c| c.contains("DeepThoughtManager::new")),
-            "Should detect DeepThoughtManager::new call, got calls: {:?}",
-            fn_sig.calls
-        );
-
-        // Should also detect just the type prefix DeepThoughtManager
-        assert!(
-            fn_sig.calls.iter().any(|c| c == "DeepThoughtManager"),
-            "Should detect DeepThoughtManager type prefix, got calls: {:?}",
-            fn_sig.calls
-        );
-    }
-
-    #[test]
-    fn test_rust_mod_item_extraction() {
-        let source = b"
-pub mod outer {
-    mod inner {
-        fn baz() {}
-    }
-}
-mod external;
-";
-
-        let parser = RustParser::new();
-        let signatures = parser.get_signatures(source).unwrap();
-
-        // Module signatures should be present
-        let outer = signatures.iter().find(|s| s.name == "outer");
-        assert!(outer.is_some(), "should emit SignatureInfo for `outer`");
-        assert_eq!(outer.unwrap().return_type.as_deref(), Some("module"));
-        assert_eq!(outer.unwrap().visibility, Visibility::Public);
-
-        let inner = signatures.iter().find(|s| s.name == "inner");
-        assert!(
-            inner.is_some(),
-            "should emit SignatureInfo for nested `inner`"
-        );
-        assert_eq!(inner.unwrap().return_type.as_deref(), Some("module"));
-
-        // `mod external;` should also produce a module signature
-        let ext = signatures.iter().find(|s| s.name == "external");
-        assert!(
-            ext.is_some(),
-            "should emit SignatureInfo for external `mod external;`"
-        );
-
-        // Function inside nested module should be indexed
-        let baz = signatures.iter().find(|s| s.name == "baz");
-        assert!(baz.is_some(), "nested fn baz should be indexed");
-        // qualified_name should reflect the module path exactly
-        assert_eq!(
-            baz.unwrap().qualified_name,
-            "outer::inner::baz",
-            "baz qualified_name should match the module path exactly"
-        );
-    }
-
-    #[test]
-    fn test_rust_flow_facts_capture_command_and_state_channels() {
-        let source = br#"
-fn execute_native_command(password: &str, askpass: &str) {
-    let mut command = std::process::Command::new("sudo");
-    command.arg("-S").env("SUDO_ASKPASS", askpass).stdin(password);
-    registry_record(password);
-    verify_installation();
-}
-"#;
-        let signatures = RustParser::new().get_signatures(source).unwrap();
-        let sig = signatures
-            .iter()
-            .find(|sig| sig.name == "execute_native_command")
-            .unwrap();
-
-        assert!(
-            sig.flow_facts.iter().any(|fact| {
-                fact.channel == FlowChannel::CommandArgument && fact.target == "argv"
-            })
-        );
-        assert!(sig.flow_facts.iter().any(|fact| {
-            fact.channel == FlowChannel::Environment && fact.target == "SUDO_ASKPASS"
-        }));
-        assert!(
-            sig.flow_facts
-                .iter()
-                .any(|fact| { fact.channel == FlowChannel::Stdin && fact.target == "password" })
-        );
-        assert!(sig.flow_facts.iter().any(|fact| {
-            fact.channel == FlowChannel::StateWrite && fact.target == "registry_record"
-        }));
-        assert!(sig.flow_facts.iter().any(|fact| {
-            fact.channel == FlowChannel::StateRead && fact.target == "verify_installation"
-        }));
-    }
-}
+#[path = "rust_test.rs"]
+mod tests;

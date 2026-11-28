@@ -742,6 +742,13 @@ mod test {
     use super::*;
 
     /// Hold LEINDEX_HOME for the whole test body; parallel tests serialize.
+    ///
+    /// The lock is the crate-wide [`crate::test_env::EnvLock`], the SAME one
+    /// every other `LEINDEX_HOME` mutation in the test suite holds. A private
+    /// mutex here would only order the services tests among themselves and
+    /// let a concurrent `set_var` from elsewhere (for example the generation
+    /// hydration sandbox) replace the home under a running services test,
+    /// which then reads `None` instead of its pidfile.
     struct HomeGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
         home: PathBuf,
@@ -749,14 +756,12 @@ mod test {
 
     impl HomeGuard {
         fn new() -> Self {
-            static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-            let lock = LOCK
-                .get_or_init(|| std::sync::Mutex::new(()))
+            let lock = crate::test_env::EnvLock
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()); // poison-proof: env is reset each acquire
             let tmp = tempfile::tempdir().unwrap();
             let home = tmp.path().to_path_buf();
-            // SAFETY: env mutation serialized by LOCK; restored on drop.
+            // SAFETY: env mutation serialized by the shared EnvLock; restored on drop.
             unsafe { std::env::set_var(crate::config::LEINDEX_HOME_ENV, &home) };
             std::mem::forget(tmp); // keep dir alive; OS tmp cleanup handles it
             Self { _lock: lock, home }

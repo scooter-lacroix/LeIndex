@@ -12,7 +12,7 @@
 
 use serde_json::Value;
 
-use super::diff::{render_default, render_diff_value};
+use super::diff::render_default;
 use super::{
     BOLD, DIM, LIGHT_BLUE, LIGHT_CYAN, LIGHT_GREEN, LIGHT_GREY, LIGHT_MAGENTA, LIGHT_RED,
     LIGHT_YELLOW, RESET, WHITE, normalize_tool_name, truncate_chars,
@@ -30,6 +30,9 @@ use map_impact::*;
 #[path = "tests.rs"]
 mod tests;
 
+mod edit;
+use edit::{render_edit_apply, render_edit_preview, render_rename_symbol};
+
 // =============================================================================
 // Shared formatters — small helpers used by multiple render_* fns
 // =============================================================================
@@ -42,7 +45,7 @@ pub(super) fn header(title: &str, color: bool) -> String {
     }
 }
 
-fn field(name: &str, value: &str, color: bool) -> String {
+pub(super) fn field(name: &str, value: &str, color: bool) -> String {
     if color {
         format!(
             "  {}{}:{} {}{}{}\n",
@@ -480,9 +483,6 @@ fn render_diagnostics_health(data: &Value, color: bool) -> String {
     if let Some(value) = health.get("index_health").and_then(|v| v.as_str()) {
         out.push_str(&field("  Index health", value, color));
     }
-    if let Some(value) = health.get("pdg_loaded").and_then(|v| v.as_bool()) {
-        out.push_str(&field("  PDG loaded", &value.to_string(), color));
-    }
     for (key, label) in [
         ("pdg_nodes", "  PDG nodes"),
         ("pdg_edges", "  PDG edges"),
@@ -573,8 +573,11 @@ fn render_diagnostics(data: &Value, color: bool) -> String {
     if let Some(v) = data.get("db_size_bytes").and_then(|v| v.as_u64()) {
         out.push_str(&field("DB size", &format!("{} bytes", v), color));
     }
-    if let Some(v) = data.get("stale").and_then(|v| v.as_bool()) {
-        out.push_str(&field("Stale", &v.to_string(), color));
+    // `stale: false` is the common case and says nothing; staleness only
+    // deserves a line when it is TRUE — the freshness block already carries
+    // the reason then.
+    if data.get("stale").and_then(|v| v.as_bool()) == Some(true) {
+        out.push_str(&field("Stale", "true", color));
     }
     if let Some(v) = data.get("last_indexed_secs_ago").and_then(|v| v.as_u64()) {
         out.push_str(&field("Last indexed", &format!("{}s ago", v), color));
@@ -765,31 +768,110 @@ fn render_file_summary(data: &Value, color: bool) -> String {
 
 fn render_read_file(data: &Value, color: bool) -> String {
     let mut out = String::new();
-    if let Some(path) = data.get("file_path").and_then(|v| v.as_str()) {
-        out.push_str(&header(&format!("Read: {}", path), color));
+    // Range header (brief §4.1): `── path:600-800 (rust) ──`, or the elided
+    // view marker when a focus_symbol collapsed the siblings.
+    let path = data.get("file_path").and_then(|v| v.as_str());
+    let start = data.get("start_line").and_then(|v| v.as_u64());
+    let end = data.get("end_line").and_then(|v| v.as_u64());
+    let lang = data.get("language").and_then(|v| v.as_str());
+    if data.get("elided").and_then(Value::as_bool) == Some(true) {
+        let focus = data
+            .get("focus_symbol")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let title = match (path, lang) {
+            (Some(path), Some(lang)) => {
+                format!("Read (elided: {focus}): {path} ({lang})")
+            }
+            (Some(path), None) => format!("Read (elided: {focus}): {path}"),
+            _ => format!("Read (elided: {focus})"),
+        };
+        out.push_str(&header(&title, color));
         out.push('\n');
+    } else if let (Some(path), Some(start), Some(end)) = (path, start, end) {
+        let title = match lang {
+            Some(lang) => format!("Read: {path}:{start}-{end} ({lang})"),
+            None => format!("Read: {path}:{start}-{end}"),
+        };
+        out.push_str(&header(&title, color));
+        out.push('\n');
+    } else if let Some(path) = path {
+        out.push_str(&header(&format!("Read: {path}"), color));
+        out.push('\n');
+    }
+    // Session dedup verdict (§4.1): a re-read of unchanged content is a
+    // one-line marker, not the bytes again.
+    if data.get("status").and_then(Value::as_str) == Some("unchanged") {
+        let note = data
+            .get("note")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unchanged");
+        out.push_str(note);
+        out.push('\n');
+        return out;
     }
     let content = data
         .get("content")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    let start = data.get("start_line").and_then(|v| v.as_u64()).unwrap_or(1);
-    for (i, line) in content.lines().enumerate() {
-        let n = start + i as u64;
-        let gutter = format!("{:>4}", n);
-        out.push_str(&format!(
-            "  {}{}{}│ {}\n",
-            if color { DIM } else { "" },
-            gutter,
-            if color { RESET } else { "" },
-            line,
-        ));
+    // §3.1: `content` already carries exactly one unpadded number per line
+    // (`600 code`, from `read_paths::number_lines`). Emit it verbatim; this
+    // renderer adds NO second gutter. The old `  600│ 600: code` form was
+    // the duplication defect.
+    out.push_str(content);
+    if !content.is_empty() && !content.ends_with('\n') {
+        out.push('\n');
     }
     // `include_symbol_map=true` requests per-symbol PDG annotations for the
     // read range; the handler builds them and the trimmer keeps them, but
     // this renderer silently dropped the field — the parameter looked like a
     // no-op (N-08). Render a compact map when present.
     out.push_str(&render_read_file_symbol_map(data, color));
+    // §6.6 overlay: last-check diagnostics for the read range, when any.
+    out.push_str(&render_read_diagnostics(data, color));
+    out
+}
+
+/// §6.6 diagnostics overlay (cross-lane contract with lane F): compact
+/// `file:line severity code message-first-line` lines for the read range.
+/// Emits nothing when the handler attached none — zero bytes.
+fn render_read_diagnostics(data: &Value, color: bool) -> String {
+    let Some(diagnostics) = data.get("diagnostics").and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    if diagnostics.is_empty() {
+        return String::new();
+    }
+    let mut out = format!(
+        "\n  {}Diagnostics ({}):{}\n",
+        if color { DIM } else { "" },
+        diagnostics.len(),
+        if color { RESET } else { "" },
+    );
+    for diagnostic in diagnostics.iter().take(10) {
+        let file = diagnostic
+            .get("file")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let line = diagnostic.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
+        let severity = diagnostic
+            .get("severity")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let code = diagnostic.get("code").and_then(|v| v.as_str());
+        let message = diagnostic
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let code_part = code.map(|code| format!(" {code}")).unwrap_or_default();
+        let first_line = message.lines().next().unwrap_or("");
+        out.push_str(&format!(
+            "  {file}:{line} {severity}{code_part} {first_line}\n"
+        ));
+    }
+    if diagnostics.len() > 10 {
+        out.push_str(&format!("  … {} more\n", diagnostics.len() - 10));
+    }
     out
 }
 
@@ -904,239 +986,6 @@ fn render_write(data: &Value, color: bool) -> String {
     }
     out.push_str(&render_write_symbols(data, color));
     out
-}
-
-fn render_meta_line(label: &str, value: &str, color: bool) -> String {
-    format!(
-        "  {}{}:{} {}",
-        if color { BOLD } else { "" },
-        label,
-        if color { RESET } else { "" },
-        value,
-    )
-}
-
-fn append_meta_lines(mut out: String, meta_lines: &[String]) -> String {
-    if meta_lines.is_empty() {
-        return out;
-    }
-    if !out.is_empty() {
-        out.push('\n');
-    }
-    out.push_str(&meta_lines.join("\n"));
-    out.push('\n');
-    out
-}
-
-/// Render edit-preview output: diff followed by metadata fields
-/// (affected_symbols, affected_files, risk_level, change_count).
-fn render_edit_preview(data: &Value, color: bool) -> String {
-    let mut meta_lines = Vec::new();
-
-    if let Some(symbols) = data.get("affected_symbols").and_then(|v| v.as_array())
-        && !symbols.is_empty()
-    {
-        let names: Vec<&str> = symbols.iter().filter_map(|v| v.as_str()).collect();
-        meta_lines.push(render_meta_line(
-            "Affected symbols",
-            &names.join(", "),
-            color,
-        ));
-    }
-    if let Some(files) = data.get("affected_files").and_then(|v| v.as_array())
-        && !files.is_empty()
-    {
-        let names: Vec<&str> = files.iter().filter_map(|v| v.as_str()).collect();
-        meta_lines.push(render_meta_line("Affected files", &names.join(", "), color));
-    }
-    if let Some(risk) = data.get("risk_level").and_then(|v| v.as_str()) {
-        meta_lines.push(render_meta_line("Risk level", risk, color));
-    }
-    if let Some(count) = data.get("change_count").and_then(|v| v.as_u64()) {
-        meta_lines.push(render_meta_line("Change count", &count.to_string(), color));
-    }
-    if let Some(breaks) = data.get("breaking_changes").and_then(|v| v.as_array()) {
-        for description in breaks.iter().filter_map(|value| value.as_str()) {
-            meta_lines.push(render_meta_line("Breaking", description, color));
-        }
-    }
-
-    append_meta_lines(render_diff_value(data, color), &meta_lines)
-}
-
-/// Render rename-symbol output: multi-file diffs followed by metadata
-/// (old_name, new_name, files_affected, preview_only).
-fn render_rename_symbol(data: &Value, color: bool) -> String {
-    let mut meta_lines = Vec::new();
-
-    if let (Some(old), Some(new)) = (
-        data.get("old_name").and_then(|v| v.as_str()),
-        data.get("new_name").and_then(|v| v.as_str()),
-    ) {
-        meta_lines.push(render_meta_line("Rename", &format!("{old} → {new}"), color));
-    }
-    if let Some(count) = data.get("files_affected").and_then(|v| v.as_u64()) {
-        meta_lines.push(render_meta_line(
-            "Files affected",
-            &count.to_string(),
-            color,
-        ));
-    }
-    if let Some(diffs_more) = data
-        .get("diffs_more")
-        .and_then(|v| v.as_u64())
-        .filter(|count| *count > 0)
-    {
-        meta_lines.push(render_meta_line(
-            "Additional diffs",
-            &format!("{diffs_more} more (not shown)"),
-            color,
-        ));
-    }
-    if data
-        .get("preview_only")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        meta_lines.push(render_meta_line(
-            "Preview only",
-            "changes not applied",
-            color,
-        ));
-    }
-
-    append_meta_lines(render_diff_value(data, color), &meta_lines)
-}
-
-fn render_edit_region(region_value: &Value, color: bool) -> String {
-    // `edit_region` may be a source excerpt or a byte-range object retained by `trim_edit`.
-    let region_text = if let Some(s) = region_value.as_str() {
-        if s.is_empty() {
-            None
-        } else {
-            Some(s.to_string())
-        }
-    } else if let Some(obj) = region_value.as_object() {
-        let start = obj.get("start").and_then(|v| v.as_u64());
-        let end = obj.get("end").and_then(|v| v.as_u64());
-        match (start, end) {
-            (Some(s), Some(e)) => Some(format!("bytes {s}..{e}")),
-            (Some(s), None) => Some(format!("bytes {s}..")),
-            (None, Some(e)) => Some(format!("bytes ..{e}")),
-            (None, None) => Some("bytes ?".to_string()),
-        }
-    } else {
-        None
-    };
-    let Some(text) = region_text else {
-        return String::new();
-    };
-
-    let mut out = String::from("\n");
-    if region_value.is_string() {
-        out.push_str(&format!(
-            "  {}Surrounding region:{}\n",
-            if color { DIM } else { "" },
-            if color { RESET } else { "" },
-        ));
-        for line in text.lines() {
-            out.push_str(&format!(
-                "      {}{}{}\n",
-                if color { DIM } else { "" },
-                truncate_chars(line, 160),
-                if color { RESET } else { "" },
-            ));
-        }
-    } else {
-        out.push_str(&format!(
-            "  {}Surrounding region:{} {}\n",
-            if color { DIM } else { "" },
-            if color { RESET } else { "" },
-            text,
-        ));
-    }
-    out
-}
-
-fn render_edit_apply(data: &Value, color: bool) -> String {
-    // `EditApplyHandler` returns a confirmation payload with shape
-    // (see `src/cli/mcp/edit_apply_handler.rs::EditApplyHandler::
-    // execute`):
-    //   { success, changes_applied, file_path, edit_region,
-    //     affected_symbols, affected_files, breaking_changes,
-    //     [validation], [message] (no-op only) }
-    // The handler never emits `diff` / `diffs` / `diff_text`, so
-    // `render_diff_value` returns an empty string for the apply
-    // response and the CLI prints nothing for a successful (or
-    // no-op) apply. Surface the success status, the change count,
-    // the file path, the affected-symbol/file summary, breaking
-    // changes, and the surrounding-region excerpt.
-    let mut out = String::new();
-    let success = data
-        .get("success")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let (status_label, status_color) = edit_apply_status(success, data, color);
-    out.push_str(&format!(
-        "{}{}{}\n",
-        status_color,
-        status_label,
-        if color { RESET } else { "" },
-    ));
-    if let Some(path) = data.get("file_path").and_then(|v| v.as_str()) {
-        out.push_str(&field("File", path, color));
-    }
-    if let Some(msg) = data.get("message").and_then(|v| v.as_str()) {
-        out.push_str(&field("Message", msg, color));
-    }
-    if let Some(arr) = data.get("affected_symbols").and_then(|v| v.as_array())
-        && !arr.is_empty()
-    {
-        out.push_str(&field("Affected symbols", &arr.len().to_string(), color));
-    }
-    if let Some(arr) = data.get("affected_files").and_then(|v| v.as_array())
-        && !arr.is_empty()
-    {
-        out.push_str(&field("Affected files", &arr.len().to_string(), color));
-    }
-    if let Some(bc) = data.get("breaking_changes").and_then(|v| v.as_array())
-        && !bc.is_empty()
-    {
-        out.push_str(&field("Breaking changes", &bc.len().to_string(), color));
-    }
-    out.push_str(
-        &data
-            .get("edit_region")
-            .map_or_else(String::new, |region| render_edit_region(region, color)),
-    );
-    out
-}
-
-/// Pick the first status line of the edit-apply render: failure, dry-run
-/// preview, no-op, or successful apply. A dry run always reports zero
-/// applied changes by design; labeling it "No-op (content identical)"
-/// misdescribes a real preview.
-fn edit_apply_status(success: bool, data: &Value, color: bool) -> (&'static str, &'static str) {
-    if !success {
-        ("Edit apply failed", if color { LIGHT_RED } else { "" })
-    } else if data.get("dry_run").and_then(|v| v.as_bool()) == Some(true) {
-        (
-            "Dry run (no changes written)",
-            if color { LIGHT_YELLOW } else { "" },
-        )
-    } else if data
-        .get("changes_applied")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0)
-        == 0
-    {
-        (
-            "No-op (content identical)",
-            if color { LIGHT_YELLOW } else { "" },
-        )
-    } else {
-        ("Applied", if color { LIGHT_GREEN } else { "" })
-    }
 }
 
 // =============================================================================
@@ -1264,20 +1113,37 @@ fn render_footer(data: &Value) -> Option<String> {
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
-        let generation = freshness
-            .get("generation")
-            .and_then(Value::as_u64)
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "none".to_string());
         let advisory = freshness
             .get("advisory")
             .and_then(Value::as_str)
             .or_else(|| freshness.get("warning").and_then(Value::as_str));
-        footer.push_str(&format!(
-            "\nFreshness: status={status}, generation={generation}\n"
-        ));
-        if let Some(advisory) = advisory {
-            footer.push_str(&format!("Advisory: {advisory}\n"));
+        // A fresh index with nothing to say costs zero bytes: the old
+        // per-response `Freshness:` line was boilerplate the caller never
+        // asked for, and the structured `_meta.freshness` badge still carries
+        // the same facts for machine readers. When the index is NOT fresh
+        // (or an advisory survived the once-per-session gate), emit exactly
+        // one compact header-style line.
+        if status != "fresh" || advisory.is_some() {
+            let generation = freshness
+                .get("generation")
+                .and_then(Value::as_u64)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string());
+            let changed = freshness
+                .get("changed_unindexed_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let changed_part = if changed > 0 {
+                format!(" changed={changed}")
+            } else {
+                String::new()
+            };
+            footer.push_str(&format!(
+                "\n[index: {status} gen={generation}{changed_part}]\n"
+            ));
+            if let Some(advisory) = advisory {
+                footer.push_str(&format!("Advisory: {advisory}\n"));
+            }
         }
     }
     if let Some(gate) = system_one_footer(data) {
@@ -1614,11 +1480,22 @@ fn render_find(data: &Value) -> String {
     render_find_summary(&mut out, data, &pattern);
     render_find_output_section(&mut out, data);
     if data["has_more"] == true {
-        let _ = writeln!(
-            out,
-            "… more results: offset={}",
-            find_num(data, "next_offset")
-        );
+        match data.get("next").and_then(Value::as_str) {
+            Some(token) => {
+                let _ = writeln!(
+                    out,
+                    "… more results: offset={} next={token}",
+                    find_num(data, "next_offset")
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    out,
+                    "… more results: offset={}",
+                    find_num(data, "next_offset")
+                );
+            }
+        }
     }
     if let Some(note) = data.get("note").and_then(Value::as_str) {
         let _ = writeln!(out, "{note}");

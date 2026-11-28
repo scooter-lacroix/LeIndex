@@ -2,6 +2,7 @@ use super::helpers::{
     byte_range_to_line_range, extract_bool, extract_string, extract_usize, get_direct_callees,
 };
 use super::protocol::JsonRpcError;
+use super::read_paths;
 use super::request_meta::WorkBudget;
 use crate::cli::live_project::LiveProject;
 use crate::cli::registry::ProjectRegistry;
@@ -11,6 +12,27 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+
+/// Split the `file_path` argument into `(file hint, symbol)`.
+///
+/// Handle form (§4.1): `path#symbol` — the path becomes the file hint, the
+/// fragment the target symbol. A `#L` range is a read_file concern and is
+/// IGNORED here, but "ignored" means the FRAGMENT is dropped, not that the
+/// handle is passed through whole. Keeping the raw string made
+/// `live.file("src/lib.rs#L10-20")` canonicalize a path containing `#L10-20`
+/// and fail as nonexistent even though the file — and the requested symbol —
+/// both exist. `parse_read_handle` splits off the fragment AND decodes the
+/// same escapes the read path decodes, so an escaped filename resolves
+/// identically here.
+fn split_file_hint(file_hint: Option<&str>, symbol: String) -> (Option<String>, String) {
+    match file_hint {
+        Some(raw) => {
+            let handle = read_paths::parse_read_handle(raw, None);
+            (Some(handle.file_path), handle.symbol.unwrap_or(symbol))
+        }
+        None => (None, symbol),
+    }
+}
 
 /// Handler for LeIndex [read_symbol — targeted symbol source read.
 #[derive(Clone)]
@@ -25,7 +47,7 @@ impl ReadSymbolHandler {
         "LeIndex [Read Symbol]"
     }
     pub fn description(&self) -> &str {
-        "PRIMARY symbol reader — returns exact source code with line numbers, doc comments, and compact caller/callee locations."
+        "PRIMARY symbol reader — returns exactly the item (fn/struct/impl/enum/trait) with its doc comment and attributes, nothing else."
     }
 
     pub fn argument_schema(&self) -> Value {
@@ -33,9 +55,9 @@ impl ReadSymbolHandler {
             "type": "object",
             "properties": {
                 "symbol": { "type": "string", "description": "Symbol name to read source for" },
-                "file_path": { "type": "string", "description": "Optional file disambiguator" },
+                "file_path": { "type": "string", "description": "Optional file disambiguator; accepts handles (path#symbol, path#L600-800 — path is then the file, fragment the target)" },
                 "project_path": { "type": "string", "description": "Project directory" },
-                "include_dependencies": { "type": "boolean", "default": false },
+                "include_dependencies": { "type": "boolean", "default": false, "description": "Include PDG callers/callees (default off: the item itself is the answer)" },
                 "token_budget": { "type": "integer", "default": 8000 },
                 "max_latency_ms": { "type": "integer", "default": 250, "minimum": 0, "maximum": 60000 },
                 "allow_partial": { "type": "boolean", "default": true }
@@ -58,6 +80,10 @@ impl ReadSymbolHandler {
             allow_partial: extract_bool(&args, "allow_partial", true),
         };
         let started = Instant::now();
+
+        let (file_hint, symbol) = split_file_hint(file_hint, symbol);
+        let file_hint = file_hint.as_deref();
+
         let project_path = match args.get("project_path").and_then(|v| v.as_str()) {
             Some(path) => PathBuf::from(path),
             None => registry.default_project_path().await?,
@@ -86,7 +112,16 @@ impl ReadSymbolHandler {
                         started,
                     )
                     .await;
-                    return symbol_response(node, bytes, token_budget, false, relations, budget);
+                    return symbol_response(
+                        node,
+                        bytes,
+                        token_budget,
+                        false,
+                        include_dependencies,
+                        relations,
+                        budget,
+                        live.root(),
+                    );
                 }
                 CatalogLookup::Stale { file } => (Some(file), true),
                 CatalogLookup::Miss => (file, false),
@@ -106,7 +141,16 @@ impl ReadSymbolHandler {
             started,
         )
         .await;
-        symbol_response(node, parsed.bytes, token_budget, true, relations, budget)
+        symbol_response(
+            node,
+            parsed.bytes,
+            token_budget,
+            true,
+            include_dependencies,
+            relations,
+            budget,
+            live.root(),
+        )
     }
 }
 
@@ -295,7 +339,17 @@ async fn find_live_symbol_in_inventory(
     // re-exports the name.
     let mut best: Option<(LiveParse, CatalogSymbol)> = None;
     for (inspected, candidate) in candidates.into_iter().enumerate() {
-        if parsed >= 20 || inspected >= 200 {
+        // §4.1 regression fix: this loop used to stop at 200 inspected / 20
+        // parsed files and then report "Symbol not found" — a FALSE negative,
+        // because a mention-heavy caller file can consume the parsed cap
+        // before the definition file is reached (that is exactly how a
+        // private `fn render_read_file` in an 1,859-line file failed during
+        // recon). A missing symbol may only be claimed after the inventory
+        // is exhausted, so the only cap left is the inventory itself
+        // (bounded by the repo; MAX_INVENTORY_FILES guards pathological
+        // trees). The content prefilter keeps the parse count proportional
+        // to files that actually mention the symbol.
+        if inspected >= MAX_INVENTORY_FILES {
             break;
         }
         let Ok(bytes) = read_live_bytes(candidate.clone()).await else {
@@ -323,20 +377,26 @@ async fn find_live_symbol_in_inventory(
     }
     let Some((live_parsed, node)) = best else {
         return Err(JsonRpcError::invalid_params(format!(
-            "Symbol '{}' not found: scanned up to 200 live source candidates and parsed up to 20",
-            symbol
+            "Symbol '{}' not found: scanned the live source inventory (bounded at {} files), parsed {} files that mentioned it — no definition found",
+            symbol, MAX_INVENTORY_FILES, parsed
         )));
     };
     Ok((live_parsed, node))
 }
+
+/// Upper bound on files inspected by the no-hint inventory scan. The scan
+/// reads at most this many files before reporting an honest miss.
+const MAX_INVENTORY_FILES: usize = 2000;
 
 fn symbol_response(
     node: CatalogSymbol,
     bytes: Vec<u8>,
     token_budget: usize,
     symbol_index_miss: bool,
+    include_dependencies: bool,
     relations: ResidentRelations,
     budget: WorkBudget,
+    project_root: &Path,
 ) -> Result<Value, JsonRpcError> {
     let (start, end) = node.byte_range;
     let content = std::str::from_utf8(&bytes).map_err(|e| {
@@ -358,13 +418,42 @@ fn symbol_response(
     }
     let (line_start, line_end) = byte_range_to_line_range(content, node.byte_range);
     let source: String = content[start..end].chars().take(token_budget * 4).collect();
-    let doc_comment = content[..start]
+    // The item's own documentation AND attributes: contiguous ///, //! and
+    // #[...] lines above the item, with blank separators allowed between the
+    // doc block and the attributes. The old walk saw /// only, so a
+    // `#[derive(...)]` above the fn was silently dropped from the answer.
+    let preceding: Vec<&str> = content[..start]
         .lines()
         .rev()
-        .take_while(|line| line.trim().is_empty() || line.trim_start().starts_with("///"))
-        .filter(|line| line.trim_start().starts_with("///"))
-        .collect::<Vec<_>>();
-    Ok(serde_json::json!({
+        .take_while(|line| {
+            let trimmed = line.trim_start();
+            trimmed.is_empty()
+                || trimmed.starts_with("///")
+                || trimmed.starts_with("//!")
+                || trimmed.starts_with("#[")
+                || trimmed.starts_with("#![")
+        })
+        .collect();
+    let doc_comment: Vec<&str> = preceding
+        .iter()
+        .rev()
+        .copied()
+        .skip_while(|line| line.trim().is_empty())
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("///") || trimmed.starts_with("//!")
+        })
+        .map(|line| line.trim_start())
+        .collect();
+    let attributes: Vec<&str> = preceding
+        .iter()
+        .rev()
+        .copied()
+        .skip_while(|line| line.trim().is_empty())
+        .filter(|line| line.trim_start().starts_with("#["))
+        .map(|line| line.trim_start())
+        .collect();
+    let result = serde_json::json!({
         "symbol": node.symbol_name,
         "qualified_name": node.qualified_name,
         "node_id": node.node_id,
@@ -374,13 +463,17 @@ fn symbol_response(
         "complexity": node.complexity,
         "line_start": line_start,
         "line_end": line_end,
-        "doc_comment": if doc_comment.is_empty() { None } else { Some(doc_comment.into_iter().rev().collect::<Vec<_>>().join("\n")) },
+        "doc_comment": if doc_comment.is_empty() { None } else { Some(doc_comment.join("\n")) },
+        "attributes": if attributes.is_empty() { None } else { Some(attributes.join("\n")) },
         "source": source,
         "source_truncated": end - start > token_budget * 4,
         "_source_char_budget": token_budget * 4,
-        "callers": relations.callers,
-        "callees": relations.callees,
-        "dependencies": relations.dependencies,
+        // Exactness (§4.1): the default answer is the item itself. Callers/
+        // callees are attached only when explicitly requested via
+        // include_dependencies.
+        "callers": if include_dependencies { relations.callers } else { Vec::new() },
+        "callees": if include_dependencies { relations.callees } else { Vec::new() },
+        "dependencies": if include_dependencies { relations.dependencies } else { Vec::new() },
         "symbol_index_miss": symbol_index_miss,
         "source_freshness": "live",
         "pdg_status": relations.pdg_status,
@@ -391,7 +484,14 @@ fn symbol_response(
             "max_latency_ms": budget.max_latency_ms,
             "allow_partial": budget.allow_partial
         }
-    }))
+    });
+    Ok(super::read_paths::attach_range_diagnostics(
+        result,
+        Some(project_root),
+        &node.file_path,
+        line_start,
+        line_end,
+    ))
 }
 
 pub(crate) async fn catalog_is_fresh(catalog: &CatalogReader, file: &Path, bytes: &[u8]) -> bool {
@@ -630,6 +730,48 @@ mod tests {
         }
     }
 
+    /// A `#L` range handle must contribute its FILE, not the whole handle.
+    ///
+    /// `live.file("src/lib.rs#L10-20")` canonicalizes a path containing the
+    /// fragment and fails as nonexistent. The range itself is a read_file
+    /// concern and is correctly ignored here — but only the fragment may be
+    /// dropped, never the file.
+    #[test]
+    fn test_split_file_hint_keeps_only_the_file_from_a_range_handle() {
+        let (file, symbol) = split_file_hint(Some("src/lib.rs#L10-20"), "wanted".to_string());
+        assert_eq!(file.as_deref(), Some("src/lib.rs"), "range must be dropped");
+        assert_eq!(symbol, "wanted", "a range must not override the symbol");
+    }
+
+    /// A `#symbol` handle contributes BOTH: the path and the target symbol
+    /// (the handle wins over the argument, as documented in the schema).
+    #[test]
+    fn test_split_file_hint_takes_the_symbol_from_a_symbol_handle() {
+        let (file, symbol) = split_file_hint(Some("src/lib.rs#helper"), "ignored".to_string());
+        assert_eq!(file.as_deref(), Some("src/lib.rs"));
+        assert_eq!(symbol, "helper");
+    }
+
+    /// The file portion is DECODED with the same escapes the read path uses,
+    /// so an escaped filename round-trips instead of resolving to `a%23b.rs`.
+    #[test]
+    fn test_split_file_hint_decodes_an_escaped_filename() {
+        let (file, symbol) = split_file_hint(Some("src/a%23b.rs#L1-2"), "wanted".to_string());
+        assert_eq!(file.as_deref(), Some("src/a#b.rs"));
+        assert_eq!(symbol, "wanted");
+    }
+
+    /// No handle: the file hint is passed through unchanged.
+    #[test]
+    fn test_split_file_hint_passes_a_plain_path_through() {
+        let (file, symbol) = split_file_hint(Some("src/lib.rs"), "wanted".to_string());
+        assert_eq!(file.as_deref(), Some("src/lib.rs"));
+        assert_eq!(symbol, "wanted");
+        let (none, symbol) = split_file_hint(None, "wanted".to_string());
+        assert_eq!(none, None);
+        assert_eq!(symbol, "wanted");
+    }
+
     #[test]
     fn test_find_live_symbol_prefers_struct_over_variable() {
         // Regression: a same-named CLI variable must not shadow the struct
@@ -703,5 +845,137 @@ mod tests {
         std::fs::write(&file, "pub fn target() {}\n").unwrap();
         let err = live_source_inventory(&file).unwrap_err();
         assert!(matches!(err, crate::cli::git::GitInventoryError::Io(_)));
+    }
+
+    #[tokio::test]
+    async fn test_read_symbol_returns_exactly_item_with_doc_and_attributes() {
+        // §4.1 exactness: the answer is the item + its doc + its attributes,
+        // nothing else — no sibling items, no caller lists by default.
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("thing.rs"),
+            "/// Builds the thing.\n///\n/// Multi-paragraph.\n#[inline]\n#[must_use]\nfn build_thing(x: u32) -> u32 {\n    x * 2\n}\n\npub fn unrelated() {}\n",
+        )
+        .unwrap();
+        let registry = test_registry_for(dir.path());
+        let result = ReadSymbolHandler
+            .execute(
+                &registry,
+                serde_json::json!({
+                    "symbol": "build_thing",
+                    "project_path": dir.path().to_string_lossy(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["symbol"], "build_thing");
+        let source = result["source"].as_str().unwrap();
+        assert!(source.starts_with("fn build_thing"), "{source}");
+        assert!(source.contains("x * 2"), "{source}");
+        assert!(!source.contains("unrelated"), "{source}");
+        assert_eq!(
+            result["doc_comment"].as_str().unwrap(),
+            "/// Builds the thing.\n///\n/// Multi-paragraph."
+        );
+        assert_eq!(
+            result["attributes"].as_str().unwrap(),
+            "#[inline]\n#[must_use]"
+        );
+        assert_eq!(
+            result["callers"].as_array().unwrap().len(),
+            0,
+            "no dependency lists unless requested: {result}"
+        );
+        assert_eq!(result["callees"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_read_symbol_returns_method_inside_impl_not_whole_impl() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("machine.rs"),
+            "pub struct Machine;\n\nimpl Machine {\n    /// Runs one step.\n    pub fn step(&self) -> u32 {\n        1\n    }\n\n    pub fn stop(&self) {\n        // nothing\n    }\n}\n",
+        )
+        .unwrap();
+        let registry = test_registry_for(dir.path());
+        let result = ReadSymbolHandler
+            .execute(
+                &registry,
+                serde_json::json!({
+                    "symbol": "step",
+                    "project_path": dir.path().to_string_lossy(),
+                }),
+            )
+            .await
+            .unwrap();
+        let source = result["source"].as_str().unwrap();
+        assert!(source.contains("fn step"), "{source}");
+        assert_eq!(
+            result["doc_comment"].as_str().unwrap(),
+            "/// Runs one step.",
+            "the method's doc comment comes back with the item"
+        );
+        assert!(!source.contains("fn stop"), "whole impl leaked: {source}");
+        assert!(!source.contains("struct Machine"), "{source}");
+    }
+
+    #[tokio::test]
+    async fn test_read_symbol_finds_fn_in_nested_module() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nested.rs"),
+            "pub mod inner {\n    /// Deep doc.\n    pub fn deep() -> u32 {\n        7\n    }\n}\n",
+        )
+        .unwrap();
+        let registry = test_registry_for(dir.path());
+        let result = ReadSymbolHandler
+            .execute(
+                &registry,
+                serde_json::json!({
+                    "symbol": "deep",
+                    "project_path": dir.path().to_string_lossy(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["symbol"], "deep");
+        let source = result["source"].as_str().unwrap();
+        assert!(source.contains("fn deep"), "{source}");
+        assert_eq!(result["doc_comment"].as_str().unwrap(), "/// Deep doc.");
+    }
+
+    #[tokio::test]
+    async fn test_read_symbol_finds_private_fn_beyond_mention_heavy_files() {
+        // §4.1 regression: the inventory scan used to stop at 20 parsed
+        // files and report a FALSE not-found for a definition living in a
+        // later-sorting file. The scan must run until the definition is
+        // found, only bounded by the inventory itself.
+        let dir = tempdir().unwrap();
+        for i in 0..25 {
+            std::fs::write(
+                dir.path().join(format!("aa_mention_{i:02}.rs")),
+                format!("pub fn caller_{i}() -> usize {{\n    render_thing(1)\n}}\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            dir.path().join("zz_render.rs"),
+            "fn render_thing(v: u32) -> usize {\n    v as usize\n}\n",
+        )
+        .unwrap();
+        let registry = test_registry_for(dir.path());
+        let result = ReadSymbolHandler
+            .execute(
+                &registry,
+                serde_json::json!({
+                    "symbol": "render_thing",
+                    "project_path": dir.path().to_string_lossy(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["symbol"], "render_thing");
+        let source = result["source"].as_str().unwrap();
+        assert!(source.contains("v as usize"), "{source}");
     }
 }

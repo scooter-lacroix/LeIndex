@@ -58,7 +58,16 @@ pub(crate) fn validate_file_within_project(
     let canonical = candidate.canonicalize().map_err(|e| {
         JsonRpcError::invalid_params(format!("Cannot resolve file path '{}': {}", file_path, e))
     })?;
-    if !canonical.starts_with(project_root) {
+    // Compare CANONICAL against CANONICAL. `canonical` has already had its
+    // symlinks resolved, but `project_root` had not: when the root itself is a
+    // symlink (a linked workspace, `/tmp` on macOS, a symlinked home) every
+    // legitimate file inside it was refused as "outside the project boundary".
+    // Resolving the root first keeps the containment check exact without
+    // rejecting the project's own files.
+    let canonical_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    if !canonical.starts_with(&canonical_root) {
         return Err(JsonRpcError::invalid_params(format!(
             "File '{}' is outside the project boundary '{}'",
             file_path,
@@ -141,9 +150,91 @@ pub(crate) fn wrap_live_with_meta(result: Value, project_root: &std::path::Path)
     wrap_live_with_meta_status(result, project_root, live_status.as_ref(), live_dirty)
 }
 
+/// Read-path freshness badge (brief §3.10, lane E).
+///
+/// `read_file` is a LIVE filesystem read: the exact bytes were served from
+/// disk, so the response must never claim `initializing` or any other
+/// reindex state — that describes OTHER files' indexing, not this read.
+/// This helper reads the persisted health snapshot directly (no project
+/// handle, no lock, no `git status` fork), so a background reindex holding
+/// the project write lock can neither block the read nor attach its state.
+/// Lane A's `wrap_*` functions are untouched; this is the read-path variant
+/// the SPEC assigns to E.
+pub(crate) fn wrap_read_live_meta(mut result: Value, project_root: &std::path::Path) -> Value {
+    let storage_path = crate::cli::leindex::resolve_existing_storage_path(project_root)
+        .unwrap_or_else(|| project_root.join(".leindex"));
+    let health = crate::cli::index_freshness::load_health(&storage_path);
+    // `None` means the index state is UNKNOWN: no health snapshot exists, the
+    // component is not loaded, is still initialising, or this build cannot
+    // provide it. None of those establish freshness, and a live read says
+    // nothing about the index, so no freshness status is attached at all —
+    // never a `fresh` badge the index has not earned. Healthy states read
+    // `fresh`; a stale/partial/failed index reads `stale`.
+    let (status_text, generation) = match &health {
+        Some(health) => (
+            match health.status {
+                ComponentStatus::Fresh => Some("fresh"),
+                ComponentStatus::Failed | ComponentStatus::Stale | ComponentStatus::Partial => {
+                    Some("stale")
+                }
+                ComponentStatus::Initializing
+                | ComponentStatus::NotLoaded
+                | ComponentStatus::Unavailable => None,
+            },
+            Some(health.generation),
+        ),
+        None => (None, None),
+    };
+    if let Some(obj) = result.as_object_mut() {
+        let meta = obj
+            .entry("_meta".to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(meta_obj) = meta.as_object_mut() {
+            meta_obj.insert(
+                "read_source".to_string(),
+                Value::String("live_bytes".to_string()),
+            );
+            if let Some(status_text) = status_text {
+                let freshness = meta_obj
+                    .entry("freshness".to_string())
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                if let Some(freshness_obj) = freshness.as_object_mut() {
+                    freshness_obj
+                        .insert("status".to_string(), Value::String(status_text.to_string()));
+                    if let Some(generation) = generation {
+                        freshness_obj
+                            .insert("generation".to_string(), serde_json::json!(generation));
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
 /// Number of files a worktree delta touches, in every dirty category.
 fn dirty_count(status: &crate::cli::git::GitStatus) -> usize {
     status.modified.len() + status.staged.len() + status.untracked.len() + status.deleted.len()
+}
+
+/// Text of the once-per-session stale advisory (`_meta.freshness.warning`,
+/// moved to `advisory` by the transport's `apply_freshness_advisory`).
+///
+/// Incremental by contract: `leindex_manage action=index` is the documented
+/// refresh path, and `force_reindex` is never recommended by default — a full
+/// rebuild is a caller decision, not boilerplate advice. `pub(crate)` so the
+/// render tests can assert the exact string the text surface must NOT echo.
+pub(crate) const STALE_ADVISORY: &str =
+    "Index may be stale; run leindex_manage action=index to refresh.";
+pub(crate) const NO_GENERATION_ADVISORY: &str =
+    "No indexed generation is loaded; exact live results remain usable.";
+
+fn stale_warning_message(no_generation_loaded: bool) -> &'static str {
+    if no_generation_loaded {
+        NO_GENERATION_ADVISORY
+    } else {
+        STALE_ADVISORY
+    }
 }
 
 /// Determine whether the index is genuinely stale by checking if dirty files
@@ -263,7 +354,7 @@ pub(crate) fn wrap_live_with_meta_status(
     let storage_path = crate::cli::leindex::resolve_existing_storage_path(project_root)
         .unwrap_or_else(|| project_root.join(".leindex"));
     let health = crate::cli::index_freshness::load_health(&storage_path);
-    let freshness = health
+    let mut freshness = health
         .as_ref()
         .map(|health| {
             let age_ms = health.indexed_at_unix_ms.and_then(|indexed_at| {
@@ -306,18 +397,13 @@ pub(crate) fn wrap_live_with_meta_status(
     if let Some(obj) = result.as_object_mut() {
         let stale = is_index_genuinely_stale(&health, project_root, live_status, status_known);
         {
-            let mut freshness = freshness;
+            // Warn only when the index is GENUINELY stale. The transport
+            // moves `warning` to `advisory` at most once per session and
+            // generation; the text surface must not echo it per call.
             if stale && let Some(freshness_obj) = freshness.as_object_mut() {
                 freshness_obj.insert(
                     "warning".to_string(),
-                    Value::String(
-                        if health.is_none() {
-                            "No indexed generation is loaded; exact live results remain usable."
-                        } else {
-                            "Index may be stale; run leindex_manage action=index with force_reindex=true to refresh."
-                        }
-                        .to_string(),
-                    ),
+                    Value::String(stale_warning_message(health.is_none()).to_string()),
                 );
             }
             let meta = obj
@@ -511,6 +597,12 @@ fn parse_replace_change(
             JsonRpcError::invalid_params(format!("changes[{}]: missing 'new_text'", index))
         })?;
     let has_explicit_range = item.get("start_byte").is_some() || item.get("end_byte").is_some();
+    // A change entry may carry its own file path (multi-file batch, §4.3);
+    // `None` keeps the single-file form where `file_path` is the argument.
+    let owning_file = item
+        .get("file_path")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     if has_explicit_range {
         let start = item.get("start_byte").and_then(Value::as_u64).unwrap_or(0) as usize;
         let end = item
@@ -519,6 +611,7 @@ fn parse_replace_change(
             .map(|value| value as usize)
             .unwrap_or(start + old_text.len());
         return Ok(EditChange::ReplaceText {
+            file_path: owning_file,
             start,
             end,
             new_text: new_text.to_owned(),
@@ -532,6 +625,7 @@ fn parse_replace_change(
     }
     let Some(content) = content else {
         return Ok(EditChange::ReplaceText {
+            file_path: owning_file,
             start: 0,
             end: old_text.len(),
             new_text: new_text.to_owned(),
@@ -545,6 +639,7 @@ fn parse_replace_change(
         return Err(missing_old_text(index, old_text));
     };
     Ok(EditChange::ReplaceText {
+        file_path: owning_file,
         start,
         end: start + length,
         new_text: new_text.to_owned(),
@@ -627,6 +722,7 @@ pub(crate) fn apply_changes_in_memory(
             start,
             end,
             new_text,
+            ..
         } = change
         {
             let bytes = modified.as_bytes();
@@ -984,6 +1080,42 @@ mod tests {
         assert!(err_msg.contains("outside the project boundary"));
     }
 
+    /// A symlinked project root must not reject its OWN files. The boundary
+    /// check canonicalises the candidate but used to compare it against the
+    /// RAW root, so `canonical=/real/src/a.rs` never started with
+    /// `/link` and every legitimate edit through a linked workspace was
+    /// refused as "outside the project boundary".
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_file_within_project_accepts_a_symlinked_root() {
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        std::fs::write(real.join("src/a.rs"), "fn a() {}\n").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let result = validate_file_within_project("src/a.rs", &link);
+        assert!(
+            result.is_ok(),
+            "a file inside a symlinked project root is INSIDE the project: {result:?}"
+        );
+        // …and the escape hatch the check exists for still closes.
+        //
+        // The escaping file must EXIST at the path `../secret.txt` actually
+        // resolves to — `real` is `dir/real`, so that is `dir/secret.txt`. An
+        // earlier version wrote it into a SEPARATE tempdir, so canonicalize()
+        // failed first and the assertion passed even with the containment
+        // guard deleted (CodeRabbit round 13, id 4701646449).
+        std::fs::write(dir.path().join("secret.txt"), "s").unwrap();
+        let refusal = validate_file_within_project("../secret.txt", &real)
+            .expect_err("a path escaping the root must be refused");
+        assert!(
+            format!("{refusal}").contains("outside the project boundary"),
+            "the refusal must come from the CONTAINMENT check, not a failed resolve: {refusal}"
+        );
+    }
+
     #[test]
     fn test_node_type_str() {
         assert_eq!(
@@ -1101,6 +1233,7 @@ mod tests {
             start,
             end,
             new_text,
+            ..
         } = &changes[0]
         {
             assert_eq!(*start, content.find("println!(\"Hello\")").unwrap());
@@ -1248,5 +1381,106 @@ mod tests {
         assert_eq!(diff.additions, 1);
         assert_eq!(diff.deletions, 1);
         assert!(diff.has_changes());
+    }
+
+    /// Regression (brief §3.2): a genuinely-stale worktree must carry the
+    /// incremental advisory and NEVER the old force_reindex recommendation.
+    /// The fixture seeds `index-state.json` through the real persistence
+    /// helper, so the loader path is production-identical.
+    #[test]
+    fn test_stale_warning_recommends_incremental_index_never_force() {
+        let directory = tempdir().unwrap();
+        let storage = directory.path().join(".leindex");
+        crate::cli::index_freshness::save_health(
+            &storage,
+            &IndexHealth {
+                generation: 695,
+                status: ComponentStatus::Fresh,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // A tracked source file changed since the indexed tree: genuinely stale.
+        let status = crate::cli::git::GitStatus {
+            modified: vec![PathBuf::from("src/lib.rs")],
+            ..Default::default()
+        };
+        let result =
+            wrap_live_with_meta_status(serde_json::json!({}), directory.path(), Some(&status), 1);
+        let warning = result["_meta"]["freshness"]["warning"]
+            .as_str()
+            .expect("genuinely stale must warn");
+        assert_eq!(warning, STALE_ADVISORY);
+        assert!(
+            !warning.contains("force_reindex"),
+            "the default advisory must never recommend a force rebuild: {warning}"
+        );
+    }
+
+    /// A fresh index with a clean worktree must NOT warn: the advisory (and
+    /// therefore the text footer) fires only when the index is genuinely
+    /// stale.
+    #[test]
+    fn test_fresh_index_with_clean_worktree_emits_no_warning() {
+        let directory = tempdir().unwrap();
+        let storage = directory.path().join(".leindex");
+        crate::cli::index_freshness::save_health(
+            &storage,
+            &IndexHealth {
+                generation: 1,
+                status: ComponentStatus::Fresh,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let clean = crate::cli::git::GitStatus::default();
+        let result =
+            wrap_live_with_meta_status(serde_json::json!({}), directory.path(), Some(&clean), 0);
+        let freshness = &result["_meta"]["freshness"];
+        assert!(
+            freshness.get("warning").is_none(),
+            "fresh + clean must not warn: {freshness}"
+        );
+        assert!(
+            freshness.get("status_note").is_none(),
+            "the N-11 note must not fire on a clean worktree: {freshness}"
+        );
+    }
+
+    /// N-11: `fresh` plus a nonzero changed count needs the semantics note —
+    /// attached to the structured badge ONLY. The renderer must never echo it
+    /// (asserted on the render side in `output/render/tests.rs`).
+    #[test]
+    fn test_status_note_attaches_only_to_fresh_with_changed_files() {
+        let directory = tempdir().unwrap();
+        let storage = directory.path().join(".leindex");
+        crate::cli::index_freshness::save_health(
+            &storage,
+            &IndexHealth {
+                generation: 2,
+                status: ComponentStatus::Fresh,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // A NON-source untracked file (`.log` is not in
+        // SOURCE_FILE_EXTENSIONS): bumps the changed count without making the
+        // index genuinely stale, so the note fires while the warning must not.
+        let changed = crate::cli::git::GitStatus {
+            untracked: vec![PathBuf::from("build.log")],
+            ..Default::default()
+        };
+        let result =
+            wrap_live_with_meta_status(serde_json::json!({}), directory.path(), Some(&changed), 1);
+        let freshness = &result["_meta"]["freshness"];
+        assert_eq!(freshness["status"], "fresh");
+        let note = freshness["status_note"]
+            .as_str()
+            .expect("fresh + changed must carry the N-11 note");
+        assert!(note.contains("1 file(s)"), "note states the count: {note}");
+        assert!(
+            freshness.get("warning").is_none(),
+            "fresh never warns, even when dirty: {freshness}"
+        );
     }
 }

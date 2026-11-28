@@ -195,13 +195,31 @@ fn restore_latest_generation_preserves_corrupt_root() {
     );
 }
 
-#[tokio::test]
-async fn test_resolve_path_defaults_to_cwd_without_startup_project() {
-    // No explicit arg and no startup --project: resolution must fall back
-    // to the process CWD (the MCP client's workspace) — never to $HOME or
-    // to whichever project another tool touched most recently.
+/// No explicit arg and no startup --project: resolution must fall back to
+/// the process CWD (the MCP client's workspace) — never to $HOME or to
+/// whichever project another tool touched most recently.
+///
+/// The lock is the crate-wide one (CodeRabbit round 11, id 4698955238):
+/// `tests_mode` calls `set_current_dir`, which is process-global, and its
+/// own module-local lock could not exclude this read. Without the shared
+/// lock the two can interleave and this assertion compares against a
+/// directory another test had just switched to.
+///
+/// SYNCHRONOUS on purpose: a `std::sync::MutexGuard` must not be held across
+/// an `.await` (clippy `await_holding_lock`), so the async call is driven to
+/// completion on a private current-thread runtime with no suspension point
+/// inside the guarded region.
+#[test]
+fn test_resolve_path_defaults_to_cwd_without_startup_project() {
+    let _guard = crate::test_env::EnvLock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let registry = ProjectRegistry::new(5);
-    let resolved = registry.resolve_path(None).await.unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let resolved = runtime.block_on(registry.resolve_path(None)).unwrap();
     let expected = std::env::current_dir().unwrap().canonicalize().unwrap();
     assert_eq!(resolved, expected);
 }

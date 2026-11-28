@@ -92,6 +92,12 @@ jobs:
           restore-keys: |
             agents-md-cargo-
 
+      # The workspace test suite includes tokbench's NATIVE-arm smoke tests,
+      # which shell out to ripgrep like Claude Code's Grep does. Without rg
+      # those tests skip loudly; with it their full assertions run.
+      - name: Install ripgrep (tokbench native-arm tests)
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
       # Validate key commands referenced in AGENTS.md actually work
       - name: Validate AGENTS.md commands
         run: |

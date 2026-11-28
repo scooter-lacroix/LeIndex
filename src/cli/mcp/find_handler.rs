@@ -7,7 +7,6 @@ use crate::search::textsearch::{
     search_symbols,
 };
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,6 +14,8 @@ use std::time::{Duration, Instant};
 const DEFAULT_LIMIT: usize = 50;
 const DEFAULT_PER_FILE: usize = 20;
 const DEFAULT_TIMEOUT_MS: usize = 20_000;
+/// Characters a token_budget entry may cost before the page is full.
+const CHARS_PER_TOKEN: usize = 4;
 /// Hard ceiling on a page. `limit` has no schema maximum today, and the
 /// engine buffers `offset + limit` hits per file to keep pagination
 /// complete — an unbounded `limit: 100_000_000` let one request park
@@ -116,12 +117,15 @@ impl FindHandler {
                 "scope": { "type": "string", "description": "Restrict to a project-relative directory or file" },
                 "include_globs": { "type": "array", "items": { "type": "string" }, "description": "Only these, e.g. [\"*.rs\"]" },
                 "exclude_globs": { "type": "array", "items": { "type": "string" }, "description": "Skip these, e.g. [\"vendor/\"]" },
-                "output": { "type": "string", "enum": ["matches", "files", "count", "symbols"], "default": "matches", "description": "matches (default), files, count, or symbols (enclosing symbols by hits)" },
+                "output": { "type": "string", "enum": ["matches", "files", "count", "symbols", "definitions", "callsites", "exists"], "default": "matches", "description": "matches (default), files, count, symbols (enclosing symbols by hits), definitions (where it is defined), callsites (call lines, definition excluded), exists (boolean + first location)" },
                 "kind": { "type": "string", "description": "target=symbols: function, class, struct, ..." },
-                "context_lines": { "type": "integer", "default": 0, "minimum": 0, "maximum": 10, "description": "Context lines per match" },
+                "token_budget": { "type": "integer", "minimum": 0, "description": "Cap the page at roughly this many tokens (1 token = 4 chars); files fill greedily in rank order and the page ends with +N more — next: <token>" },
+                "include_tests": { "type": "boolean", "default": false, "description": "Show test-file hits in full instead of collapsing them to one line after the source hits" },
+                "next": { "type": "string", "description": "Continuation token from a previous page's `next`; pass it (plus project_path) alone to continue without re-sending the query" },
+                "context_lines": { "type": "integer", "default": 0, "minimum": 0, "maximum": 10, "description": "Context lines per match (adjacent windows are merged, no line repeats)" },
                 "limit": { "type": "integer", "default": DEFAULT_LIMIT, "minimum": 0, "maximum": MAX_LIMIT, "description": "Hits per page; 0 = ceiling (10000)" },
                 "offset": { "type": "integer", "default": 0, "minimum": 0, "maximum": MAX_LIMIT, "description": "Hits to skip; clamped to 10000; stream ends there" },
-                "per_file_cap": { "type": "integer", "default": DEFAULT_PER_FILE, "minimum": 0, "description": "Shown per file; past-cap matches appear on no page; 0 = no cap" },
+                "per_file_cap": { "type": "integer", "default": DEFAULT_PER_FILE, "minimum": 0, "description": "Shown per file; matches past the cap stay reachable on the next page (offset/next) and the file announces +K more; 0 = no cap" },
                 "max_line_chars": { "type": "integer", "default": 200, "minimum": 20, "maximum": 2000, "description": "Longest line shown" },
                 "timeout_ms": { "type": "integer", "default": DEFAULT_TIMEOUT_MS, "minimum": 0, "description": "Time budget; partial results + has_more. 0 = none" },
                 "project_path": { "type": "string", "description": "Project directory; omit to use the current project" }
@@ -135,6 +139,27 @@ impl FindHandler {
         registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
+        // §6.8: `next` alone (with project_path) continues a previous call
+        // without re-sending the query. The stored arguments win; the
+        // caller's overrides (project_path) merge over them; the position
+        // comes from the token.
+        if let Some(token) = args
+            .get("next")
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+        {
+            let resumed =
+                crate::cli::mcp::find_paging::resume("leindex_find", token).map_err(|reason| {
+                    JsonRpcError::invalid_params_with_suggestion(reason, "Re-send the full query")
+                })?;
+            let merged = crate::cli::mcp::find_paging::merge(
+                &resumed.args,
+                &args,
+                resumed.offset,
+                &resumed.cursors,
+            );
+            return Box::pin(self.run(registry, merged)).await;
+        }
         // `auto`: definitions named like the pattern first; when there are
         // none (or no index to ask), fall back to the text itself.
         if args.get("target").and_then(Value::as_str) == Some("auto") {
@@ -179,40 +204,123 @@ impl FindHandler {
         let (specs, primary) = find_roots(registry, &args).await?;
 
         // ── Symbol definitions ───────────────────────────────────────────
-        if target_symbols {
-            return symbols_result(&args, found, specs, &primary, window.offset, window.limit)
-                .await;
+        // `target=symbols` and `output=definitions` share the same
+        // machinery; §4.2f names the question differently ("where is X
+        // defined") but the answer is identical.
+        if target_symbols || output_mode == "definitions" {
+            let mut value =
+                symbols_result(&args, found, specs, &primary, window.offset, window.limit).await?;
+            if output_mode == "definitions" {
+                value["output"] = json!("definitions");
+            }
+            return Ok(value);
+        }
+
+        // ── Answer-shaped modes: exists stops at the first hit ──────────
+        if output_mode == "exists" {
+            return exists_result(found, specs, &primary, window).await;
         }
 
         // ── Text ─────────────────────────────────────────────────────────
-        let windowed = output_mode == "matches";
+        let windowed = output_mode == "matches" || output_mode == "callsites";
         let (engine_offset, engine_limit) =
             paging_for_window(windowed, window.offset, window.limit);
+        // §4.2f: callsites fetch a slack window — definitions are dropped
+        // AFTER the fetch (see `filter_callsites_rows`), so a definition that
+        // would consume the single fetched slot must not crowd the call out.
+        // The response still shows at most `limit` calls.
+        let engine_limit = if output_mode == "callsites" {
+            engine_limit.map(|limit| limit.saturating_mul(2).min(MAX_LIMIT))
+        } else {
+            engine_limit
+        };
         let options = SearchOptions {
             offset: engine_offset,
             limit: engine_limit,
             per_file_cap: window.per_file,
+            skip_in_file: parse_resume_cursors(&args),
             context: window.context,
             max_line_chars: window.max_line_chars,
             deadline: search_deadline(window.timeout_ms),
             collect_hits: windowed,
             want_symbols: extract_bool(&args, "symbols", true),
         };
+        let case_sensitive = !found.compiled.case_insensitive;
+        let want_retry = !extract_bool(&args, "regex", false) && looks_like_regex(&found.text);
+        let literal = found.text.clone();
+        let retry_args = args.clone();
         let compiled = found.compiled;
-        let result: SearchOutput =
-            tokio::task::spawn_blocking(move || search(&specs, &compiled, &options))
-                .await
-                .map_err(|e| JsonRpcError::internal_error(format!("find failed: {e}")))?;
+        let (result, regex_note_owned, case_insensitive_hits) =
+            tokio::task::spawn_blocking(move || {
+                search_with_fallbacks(
+                    &specs,
+                    &compiled,
+                    &options,
+                    want_retry,
+                    literal,
+                    retry_args,
+                    case_sensitive,
+                )
+            })
+            .await
+            .map_err(|e| JsonRpcError::internal_error(format!("find failed: {e}")))??;
+        let regex_note = regex_note_owned.as_deref();
 
-        Ok(shape_text_result(
+        let mut value = shape_text_result(
             &found.text,
             &output_mode,
             &primary,
             result,
-            window.offset,
-            window.limit,
-        ))
+            &window,
+            regex_note,
+            case_insensitive_hits,
+            &args,
+        );
+        if output_mode == "callsites" {
+            filter_callsites(&mut value, &found.text);
+        }
+        Ok(value)
     }
+}
+
+/// One text-search attempt, plus the two advisory follow-ups, run on the
+/// blocking pool.
+///
+/// §3.8: a literal search with regex metacharacters that returns nothing gets
+/// ONE retry as a regex — the double read is paid only on the zero path, and
+/// the note says what happened either way. §6.7: a case-sensitive zero also
+/// gets a case-insensitive recount so the reason can say "0 sensitive,
+/// N insensitive".
+fn search_with_fallbacks(
+    specs: &[RootSpec],
+    compiled: &Compiled,
+    options: &SearchOptions,
+    want_retry: bool,
+    literal: String,
+    retry_args: Value,
+    case_sensitive: bool,
+) -> Result<(SearchOutput, Option<String>, usize), JsonRpcError> {
+    let mut result = search(specs, compiled, options);
+    let mut note = None;
+    if want_retry && result.stats.match_lines == 0 {
+        let mut query = find_query(&retry_args)?;
+        query.regex = true;
+        query.pattern = literal;
+        if let Ok(regex_compiled) = query.compile() {
+            let retried = search(specs, &regex_compiled, options);
+            note = retry_note(&retried).map(str::to_string);
+            result = retried;
+        }
+    }
+    let mut insensitive = 0usize;
+    if result.stats.match_lines == 0 && case_sensitive {
+        let mut query = find_query(&retry_args)?;
+        query.case = CaseMode::Insensitive;
+        if let Ok(ci_compiled) = query.compile() {
+            insensitive = search(specs, &ci_compiled, options).stats.match_lines;
+        }
+    }
+    Ok((result, note, insensitive))
 }
 
 /// The pattern a LeIndex \[Find\] call searches for, with its matcher compiled.
@@ -237,6 +345,13 @@ struct FindWindow {
     max_line_chars: usize,
     /// Scan budget; 0 disables the deadline.
     timeout_ms: usize,
+    /// Output budget: fill the page greedily by rank and stop before
+    /// blowing it. `None` = unbounded page (the `limit` ceiling still
+    /// applies).
+    token_budget: Option<usize>,
+    /// Test-file hits listed in full after source hits instead of being
+    /// collapsed to a summary line.
+    include_tests: bool,
 }
 
 /// The primary argument name when the caller supplied it, else the legacy
@@ -284,12 +399,22 @@ fn output_mode_arg(args: &Value) -> Result<String, JsonRpcError> {
         .and_then(Value::as_str)
         .unwrap_or("matches")
         .to_ascii_lowercase();
-    if ["matches", "files", "count", "symbols"].contains(&mode.as_str()) {
+    if [
+        "matches",
+        "files",
+        "count",
+        "symbols",
+        "definitions",
+        "callsites",
+        "exists",
+    ]
+    .contains(&mode.as_str())
+    {
         return Ok(mode);
     }
     Err(JsonRpcError::invalid_params_with_suggestion(
         format!("Unknown output '{mode}'"),
-        "Use output: matches | files | count | symbols",
+        "Use output: matches | files | count | symbols | definitions | callsites | exists",
     ))
 }
 
@@ -314,6 +439,7 @@ fn find_window(args: &Value) -> Result<FindWindow, JsonRpcError> {
         DEFAULT_PER_FILE,
     )?;
     let max_line_chars = extract_usize(args, "max_line_chars", 200)?.clamp(20, 2000);
+    let token_budget = extract_usize(args, "token_budget", 0)?;
     Ok(FindWindow {
         // `limit: 0` means "as much as the ceiling allows", NOT unbounded:
         // a None limit reaches the engine as `collect_bound = 0`, which
@@ -332,6 +458,8 @@ fn find_window(args: &Value) -> Result<FindWindow, JsonRpcError> {
         per_file,
         max_line_chars,
         timeout_ms,
+        token_budget: (token_budget > 0).then_some(token_budget),
+        include_tests: extract_bool(args, "include_tests", false),
     })
 }
 
@@ -485,13 +613,19 @@ struct PrimaryRoot {
     indexed: bool,
     /// Outside the project (explicit `paths` entry): report absolute paths.
     external: bool,
+    /// The root IS the file (an explicit `paths` entry naming one file):
+    /// display the root's own path — the engine reports that file's name
+    /// as `rel`, so joining again produced the doubled `g6.log/g6.log`.
+    file_root: bool,
 }
 
 fn display_path(roots: &[PrimaryRoot], root: usize, rel: &str) -> String {
-    // The project alone: short project-relative paths. Anything else — an
-    // outside path, or several roots — absolute, so a hit is unambiguous and
+    // The project alone: short project-relative paths. A named file: its
+    // own path, exactly as the caller asked. Anything else — an outside
+    // path, or several roots — absolute, so a hit is unambiguous and
     // matches the path the caller asked about.
     match roots.get(root) {
+        Some(r) if r.file_root => r.root.to_string_lossy().into_owned(),
         Some(r) if r.external || roots.len() > 1 => r.root.join(rel).to_string_lossy().into_owned(),
         _ => rel.to_string(),
     }
@@ -509,17 +643,21 @@ fn build_roots(
     let project_root = project.map(|p| p.root.clone());
     let mut push = |root: PathBuf,
                     index: Option<Arc<crate::search::textsearch::TextIndex>>,
-                    filter: FileFilter| {
+                    filter: FileFilter,
+                    bypass_ignore: bool,
+                    file_root: bool| {
         let external = project_root.as_ref() != Some(&root);
         primary.push(PrimaryRoot {
             root: root.clone(),
             indexed: index.is_some(),
             external,
+            file_root,
         });
         specs.push(RootSpec {
             root,
             index,
             filter,
+            bypass_ignore,
         });
     };
 
@@ -528,11 +666,23 @@ fn build_roots(
             project.ok_or_else(|| JsonRpcError::invalid_params("No project to search"))?;
         let scope = scope.map(|s| relative_to(&project.root, s));
         let filter = FileFilter::new(include, exclude, scope.as_deref());
-        push(project.root.clone(), project_index(project), filter);
+        push(
+            project.root.clone(),
+            project_index(project),
+            filter,
+            false,
+            false,
+        );
         return Ok((specs, primary));
     }
 
-    let mut project_scopes: Vec<String> = Vec::new();
+    // §3.7/§6.1: explicit `paths=[...]` bypass ignore rules entirely —
+    // including files inside git-ignored directories and explicitly named
+    // files — because the raw walk never consults .gitignore, and such
+    // roots carry no trigram index (an index built from `git ls-files`
+    // would silently re-apply the rules being bypassed). Named paths keep
+    // the caller's include/exclude globs; NO project `scope` — the caller
+    // named exactly where to search.
     for raw in paths {
         let candidate = expand_home(raw);
         let candidate = match (&project, candidate.is_relative()) {
@@ -542,31 +692,25 @@ fn build_roots(
         let canonical = candidate
             .canonicalize()
             .map_err(|e| JsonRpcError::invalid_params(format!("Cannot search '{raw}': {e}")))?;
-        // Inside the workspace: same index, narrowed to that subpath.
-        if let Some(project) = project.filter(|p| canonical.starts_with(&p.root)) {
-            let rel = canonical
-                .strip_prefix(&project.root)
-                .map(|r| r.to_string_lossy().replace('\\', "/"))
-                .unwrap_or_default();
-            project_scopes.push(rel);
-            continue;
+        let filter = FileFilter::new(include, exclude, None);
+        if canonical.is_file() {
+            // The engine deliberately skips the filter for explicit FILE
+            // roots (a named file is admitted raw), so the caller's
+            // include/exclude globs must be honored HERE — a named file
+            // that the globs exclude must not be searched.
+            let rel = project_root
+                .as_ref()
+                .and_then(|root| canonical.strip_prefix(root).ok())
+                .map_or_else(
+                    || canonical.to_string_lossy().into_owned(),
+                    |r| r.to_string_lossy().into_owned(),
+                )
+                .replace('\\', "/");
+            if !filter.allows(&rel) {
+                continue;
+            }
         }
-        // Another project that already has an index: use it.
-        let other_index = project_ref(&canonical)
-            .filter(|_| canonical.is_dir())
-            .and_then(|other| crate::cli::textindex::load(&other.storage));
-        push(
-            canonical,
-            other_index,
-            FileFilter::new(include, exclude, None),
-        );
-    }
-    if let Some(project) = project.filter(|_| !project_scopes.is_empty()) {
-        // One RootSpec per in-workspace path so each keeps its own scope.
-        for scope in project_scopes {
-            let filter = FileFilter::new(include, exclude, Some(&scope));
-            push(project.root.clone(), project_index(project), filter);
-        }
+        push(canonical.clone(), None, filter, true, canonical.is_file());
     }
     Ok((specs, primary))
 }
@@ -579,224 +723,54 @@ fn relative_to(root: &Path, raw: &str) -> String {
         .replace('\\', "/")
 }
 
-fn shape_text_result(
-    pattern: &str,
-    output_mode: &str,
-    primary: &[PrimaryRoot],
-    result: SearchOutput,
-    offset: usize,
-    limit: Option<usize>,
-) -> Value {
-    let stats = &result.stats;
-    let (files_json, symbol_totals, file_rows) = collect_file_rows(&result, primary, output_mode);
+// Response-shaping helpers live in `find_handler_shape.rs` (line budget).
+#[path = "find_handler_shape.rs"]
+mod shape;
+use shape::{exists_result, looks_like_regex, parse_resume_cursors, retry_note, shape_text_result};
 
-    let mut value = json!({
-        "pattern": pattern,
-        "target": "text",
-        "output": output_mode,
-        "roots": primary.iter().map(|r| json!({
-            "path": r.root.to_string_lossy(),
-            "indexed": r.indexed,
-        })).collect::<Vec<_>>(),
-        "total_files": stats.files_matched,
-        "total_matches": stats.match_lines,
-        "complete": result.complete,
-        "source_freshness": "live",
-        "stats": {
-            "candidates": stats.candidates,
-            "scanned": stats.scanned,
-            "changed_since_index": stats.dirty,
-            "millis": stats.millis as u64,
-        },
-    });
-    // Whether the engine's has_more was suppressed because the continuation
-    // cannot advance (matches mode only; the summary modes compute their own
-    // in `shape_rows_page`). A zero-hit page ends the stream too — its
-    // next_offset would re-serve the identical page — but only the ceiling
-    // case is a truncation; the note explains the rest.
-    let ceiling_ended = output_mode == "matches"
-        && result.has_more
-        && continuation_past_ceiling(offset + result.returned);
-    let zero_hit_ended =
-        output_mode == "matches" && result.has_more && result.returned == 0 && !ceiling_ended;
-    match output_mode {
-        "matches" => shape_matches_page(
-            &mut value,
-            &result,
-            offset,
-            ceiling_ended,
-            zero_hit_ended,
-            files_json,
-        ),
-        "files" => shape_rows_page(
-            &mut value,
-            file_rows,
-            offset,
-            limit,
-            "files",
-            |(file, matches)| json!({ "file": file, "matches": matches }),
-        ),
-        "symbols" => {
-            let mut rows: Vec<_> = symbol_totals.into_iter().collect();
-            rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            shape_rows_page(&mut value, rows, offset, limit, "symbols", |entry| {
-                let ((name, kind, file), matches) = entry;
-                json!({ "name": name, "kind": kind, "file": file, "matches": matches })
-            });
-        }
-        _ => {}
-    }
-    let value_notes_ceiling = ceiling_ended || value.get("truncated_by_ceiling").is_some();
-    // `count` carries no has_more at all — it is not pageable — so a
-    // missing key means false, not true.
-    let response_has_more = value
-        .get("has_more")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if let Some(note) = result_note(&result, value_notes_ceiling, response_has_more) {
-        value["note"] = json!(note);
-    }
-    value
-}
-
-/// Gather the per-root file results into the shape each output mode needs:
-/// rendered match pages, per-file symbol totals, or plain (file, count) rows.
-fn collect_file_rows(
-    result: &SearchOutput,
-    primary: &[PrimaryRoot],
-    output_mode: &str,
-) -> (
-    Vec<Value>,
-    BTreeMap<(String, &'static str, String), usize>,
-    Vec<(String, usize)>,
-) {
-    let mut files_json = Vec::new();
-    let mut symbol_totals: BTreeMap<(String, &'static str, String), usize> = BTreeMap::new();
-    let mut file_rows: Vec<(String, usize)> = Vec::new();
-    for (root_id, root) in result.roots.iter().enumerate() {
-        for file in &root.files {
-            let shown = display_path(primary, root_id, &file.rel);
-            match output_mode {
-                "matches" => {
-                    files_json.push(json!({
-                        "file": shown,
-                        "matches": file.match_lines,
-                        "symbols_stale": file.symbols_stale,
-                        "hits": file.hits.iter().map(|hit| {
-                            let mut value = json!({ "line": hit.line, "text": hit.text });
-                            if hit.col > 1 { value["col"] = json!(hit.col); }
-                            if let Some((name, kind)) = &hit.symbol {
-                                value["symbol"] = json!(name);
-                                value["kind"] = json!(kind);
-                            }
-                            if !hit.before.is_empty() { value["before"] = json!(hit.before); }
-                            if !hit.after.is_empty() { value["after"] = json!(hit.after); }
-                            value
-                        }).collect::<Vec<_>>(),
-                    }));
-                }
-                "symbols" => {
-                    for (name, kind, count) in &file.symbols {
-                        *symbol_totals
-                            .entry((name.clone(), kind, shown.clone()))
-                            .or_default() += count;
-                    }
-                }
-                _ => file_rows.push((shown, file.match_lines)),
-            }
+/// §4.2f `output=callsites`: the engine searched `name(` as a literal
+/// pattern; drop the rows that are the definition itself (the
+/// `fn`/`function`/`def` line naming the pattern) so what remains is the
+/// call surface. Find is registry-free by design, so this stays syntactic —
+/// the PDG-backed variant belongs to symbol_lookup.
+fn filter_callsites(value: &mut Value, pattern: &str) {
+    // The caller may search the bare name or `name(`; both mean the same
+    // call surface. Strip the paren so the marker is exactly `name(`.
+    let name = pattern.trim_end_matches('(');
+    let definition_marker = format!("{name}(");
+    // A definition line names the function after one of these keywords
+    // ("pub fn", "async def", "export function", ...). A bare modifier is
+    // not enough, and a call at line start has an empty prefix, which is a
+    // call — not a vacuous definition.
+    const DEFINITION_KEYWORDS: [&str; 7] =
+        ["fn", "function", "def", "func", "class", "struct", "impl"];
+    let mut callsites = 0usize;
+    if let Some(files) = value.get_mut("files").and_then(Value::as_array_mut) {
+        for file in files {
+            let kept = file
+                .get_mut("hits")
+                .and_then(Value::as_array_mut)
+                .map_or(0, |hits| {
+                    hits.retain(|hit| {
+                        let Some(text) = hit.get("text").and_then(Value::as_str) else {
+                            return true;
+                        };
+                        let trimmed = text.trim_start();
+                        let Some(marker_pos) = trimmed.find(&definition_marker) else {
+                            return true;
+                        };
+                        !trimmed[..marker_pos]
+                            .split_whitespace()
+                            .any(|token| DEFINITION_KEYWORDS.contains(&token))
+                    });
+                    hits.len()
+                });
+            file["matches"] = json!(kept);
+            callsites += kept;
         }
     }
-    (files_json, symbol_totals, file_rows)
-}
-
-/// The `matches` response page: hit lists plus the paging/truncation signals.
-fn shape_matches_page(
-    value: &mut Value,
-    result: &SearchOutput,
-    offset: usize,
-    ceiling_ended: bool,
-    zero_hit_ended: bool,
-    files: Vec<Value>,
-) {
-    let stream_ended = ceiling_ended || zero_hit_ended;
-    value["returned"] = json!(result.returned);
-    value["offset"] = json!(offset);
-    value["has_more"] = json!(result.has_more && !stream_ended);
-    if result.has_more && !stream_ended {
-        value["next_offset"] = json!(offset + result.returned);
-    }
-    if ceiling_ended {
-        value["truncated_by_ceiling"] = json!(true);
-    }
-    if result.cap_withheld > 0 {
-        value["withheld_by_cap"] = json!(result.cap_withheld);
-    }
-    value["files"] = Value::Array(files);
-}
-
-/// A summarised (`files`/`symbols`) response page: window the sorted rows and
-/// attach the same honest paging/truncation signals the hit pages carry.
-fn shape_rows_page<T>(
-    value: &mut Value,
-    rows: Vec<T>,
-    offset: usize,
-    limit: Option<usize>,
-    key: &str,
-    render: impl Fn(&T) -> Value,
-) {
-    let cap = limit.unwrap_or(usize::MAX);
-    let total = rows.len();
-    let page: Vec<_> = rows.into_iter().skip(offset).take(cap).collect();
-    let proposed_next = offset + page.len();
-    let ceiling_ended = proposed_next < total && continuation_past_ceiling(proposed_next);
-    value["has_more"] = json!(proposed_next < total && !ceiling_ended);
-    if ceiling_ended {
-        value["truncated_by_ceiling"] = json!(true);
-    }
-    value[key] = json!(page.iter().map(render).collect::<Vec<_>>());
-}
-
-/// Trailing hint for any text payload: why a complete-looking response may
-/// still be incomplete. `None` when no signal applies. `ceiling_ended` is
-/// the caller-computed truncation flag (it needs the request offset); the
-/// ceiling sentence takes precedence because it is the binding cause — the
-/// page's continuation is unservable regardless of the time budget. Whether
-/// the scan ALSO stopped at the deadline is answered by the engine's
-/// `stopped_by_deadline`, not by `complete`: a window stop pairs `has_more`
-/// with `complete = false` itself, so keying the budget sentence on
-/// `complete` mislabeled ceiling-ended pages "time budget".
-fn result_note(
-    result: &SearchOutput,
-    ceiling_ended: bool,
-    response_has_more: bool,
-) -> Option<String> {
-    let mut note = String::new();
-    if ceiling_ended {
-        if !note.is_empty() {
-            note.push(' ');
-        }
-        note.push_str(&ceiling_sentence());
-    }
-    // Keyed on the RESPONSE's has_more, not the engine's: a page whose
-    // continuation was refused reads as final to the client, so a
-    // deadline-stopped scan must still say its totals are provisional.
-    if result.stopped_by_deadline && !response_has_more {
-        if !note.is_empty() {
-            note.push(' ');
-        }
-        note.push_str("Stopped at the time budget; raise timeout_ms or narrow the search");
-    }
-    if result.cap_withheld > 0 {
-        if !note.is_empty() {
-            note.push(' ');
-        }
-        note.push_str(&format!(
-            "{} buffered matches sit past per_file_cap and appear on no page; \
-             raise per_file_cap (0 = no cap) to page through every match",
-            result.cap_withheld
-        ));
-    }
-    (!note.is_empty()).then_some(note)
+    value["callsites"] = json!(callsites);
+    value["total_matches"] = json!(callsites);
 }
 
 /// The ceiling sentence shared by the text paths (`result_note`) and the
@@ -811,419 +785,10 @@ fn ceiling_sentence() -> String {
     )
 }
 
+/// The module's tests live in `find_handler_test.rs` so this file stays under
+/// the repository's 2000-line budget (`Large File Detection`). Same seam the
+/// sibling handlers use (`#[path = ...] mod test;` in `git_apply.rs`,
+/// `git_handler.rs`, `git_apply_exec.rs`, `edit_apply_handler.rs`).
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_find_window_limit_zero_maps_to_ceiling_not_unbounded() {
-        // `limit: 0` must NOT reach the engine as `None` (unbounded
-        // collection): the ceiling exists precisely to stop one request
-        // from parking every match of every file in the shared daemon.
-        let window = find_window(&serde_json::json!({ "limit": 0 })).unwrap();
-        assert_eq!(window.limit, Some(MAX_LIMIT));
-
-        // Values above the ceiling clamp; the offset clamps for the same
-        // reason (the engine buffers offset + limit hits per file).
-        let window =
-            find_window(&serde_json::json!({ "limit": 500_000, "offset": 90_000_000 })).unwrap();
-        assert_eq!(window.limit, Some(MAX_LIMIT));
-        assert_eq!(window.offset, MAX_LIMIT);
-
-        // A limit of None (absent) keeps the default page, not unbounded.
-        let window = find_window(&serde_json::json!({})).unwrap();
-        assert_eq!(window.limit, Some(DEFAULT_LIMIT));
-    }
-
-    fn project() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(
-            dir.path().join("src/lib.rs"),
-            "pub fn parse_config() {}\npub fn other() {\n    parse_config();\n}\n",
-        )
-        .unwrap();
-        std::fs::write(dir.path().join("README.md"), "Call parse_config first.\n").unwrap();
-        dir
-    }
-
-    async fn run(dir: &Path, args: Value) -> Value {
-        // A bare registry: `test_registry_for` would create `.leindex`, which
-        // marks the project as indexed.
-        let registry = Arc::new(ProjectRegistry::new(2));
-        let mut args = args;
-        args["project_path"] = json!(dir.to_string_lossy());
-        FindHandler.execute(&registry, args).await.unwrap()
-    }
-
-    #[tokio::test]
-    async fn test_find_matches_are_grouped_by_file_with_lines() {
-        let dir = project();
-        let value = run(dir.path(), json!({"pattern": "parse_config"})).await;
-        assert_eq!(value["total_files"], 2);
-        assert_eq!(value["total_matches"], 3);
-        assert_eq!(value["has_more"], false);
-        let files: Vec<&str> = value["files"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|f| f["file"].as_str().unwrap())
-            .collect();
-        assert_eq!(files, ["README.md", "src/lib.rs"]);
-        assert_eq!(value["files"][1]["hits"][1]["line"], 3);
-    }
-
-    #[tokio::test]
-    async fn test_find_searches_outside_the_workspace_without_an_index() {
-        let workspace = project();
-        let elsewhere = tempfile::tempdir().unwrap();
-        std::fs::write(
-            elsewhere.path().join("notes.txt"),
-            "remember: parse_config lives here\n",
-        )
-        .unwrap();
-        let value = run(
-            workspace.path(),
-            json!({"pattern": "parse_config", "paths": [elsewhere.path().to_string_lossy()]}),
-        )
-        .await;
-        assert_eq!(value["total_files"], 1, "only the extra path was searched");
-        let file = value["files"][0]["file"].as_str().unwrap();
-        assert!(
-            file.ends_with("notes.txt") && Path::new(file).is_absolute(),
-            "{file}"
-        );
-        assert_eq!(value["roots"][0]["indexed"], false);
-        assert!(
-            !elsewhere.path().join(".leindex").exists(),
-            "searching must have no side effects"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_find_works_with_no_project_at_all() {
-        let elsewhere = tempfile::tempdir().unwrap();
-        std::fs::write(elsewhere.path().join("a.txt"), "needle\n").unwrap();
-        let registry = Arc::new(ProjectRegistry::new(2));
-        let value = FindHandler
-            .execute(
-                &registry,
-                json!({"pattern": "needle", "paths": [elsewhere.path().to_string_lossy()]}),
-            )
-            .await
-            .unwrap();
-        assert_eq!(value["total_matches"], 1);
-    }
-
-    #[tokio::test]
-    async fn test_find_output_modes() {
-        let dir = project();
-        let count = run(
-            dir.path(),
-            json!({"pattern": "parse_config", "output": "count"}),
-        )
-        .await;
-        assert_eq!(count["total_matches"], 3);
-        assert!(count.get("files").is_none() && count.get("hits").is_none());
-        let files = run(
-            dir.path(),
-            json!({"pattern": "parse_config", "output": "files"}),
-        )
-        .await;
-        assert_eq!(
-            files["files"][1],
-            json!({"file": "src/lib.rs", "matches": 2})
-        );
-    }
-
-    #[test]
-    fn test_continuation_past_ceiling_boundaries() {
-        assert!(!continuation_past_ceiling(MAX_LIMIT));
-        assert!(continuation_past_ceiling(MAX_LIMIT + 1));
-    }
-
-    /// A page whose continuation would land past the offset ceiling must END
-    /// the stream (has_more=false, no next_offset, ceiling note) instead of
-    /// advertising a next_offset the next request would clamp back to this
-    /// page's start — the repeat-forever page (Codex P2, round 8).
-    #[test]
-    fn test_matches_page_at_ceiling_ends_stream_instead_of_repeating() {
-        // Engine-shaped window stop (`has_more` pairs with `complete=false`;
-        // the deadline never fired): the page starting AT the ceiling is a
-        // window stop, not a time-budget stop.
-        let more = || SearchOutput {
-            returned: 5,
-            has_more: true,
-            complete: false,
-            ..SearchOutput::default()
-        };
-
-        // Control: a normal page keeps paging.
-        let value = shape_text_result("p", "matches", &[], more(), 10, Some(50));
-        assert_eq!(value["has_more"], true);
-        assert_eq!(value["next_offset"], 15);
-        assert!(value.get("truncated_by_ceiling").is_none());
-
-        // The page starting AT the ceiling: returned hits are served in
-        // full, but the continuation is refused with an explanation.
-        let value = shape_text_result("p", "matches", &[], more(), MAX_LIMIT, Some(50));
-        assert_eq!(value["has_more"], false);
-        assert!(value["next_offset"].is_null());
-        assert_eq!(value["truncated_by_ceiling"], true);
-        let note = value["note"].as_str().unwrap();
-        assert!(note.contains("window ceiling"), "note: {note}");
-
-        // The straddling page (offset + returned crosses the ceiling): same
-        // honest end, no clamped overlap.
-        let value = shape_text_result("p", "matches", &[], more(), MAX_LIMIT - 2, Some(50));
-        assert_eq!(value["has_more"], false);
-        assert!(value["next_offset"].is_null());
-        assert_eq!(value["truncated_by_ceiling"], true);
-    }
-
-    /// The round-10 Kilo CRITICAL: a page that ended because the WINDOW
-    /// filled at the ceiling (no deadline involved) must report the ceiling
-    /// as the cause. The old note keyed the budget sentence on `complete`
-    /// — which a window stop also sets false — so the page was mislabeled
-    /// "Stopped at the time budget" and the ceiling sentence was dead code
-    /// on the matches path (`has_more => !complete` made
-    /// `ceiling_ended && result.complete` unreachable).
-    #[test]
-    fn test_window_stop_at_ceiling_reports_the_ceiling_not_the_budget() {
-        let value = shape_text_result(
-            "p",
-            "matches",
-            &[],
-            SearchOutput {
-                returned: 50,
-                has_more: true,
-                complete: false,
-                ..SearchOutput::default()
-            },
-            MAX_LIMIT,
-            Some(50),
-        );
-        assert_eq!(value["has_more"], false);
-        assert_eq!(value["truncated_by_ceiling"], true);
-        let note = value["note"].as_str().unwrap();
-        assert!(
-            note.contains("window ceiling") && !note.contains("time budget"),
-            "a window stop at the ceiling is not a time-budget stop, note: {note}"
-        );
-    }
-
-    /// A zero-hit page must end the stream whatever its offset: its
-    /// next_offset equals its own offset, so a `while has_more` client would
-    /// re-serve the identical page forever (the engine forces has_more=true
-    /// on a deadline stop, making this reachable at offset == MAX_LIMIT).
-    #[test]
-    fn test_zero_hit_page_ends_the_stream() {
-        let value = shape_text_result(
-            "p",
-            "matches",
-            &[],
-            SearchOutput {
-                returned: 0,
-                has_more: true,
-                complete: false,
-                stopped_by_deadline: true,
-                ..SearchOutput::default()
-            },
-            MAX_LIMIT,
-            Some(50),
-        );
-        assert_eq!(value["has_more"], false);
-        assert!(value["next_offset"].is_null());
-        assert!(
-            value.get("truncated_by_ceiling").is_none(),
-            "zero hits is not a ceiling truncation"
-        );
-        let note = value["note"].as_str().unwrap_or_default();
-        assert!(note.contains("time budget"), "note: {note}");
-    }
-
-    /// A deadline-stopped page at the ceiling reports BOTH causes: the
-    /// ceiling is the binding constraint for the stream (its continuation is
-    /// unservable), and the deadline made the page's totals provisional. The
-    /// old note picked one cause from `complete` alone — which a window stop
-    /// also sets false — so a pure window stop was mislabeled "time budget"
-    /// and a deadline stop at the ceiling lost the ceiling sentence.
-    #[test]
-    fn test_deadline_stopped_page_at_ceiling_reports_both_causes() {
-        let value = shape_text_result(
-            "p",
-            "matches",
-            &[],
-            SearchOutput {
-                returned: 50,
-                has_more: true,
-                complete: false,
-                stopped_by_deadline: true,
-                ..SearchOutput::default()
-            },
-            MAX_LIMIT,
-            Some(50),
-        );
-        assert_eq!(value["has_more"], false);
-        assert_eq!(value["truncated_by_ceiling"], true);
-        let note = value["note"].as_str().unwrap();
-        assert!(
-            note.contains("window ceiling") && note.contains("time budget"),
-            "both the ceiling and the budget must be named, note: {note}"
-        );
-    }
-
-    /// The time-budget sentence applies to every output mode: a truncated
-    /// `count` response carries provisional totals and must say so. The
-    /// engine end state `has_more=false, complete=false` is exactly the
-    /// deadline stop (the closing fallback sets both), so the fixture
-    /// carries `stopped_by_deadline`.
-    #[test]
-    fn test_budget_note_applies_to_summary_modes() {
-        let value = shape_text_result(
-            "p",
-            "count",
-            &[],
-            SearchOutput {
-                has_more: false,
-                complete: false,
-                stopped_by_deadline: true,
-                stats: crate::search::textsearch::SearchStats {
-                    match_lines: 7,
-                    ..Default::default()
-                },
-                ..SearchOutput::default()
-            },
-            0,
-            None,
-        );
-        assert_eq!(value["complete"], false);
-        let note = value["note"].as_str().unwrap();
-        assert!(note.contains("time budget"), "note: {note}");
-    }
-
-    #[tokio::test]
-    async fn test_find_pages_with_next_offset() {
-        let dir = project();
-        let first = run(dir.path(), json!({"pattern": "parse_config", "limit": 2})).await;
-        assert_eq!(first["returned"], 2);
-        assert_eq!(first["has_more"], true);
-        let next = first["next_offset"].as_u64().unwrap();
-        let second = run(
-            dir.path(),
-            json!({"pattern": "parse_config", "limit": 2, "offset": next}),
-        )
-        .await;
-        assert_eq!(second["returned"], 1);
-        assert_eq!(second["has_more"], false);
-        let all = run(dir.path(), json!({"pattern": "parse_config", "limit": 0})).await;
-        assert_eq!(all["returned"], 3);
-    }
-
-    #[tokio::test]
-    async fn test_find_accepts_the_legacy_text_search_spelling() {
-        let dir = project();
-        let value = run(
-            dir.path(),
-            json!({"query": "PARSE_CONFIG", "case_sensitive": false, "max_results": 5, "include_globs": ["*.rs"]}),
-        )
-        .await;
-        assert_eq!(value["total_files"], 1);
-        let sensitive = run(
-            dir.path(),
-            json!({"query": "PARSE_CONFIG", "case_sensitive": true}),
-        )
-        .await;
-        assert_eq!(sensitive["total_matches"], 0);
-    }
-
-    #[tokio::test]
-    async fn test_find_regex_errors_are_actionable_and_bad_args_rejected() {
-        let dir = project();
-        let registry = Arc::new(ProjectRegistry::new(2));
-        let error = FindHandler
-            .execute(&registry, json!({"pattern": "(oops", "regex": true, "project_path": dir.path().to_string_lossy()}))
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("invalid pattern"), "{error}");
-        let error = FindHandler.execute(&registry, json!({})).await.unwrap_err();
-        assert!(error.message_with_hint().contains("pattern"), "{error}");
-        let error = FindHandler
-            .execute(&registry, json!({"pattern": "x", "output": "nope", "project_path": dir.path().to_string_lossy()}))
-            .await
-            .unwrap_err();
-        assert!(
-            error.message_with_hint().contains("matches | files"),
-            "{error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_find_does_not_hydrate_the_project() {
-        use crate::cli::mcp::request_meta::{PDG_LOADS, PROJECT_HYDRATIONS};
-        use std::sync::atomic::Ordering;
-        let dir = project();
-        let (pdg, hydrations) = (
-            PDG_LOADS.load(Ordering::Relaxed),
-            PROJECT_HYDRATIONS.load(Ordering::Relaxed),
-        );
-        let registry = Arc::new(ProjectRegistry::new(2));
-        FindHandler
-            .execute(
-                &registry,
-                json!({"pattern": "parse_config", "project_path": dir.path().to_string_lossy()}),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            registry.len().await,
-            0,
-            "find must not load the project into the registry"
-        );
-        assert_eq!(PDG_LOADS.load(Ordering::Relaxed), pdg);
-        assert_eq!(PROJECT_HYDRATIONS.load(Ordering::Relaxed), hydrations);
-    }
-
-    #[tokio::test]
-    async fn test_find_uses_and_refreshes_the_index_when_the_project_is_indexed() {
-        let dir = project();
-        std::fs::create_dir_all(dir.path().join(".leindex")).unwrap(); // marks the project as indexed
-        let first = run(dir.path(), json!({"pattern": "parse_config"})).await;
-        assert_eq!(first["roots"][0]["indexed"], true);
-        assert!(dir.path().join(".leindex/textindex/index.bin").is_file());
-
-        std::thread::sleep(Duration::from_millis(20));
-        std::fs::write(
-            dir.path().join("src/new.rs"),
-            "fn added_after_indexing() {}\n",
-        )
-        .unwrap();
-        let fresh = run(dir.path(), json!({"pattern": "added_after_indexing"})).await;
-        assert_eq!(
-            fresh["total_matches"], 1,
-            "files added after the index was built are still found"
-        );
-        assert!(fresh["stats"]["changed_since_index"].as_u64().unwrap() >= 1);
-    }
-
-    #[tokio::test]
-    async fn test_find_auto_target_falls_back_to_text() {
-        let dir = project();
-        let value = run(
-            dir.path(),
-            json!({"pattern": "parse_config", "target": "auto"}),
-        )
-        .await;
-        assert_eq!(value["target"], "text");
-        assert_eq!(value["total_matches"], 3);
-        assert!(value["fallback"].as_str().unwrap().contains("text"));
-    }
-
-    #[tokio::test]
-    async fn test_find_symbols_target_without_an_index_explains_itself() {
-        let dir = project();
-        let value = run(dir.path(), json!({"pattern": "parse", "target": "symbols"})).await;
-        assert_eq!(value["total_symbols"], 0);
-        assert!(value["note"].as_str().unwrap().contains("leindex_manage"));
-    }
-}
+#[path = "find_handler_test.rs"]
+mod tests;

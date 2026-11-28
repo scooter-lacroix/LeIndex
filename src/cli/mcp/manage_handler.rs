@@ -39,7 +39,7 @@ struct Action {
 }
 
 /// The manage surface, in advertisement order.
-const ACTIONS: [Action; 6] = [
+const ACTIONS: [Action; 8] = [
     Action {
         name: "index",
         summary: "Build or refresh the index; returns a pollable job (status_only=true polls)",
@@ -69,6 +69,29 @@ const ACTIONS: [Action; 6] = [
         name: "cleanup",
         summary: "Retention report for the generation store; dry_run=true by default",
         args: &["dry_run", "max_generations"],
+    },
+    Action {
+        name: "run",
+        summary: "Run cargo/npm/pytest/go/make/just/script/* sandboxed; ~300-char summary + log://handle",
+        args: &[
+            "argv",
+            "command",
+            "cwd",
+            "timeout_secs",
+            "name",
+            "log",
+            "tail",
+            "check",
+            "max",
+            "diagnostics",
+            "from",
+            "to",
+        ],
+    },
+    Action {
+        name: "how_to_test",
+        summary: "The gate command for a path (workspace member, docs, scripts, Makefile/justfile)",
+        args: &["path"],
     },
 ];
 
@@ -163,6 +186,53 @@ impl ManageHandler {
                     "minimum": 1,
                     "maximum": 100,
                     "default": 3
+                },
+                "argv": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Command as an array, run without a shell (run)"
+                },
+                "command": {
+                    "type": "string",
+                    "description": "Single-string form; rejected if it has shell metacharacters (run)"
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory inside the project (run)"
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "description": "Wall-clock limit, default 600, max 3600 (run)"
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Log handle name; the log is stored as log://<name> (run)"
+                },
+                "log": {
+                    "type": "string",
+                    "description": "Read a stored log by handle, e.g. log://g6-clippy (run)"
+                },
+                "tail": {
+                    "type": "integer",
+                    "description": "Lines to return from the end of a log, default 200 (run log)"
+                },
+                "check": {
+                    "type": "string",
+                    "description": "File whose owning crate/package to check (run)"
+                },
+                "max": {
+                    "type": "integer",
+                    "description": "Most failures to list, default 10 (run check)"
+                },
+                "diagnostics": {
+                    "type": "string",
+                    "description": "File whose stored diagnostics to return (run)"
+                },
+                "from": { "type": "integer", "description": "First line (run diagnostics)" },
+                "to": { "type": "integer", "description": "Last line (run diagnostics)" },
+                "path": {
+                    "type": "string",
+                    "description": "File or directory to find the test command for (how_to_test)"
                 }
             },
             "required": []
@@ -199,9 +269,29 @@ impl ManageHandler {
             "evict" => evict(registry, &args).await,
             "lease" => lease(registry, &args).await,
             "cleanup" => cleanup(registry, &args).await,
+            "run" => {
+                let root = resolved_root(registry, &args).await?;
+                crate::cli::run::actions::run_action(&root, &args)
+                    .await
+                    .map_err(run_error)
+            }
+            "how_to_test" => {
+                let root = resolved_root(registry, &args).await?;
+                crate::cli::run::actions::how_to_test_action(&root, &args).map_err(run_error)
+            }
             _ => unreachable!("every OPS entry is handled above"),
         }
     }
+}
+
+/// A `run` / `how_to_test` failure is a caller-correctable request problem
+/// (denied command, bad path, nothing detected), so it is `invalid_params`.
+fn run_error(message: String) -> JsonRpcError {
+    JsonRpcError::invalid_params_with_suggestion(
+        message,
+        "run takes argv (array) or command (no shell metacharacters); see leindex://tools/guide"
+            .to_string(),
+    )
 }
 
 /// Resolve the project path this action refers to, without creating or
@@ -276,7 +366,7 @@ async fn state(registry: &Arc<ProjectRegistry>, args: &Value) -> Result<Value, J
         "last_failure_phase": health.last_failure_phase.map(|phase| phase.as_str()),
         "last_failure": health.last_failure,
         "next": if complete {
-            "leindex_manage action=index with force_reindex=true to rebuild"
+            "the generation is current; leindex_manage action=index refreshes incrementally when the worktree changes"
         } else {
             "the last index run did not complete; run leindex_manage action=index to resume"
         },
@@ -482,7 +572,16 @@ mod tests {
     fn test_dispatch_covers_every_advertised_action() {
         // Kept as an explicit list rather than a wildcard: adding an Action
         // without a dispatch arm is exactly the drift this catches.
-        for name in ["index", "state", "projects", "evict", "lease", "cleanup"] {
+        for name in [
+            "index",
+            "state",
+            "projects",
+            "evict",
+            "lease",
+            "cleanup",
+            "run",
+            "how_to_test",
+        ] {
             assert!(
                 ACTIONS.iter().any(|action| action.name == name),
                 "{name} is missing from ACTIONS"
@@ -490,7 +589,7 @@ mod tests {
         }
         assert_eq!(
             ACTIONS.len(),
-            6,
+            8,
             "a new action needs a dispatch arm and a test"
         );
     }

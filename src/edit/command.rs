@@ -13,7 +13,14 @@ use crate::storage::UniqueProjectId;
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum EditChange {
     /// Replace text at a specific byte range
+    ///
+    /// `file_path` is `None` for the single-file form (`file_path` argument
+    /// or `old_text`/`new_text` aliases) and `Some` for a `changes[]` entry
+    /// that carries its own `file_path` (multi-file batch, §4.3).
     ReplaceText {
+        /// Owning file when this change names one explicitly (batch mode).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_path: Option<String>,
         /// Start byte offset
         start: usize,
         /// End byte offset

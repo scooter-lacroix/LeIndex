@@ -74,6 +74,16 @@ pub(super) fn render_symbol_source(data: &Value, color: bool) -> String {
     out
 }
 
+/// Continuation handles for a paged relationship list.
+#[derive(Clone, Copy, Default)]
+pub(super) struct RelationshipPage {
+    /// Field naming the producer-side total (`callers_total`).
+    pub total_key: Option<&'static str>,
+    /// Field naming the offset that fetches the next page
+    /// (`callers_next_offset`), plus the argument that consumes it.
+    pub next: Option<(&'static str, &'static str)>,
+}
+
 pub(super) fn render_symbol_relationships(
     data: &Value,
     key: &str,
@@ -81,6 +91,7 @@ pub(super) fn render_symbol_relationships(
     title: &str,
     arrow: &str,
     color: bool,
+    page: RelationshipPage,
 ) -> String {
     let Some(entries) = data.get(key).and_then(|v| v.as_array()) else {
         return String::new();
@@ -90,7 +101,12 @@ pub(super) fn render_symbol_relationships(
     }
 
     let mut out = format!("\n  {title}:\n");
-    for entry in entries.iter().take(50) {
+    // No renderer-side cap. The producer already pages the list inside the
+    // response character budget and reports the overflow through
+    // `*_truncated` / `*_total` / `*_next_offset`; a second cap here dropped
+    // rows the producer had counted and reported nothing, so a partial list
+    // read as the complete set.
+    for entry in entries {
         let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("?");
         let file = entry.get("file").and_then(|v| v.as_str()).unwrap_or("");
         let typ = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -109,14 +125,39 @@ pub(super) fn render_symbol_relationships(
             if color { RESET } else { "" },
         ));
     }
-    if data
+    // The next-page instruction is what makes a budgeted list actionable:
+    // without it the caller cannot reach the entries the producer withheld,
+    // and the paged `caller_offset` argument is unreachable from this output.
+    let next_offset = page
+        .next
+        .and_then(|(next_key, _)| data.get(next_key).and_then(|v| v.as_u64()));
+    if let (Some((_, argument)), Some(next)) = (page.next, next_offset) {
+        let total = page
+            .total_key
+            .and_then(|total_key| data.get(total_key).and_then(|v| v.as_u64()))
+            .unwrap_or(0);
+        out.push_str(&format!(
+            "    {}... showing {shown} of {total} — pass {argument}={next} for the rest{}\n",
+            if color { DIM } else { "" },
+            if color { RESET } else { "" },
+            shown = entries.len(),
+        ));
+    } else if data
         .get(truncated_key)
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
     {
+        // Truncated with NO continuation handle. The relationship producer
+        // pages only CALLERS (`callers_next_offset`); there is no
+        // `callees_total` / `callees_next_offset` / `callee_offset` anywhere
+        // in the handler, so a callee page cannot be continued and offering a
+        // fake offset would send the client after a field that is never
+        // emitted. The notice therefore states the page size AND that no
+        // continuation exists, instead of implying the rest is retrievable.
         out.push_str(&format!(
-            "    {}... (showing 50 or more){}\n",
+            "    {}... (truncated at {} — this list has no continuation handle){}\n",
             if color { DIM } else { "" },
+            entries.len(),
             if color { RESET } else { "" },
         ));
     }
@@ -174,6 +215,12 @@ pub(super) fn render_symbol_lookup_single(data: &Value, color: bool) -> String {
     {
         out.push_str(&field("Index freshness", freshness, color));
     }
+    // §6.3 usage sites (`kind: construct|match`) and §6.4 executable tests
+    // (`kind: tests`) replace the relations body. Rendering only the relations
+    // shape showed symbol/file/source for those kinds and hid the actual
+    // answer — the usage sites, or the command that runs each test.
+    out.push_str(&render_usage_sites(data, color));
+    out.push_str(&render_test_targets(data, color));
     out.push_str(&render_symbol_source(data, color));
 
     out.push_str(&render_symbol_relationships(
@@ -183,6 +230,10 @@ pub(super) fn render_symbol_lookup_single(data: &Value, color: bool) -> String {
         "Callers",
         "→",
         color,
+        RelationshipPage {
+            total_key: Some("callers_total"),
+            next: Some(("callers_next_offset", "caller_offset")),
+        },
     ));
     out.push_str(&render_symbol_relationships(
         data,
@@ -191,7 +242,116 @@ pub(super) fn render_symbol_lookup_single(data: &Value, color: bool) -> String {
         "Callees",
         "←",
         color,
+        RelationshipPage::default(),
     ));
+    out
+}
+
+/// §6.4 tests body: each entry carries the exact command that runs it, so it
+/// has to be rendered, not just trimmed through.
+fn render_test_targets(data: &Value, color: bool) -> String {
+    let Some(entries) = data.get("tests").and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    if entries.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("\n  Tests ({}):\n", entries.len());
+    // Render EVERY budgeted entry. The producer already enforces the response
+    // character budget and reports `tests_truncated`; an extra renderer-side
+    // cap silently dropped entries while the heading still counted them, so a
+    // partial answer read as the complete set — six tests printed under a
+    // "(6)" heading with five lines below it, and eleven sites printed under
+    // an "(11)" heading with ten.
+    for entry in entries {
+        let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+        let file = entry.get("file").and_then(|v| v.as_str()).unwrap_or("");
+        let command = entry.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        out.push_str(&format!(
+            "    → {}{}{} {}{}{}\n        {}{}{}\n",
+            if color { LIGHT_CYAN } else { "" },
+            name,
+            if color { RESET } else { "" },
+            if color { DIM } else { "" },
+            file,
+            if color { RESET } else { "" },
+            if color { DIM } else { "" },
+            command,
+            if color { RESET } else { "" },
+        ));
+    }
+    if data
+        .get("tests_truncated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        // Same disclosure shape as the usage-site notice: whenever the
+        // producer reports the overflow total, state it — "(truncated)" alone
+        // makes a budgeted list look like a short list.
+        let total = data
+            .get("tests_total")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if total > 0 {
+            out.push_str(&format!("    ... (truncated, {total} total)\n"));
+        } else {
+            out.push_str("    ... (truncated)\n");
+        }
+    }
+    out
+}
+
+/// §6.3 usage body: `kind: construct|match` with `sites`. Without this the
+/// alternate kinds rendered as a bare symbol header.
+fn render_usage_sites(data: &Value, color: bool) -> String {
+    let Some(entries) = data.get("sites").and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    let kind = data.get("kind").and_then(|v| v.as_str()).unwrap_or("sites");
+    if entries.is_empty() {
+        return format!("\n  {} (0):\n", kind);
+    }
+    let mut out = format!("\n  {} ({}):\n", kind, entries.len());
+    // No renderer-side cap: `sites_truncated` is the producer's contract, and
+    // the producer already fits the list inside the response character budget.
+    // A second `take(10)` here dropped the eleventh site while the heading
+    // still said eleven, so a partial answer read as the complete set.
+    for entry in entries {
+        let file = entry.get("file").and_then(|v| v.as_str()).unwrap_or("");
+        let line = entry.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
+        let text = entry
+            .get("site_line")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let form = entry.get("form").and_then(|v| v.as_str()).unwrap_or("");
+        let enclosing = entry.get("enclosing").and_then(|v| v.as_str());
+        let suffix = match enclosing {
+            Some(owner) => format!("  [{form}]  (in {owner})"),
+            None if form.is_empty() => String::new(),
+            None => format!("  [{form}]"),
+        };
+        out.push_str(&format!(
+            "    {}{}:{}{} {}{}{}\n",
+            if color { DIM } else { "" },
+            file,
+            line,
+            if color { RESET } else { "" },
+            truncate_chars(text, 120),
+            if color { DIM } else { "" },
+            suffix,
+        ));
+    }
+    if data
+        .get("sites_truncated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        let total = data
+            .get("sites_total")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        out.push_str(&format!("    ... (truncated, {total} total)\n"));
+    }
     out
 }
 
@@ -267,7 +427,16 @@ pub(super) fn render_phase_section(data: &Value, phase: u8, color: bool) -> Stri
                 .unwrap_or(0);
             let mut out = format!("  {bold}Phase 4:{reset} {hotspots} hotspots{reset}\n");
             if let Some(items) = value.get("hotspots").and_then(|v| v.as_array()) {
-                for (index, hotspot) in items.iter().take(5).enumerate() {
+                // The heading states the producer's full count while only the
+                // ranked top five are printed, so the list must say what it is:
+                // a sample. Numbered rows that stop mid-count read as the whole
+                // set otherwise — the same read-as-complete class as the
+                // symbol-lookup caps, just with the total already disclosed.
+                let shown = items.len().min(5);
+                if items.len() > shown {
+                    out.push_str(&format!("    {dim}(top {shown} by score){reset}\n"));
+                }
+                for (index, hotspot) in items.iter().take(shown).enumerate() {
                     let name = hotspot
                         .get("node_id")
                         .and_then(|v| v.as_str())

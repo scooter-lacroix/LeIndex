@@ -190,7 +190,7 @@ model pays on every session and removes the choice between near-synonyms.
 | `leindex_analyze` | `mode` | `deep` (default), `impact`, `diagnostics`, `phase` |
 | `leindex_edit` | `action` (**required**) | `preview`, `apply`, `rename`, `write` |
 | `leindex_manage` | `action` | `index` (default), `state`, `projects`, `evict`, `lease`, `cleanup` |
-| `leindex_git` | `action` | `status`, `diff`, `log`, `show`, `blame`, `branch`, `remote`, `add`, `commit`, `checkout`, `stash`, `tag`, `merge`, `rebase`, `push`, `reset`, `force` (mutations are preview-only) |
+| `leindex_git` | `action` | `status`, `diff`, `log`, `show`, `blame`, `branch`, `remote`, `add`, `commit`, `checkout`, `stash`, `tag`, `merge`, `rebase`, `push`, `reset`, `force` (mutations are plan-gated: bare call → plan + `preview_token`; re-send with the token to apply, `confirm:true` for add/commit/push) |
 
 `leindex_edit` has no default on purpose: an ambiguous call must fail rather than
 guess at a mutation. The read-only routers default to their most common branch,
@@ -254,13 +254,45 @@ tool's semantic mode is gone; use `mode=search`.
 
 A PDG-enriched diff: the working tree (default), the index (`staged=true`), one
 commit against its parent (`ref="HEAD~1"`), or a range (`range="main..feature"`).
-Returns per-file status and line counts, an optionally bounded `patch`
-(`include_patch`, `max_patch_chars`, `stat_only`), and — for working-tree diffs —
-the **symbols whose bodies the changed hunks touch**, with their callers and the
-files affected by the change (`enrich_pdg`). For historical refs and ranges the
-symbols are reported per changed file (`symbol_mapping: "file"`), since the
-current graph describes the current tree. Revision arguments cannot smuggle git
-options.
+Compact by default: per-file status and line counts, long-hunk summaries
+(`changes.long_hunks`: lines, start line, kind, enclosing `fn`), and — for
+working-tree diffs — the **symbols whose bodies the changed hunks touch**, with
+their callers and the files affected by the change (`enrich_pdg`). The full
+unified patch appears on `include_patch: true` (bounded by `max_patch_chars`).
+For historical refs and ranges the symbols are reported per changed file
+(`symbol_mapping: "file"`), since the current graph describes the current tree.
+Revision arguments cannot smuggle git options.
+
+### `git_mutations` (`leindex_git` `action=add|commit|checkout|stash|tag|merge|rebase|push|reset|force`)
+
+A bare mutating call never runs: it returns a **plan** — the exact argv, a
+read-only probe of the current state, the bulk-add stage list (what will be
+staged, post-exclusion), and a `preview_token` that binds the argv AND the
+repository state (HEAD oid + index digest). Apply by re-sending the call with
+that token; the executor rejects it if HEAD or the index moved since the plan.
+`confirm: true` skips the plan for the safe subset only (`add`, `commit`,
+`push` without force). Rails on the destructive shapes:
+
+| Shape | Gate |
+|---|---|
+| force-push (`action=force`) | `force: true` **and** `confirm_text` equal to the string the plan printed (`force-push <target>`), plus the token |
+| `reset --hard` | `hard: true` **and** the token |
+| `clean -fd` / `clean -d` (`action=reset`, `target: "-fd"`) | `clean: true` **and** the token |
+| branch deletion (`action=reset`, `target: "-d <branch>"`) | `delete: true` **and** the token |
+
+Bulk adds exclude likely secrets (`.env*`, `*.pem`, `id_rsa*`, `*.key`,
+`credentials*.json`, `*secret*`) and runtime artefacts (`.maestro/operations/*/lock`,
+`selection.json`, `initializer.json`, `target/`, `node_modules/`, `*.log`)
+discovered under directory paths; they are listed under `excluded` with a
+warning. An explicit path or `allow_sensitive: true` stages them anyway.
+`commit` accepts `paths` (a git **pathspec commit**: commits exactly those
+working-tree paths and disregards contents staged for other paths — untracked
+paths are not swept in) and `trailers` (git `--trailer`, one line each). The
+commit result carries `<shorthash> <oneline>` and a files-changed count; `push`
+returns the remote ref range (`50c8afc1..4b931c6b` shape) and the upstream
+ahead/behind after the push. Every mutation runs with stdin closed,
+`GIT_TERMINAL_PROMPT=0`, no editor/pager, and a 300 s timeout; failures (hook
+rejections included) are surfaced verbatim, bounded, with a truncation count.
 
 ---
 

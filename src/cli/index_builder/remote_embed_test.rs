@@ -1431,10 +1431,28 @@ fn test_remote_batch_is_reembedded_only_once() {
             .unwrap_or_default()
     ));
     std::fs::create_dir_all(&scratch).expect("scratch home");
-    let previous_home = std::env::var("LEINDEX_HOME").ok();
-    // SAFETY: this test owns `LEINDEX_HOME` for its own duration; the cache
-    // tests in `search::onnx::remote_cache` serialize on their own lock and use
-    // distinct roots, so the only shared state is the variable itself.
+    // `LEINDEX_HOME` is process-global, and other tests now hold it for long
+    // sandboxed windows (generation read equivalence), so this mutation must
+    // hold the shared env lock instead of assuming sole ownership of the
+    // variable for the test's duration.
+    let _env_lock = crate::test_env::EnvLock
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    // Restores the previous home on drop, including on panic — a failed
+    // assert must not leave the scratch root installed for the rest of the
+    // suite (which would re-arm the ambient host config for later tests).
+    struct RestoreHome(Option<std::ffi::OsString>);
+    impl Drop for RestoreHome {
+        fn drop(&mut self) {
+            // SAFETY: LEINDEX_HOME mutation is serialized by _env_lock above.
+            match self.0.take() {
+                Some(home) => unsafe { std::env::set_var("LEINDEX_HOME", home) },
+                None => unsafe { std::env::remove_var("LEINDEX_HOME") },
+            }
+        }
+    }
+    let _restore_home = RestoreHome(std::env::var_os("LEINDEX_HOME"));
+    // SAFETY: serialized by _env_lock; _restore_home undoes it on every path.
     unsafe { std::env::set_var("LEINDEX_HOME", &scratch) };
 
     let remote_cfg = RemoteEmbeddingConfig {
@@ -1466,10 +1484,10 @@ fn test_remote_batch_is_reembedded_only_once() {
         embedder.embed_neural_batch_blocking(&texts)
     };
 
-    match previous_home {
-        Some(value) => unsafe { std::env::set_var("LEINDEX_HOME", value) },
-        None => unsafe { std::env::remove_var("LEINDEX_HOME") },
-    }
+    // Restore while still holding the env lock, then release it before the
+    // remaining asserts so the lock's hold time stays minimal.
+    drop(_restore_home);
+    drop(_env_lock);
     let _ = std::fs::remove_dir_all(&scratch);
 
     assert_eq!(

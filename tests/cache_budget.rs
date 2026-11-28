@@ -508,11 +508,13 @@ async fn test_edit_cache_rejects_oversized() {
         original_text: "x".repeat(EDIT_CACHE_MAX_ENTRY_BYTES + 1000),
         modified_text: "y".repeat(100),
         changes: vec![EditChange::ReplaceText {
+            file_path: None,
             start: 0,
             end: 1,
             new_text: "y".to_string(),
         }],
         timestamp: chrono::Utc::now(),
+        original_hashes: std::collections::HashMap::new(),
     };
 
     let result = cache
@@ -538,11 +540,13 @@ async fn test_edit_cache_total_cap_enforced() {
             original_text: "x".repeat(entry_size / 2),
             modified_text: "y".repeat(entry_size / 2),
             changes: vec![EditChange::ReplaceText {
+                file_path: None,
                 start: 0,
                 end: 1,
                 new_text: "y".to_string(),
             }],
             timestamp: chrono::Utc::now(),
+            original_hashes: std::collections::HashMap::new(),
         };
         let result = cache
             .set(temp_dir.path(), entry)

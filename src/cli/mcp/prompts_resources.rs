@@ -35,8 +35,14 @@ pub fn list_resources_json() -> Value {
     serde_json::json!({ "resources": resources })
 }
 
-/// Handle resources/read request
-pub fn handle_resource_read(req: &JsonRpcRequest) -> Result<Value, JsonRpcError> {
+/// Handle resources/read request.
+///
+/// `session` is the transport session id (Mcp-Session-Id / generated stdio
+/// id); it keys the per-session read ledger behind `leindex://session/reads`.
+pub fn handle_resource_read(
+    req: &JsonRpcRequest,
+    session: Option<&str>,
+) -> Result<Value, JsonRpcError> {
     let params = req
         .params
         .as_ref()
@@ -47,7 +53,7 @@ pub fn handle_resource_read(req: &JsonRpcRequest) -> Result<Value, JsonRpcError>
         .and_then(|v| v.as_str())
         .ok_or_else(|| JsonRpcError::invalid_params("Missing or invalid 'uri' field"))?;
 
-    let content = get_resource(uri)?;
+    let content = get_resource_for_session(uri, session)?;
     Ok(serde_json::json!({ "contents": [content] }))
 }
 
@@ -229,12 +235,37 @@ pub fn get_resources() -> Vec<Resource> {
             mime_type: Some("text/markdown".to_string()),
             description: Some("Configuration options for LeIndex server".to_string()),
         },
+        Resource {
+            uri: "leindex://session/reads".to_string(),
+            name: "Session Read Ledger".to_string(),
+            mime_type: Some("text/markdown".to_string()),
+            description: Some(
+                "Files and ranges read or edited this session, with read ordinals; ranges merged, one line per file".to_string(),
+            ),
+        },
     ]
 }
 
 /// Get a specific resource by URI
 pub fn get_resource(uri: &str) -> Result<ResourceContent, JsonRpcError> {
+    get_resource_for_session(uri, None)
+}
+
+/// Get a specific resource by URI, session-aware.
+///
+/// `leindex://session/reads` (§6.9) renders the per-session read ledger; all
+/// other resources are session-independent.
+pub fn get_resource_for_session(
+    uri: &str,
+    session: Option<&str>,
+) -> Result<ResourceContent, JsonRpcError> {
     match uri {
+        "leindex://session/reads" => Ok(ResourceContent {
+            uri: uri.to_string(),
+            mime_type: Some("text/markdown".to_string()),
+            text: Some(crate::cli::mcp::read_paths::session_ledger().render(session)),
+            blob: None,
+        }),
         "leindex://tools/guide" => Ok(ResourceContent {
             uri: uri.to_string(),
             mime_type: Some("text/markdown".to_string()),
@@ -289,7 +320,7 @@ Full arguments: `leindex://tools/guide`.
 | check a commit, file or branch | `leindex_git` action=log / show / blame / branch |
 | stage, commit or push | `leindex_git` action=add / commit / push (preview-only: returns the plan) |
 | check index health | `leindex_analyze` mode=diagnostics |
-| change code safely | `leindex_edit` action=preview, then action=apply |
+| change code safely | `leindex_edit` action=preview (token is the first line), then action=apply with preview_token + project_path ONLY — never resend old_text/new_text |
 | rename across files | `leindex_edit` action=rename old_name=... new_name=... (preview by default) |
 | (re)build the index | `leindex_manage` action=index |
 | inspect or evict resident projects | `leindex_manage` action=state / projects / evict |
@@ -461,5 +492,38 @@ mod tests {
         match &messages[0].content {
             PromptContent::Text { text } => assert!(text.contains("find authentication")),
         }
+    }
+
+    #[test]
+    fn test_session_reads_resource_is_registered_and_listed() {
+        let resources = get_resources();
+        let session = resources
+            .iter()
+            .find(|r| r.uri == "leindex://session/reads")
+            .expect("session/reads must be advertised in resources/list");
+        assert_eq!(session.name, "Session Read Ledger");
+    }
+
+    #[test]
+    fn test_session_reads_resource_lists_reads_and_edits() {
+        // The ledger is process-global; use an isolated session key so this
+        // test cannot collide with other tests or a live session.
+        let ledger = crate::cli::mcp::read_paths::session_ledger();
+        let session = format!("resource-test-{}", std::process::id());
+        let path = std::path::Path::new("/proj/src/lib.rs");
+        ledger.record(&session, path, "hash-x", 100, 120);
+        ledger.record(&session, path, "hash-x", 110, 150);
+
+        let content = get_resource_for_session("leindex://session/reads", Some(&session)).unwrap();
+        assert_eq!(content.uri, "leindex://session/reads");
+        let body = content.text.expect("ledger renders text");
+        assert!(body.contains("/proj/src/lib.rs"), "{body}");
+        assert!(body.contains("L100-150"), "ranges merged: {body}");
+        assert!(!body.contains("L100-120"), "no unmerged ranges: {body}");
+    }
+
+    #[test]
+    fn test_unknown_resource_still_errors() {
+        assert!(get_resource_for_session("leindex://nope", None).is_err());
     }
 }

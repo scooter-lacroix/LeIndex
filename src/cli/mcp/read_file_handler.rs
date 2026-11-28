@@ -1,8 +1,8 @@
 use super::helpers::{
     extract_bool, extract_string, extract_usize, get_direct_callers, node_type_str,
-    validate_file_within_project, wrap_live_with_meta, wrap_with_meta,
 };
 use super::protocol::JsonRpcError;
+use super::read_paths::{self, ConsultVerdict};
 use crate::cli::live_project::LiveProject;
 use crate::cli::registry::{ProjectHandle, ProjectRegistry};
 use crate::graph::pdg::ProgramDependenceGraph;
@@ -83,25 +83,44 @@ fn detect_language(extension: &str) -> &str {
         .map_or(extension, |(_, language)| *language)
 }
 
-async fn resolve_project_root(
-    registry: &Arc<ProjectRegistry>,
-    args: &Value,
-) -> Result<PathBuf, JsonRpcError> {
+/// Project root for handle parsing and PDG enrichment labels.
+///
+/// An unindexed or unresolved project is NOT an error for a read: an
+/// absolute path outside any project is a valid live read (brief §6.1), and
+/// a relative path only needs the root when it is actually relative.
+async fn resolve_project_root(registry: &Arc<ProjectRegistry>, args: &Value) -> Option<PathBuf> {
     if let Some(project_path) = args.get("project_path").and_then(|value| value.as_str()) {
         return LiveProject::resolve(project_path)
-            .map(|project| project.root().to_path_buf())
-            .map_err(|error| JsonRpcError::invalid_params(error.to_string()));
+            .ok()
+            .map(|project| project.root().to_path_buf());
     }
 
-    registry.default_project_path().await
+    registry.default_project_path().await.ok()
 }
 
-async fn read_visible_content(
-    resolved_file_path: &Path,
-    args: &Value,
-    start_line: usize,
-    max_lines: usize,
-) -> Result<(String, usize, usize, String), JsonRpcError> {
+/// Resolve the file argument to a path on disk. Absolute paths read from
+/// disk as-is — the project boundary is irrelevant to a live read (§6.1),
+/// which is what makes logs, /tmp files and other repos readable. Relative
+/// paths join against the project root.
+fn resolve_read_target(
+    file_path: &str,
+    project_root: Option<&Path>,
+) -> Result<PathBuf, JsonRpcError> {
+    let candidate = Path::new(file_path);
+    if candidate.is_absolute() {
+        return Ok(candidate.to_path_buf());
+    }
+    let Some(root) = project_root else {
+        return Err(JsonRpcError::invalid_params(format!(
+            "Relative path '{file_path}' needs a project: pass project_path, or use an absolute file_path"
+        )));
+    };
+    Ok(root.join(file_path))
+}
+
+/// Live bytes of `path`: full content plus the line count. A read never
+/// touches the index — the bytes on disk are the answer (brief §3.10).
+async fn read_file_content(resolved_file_path: &Path) -> Result<(String, usize), JsonRpcError> {
     let content = tokio::fs::read_to_string(resolved_file_path)
         .await
         .map_err(|error| {
@@ -112,36 +131,33 @@ async fn read_visible_content(
             ))
         })?;
     let total_lines = content.lines().count();
-    let end_line_raw = extract_usize(args, "end_line", total_lines)?;
-    let end_line = end_line_raw
-        .min(total_lines)
-        .min(start_line.saturating_add(max_lines).saturating_sub(1));
+    Ok((content, total_lines))
+}
 
+/// Validate the requested window against the file and slice it (1-based,
+/// inclusive bounds).
+fn visible_slice(
+    content: &str,
+    start_line: usize,
+    end_line: usize,
+    total_lines: usize,
+) -> Result<String, JsonRpcError> {
     if total_lines > 0 && start_line > total_lines {
         return Err(JsonRpcError::invalid_params(format!(
-            "start_line {} exceeds total lines {}",
-            start_line, total_lines
+            "start_line {start_line} exceeds total lines {total_lines}"
         )));
     }
     if total_lines > 0 && end_line < start_line {
         return Err(JsonRpcError::invalid_params(format!(
-            "end_line {} precedes start_line {}",
-            end_line_raw, start_line
+            "end_line {end_line} precedes start_line {start_line}"
         )));
     }
-
-    let visible_lines: Vec<String> = if total_lines == 0 {
-        Vec::new()
-    } else {
-        content
-            .lines()
-            .skip(start_line - 1)
-            .take(end_line.min(total_lines) - (start_line - 1))
-            .enumerate()
-            .map(|(index, line)| format!("{}: {}", start_line + index, line))
-            .collect()
-    };
-    Ok((content, total_lines, end_line, visible_lines.join("\n")))
+    Ok(content
+        .lines()
+        .skip(start_line - 1)
+        .take(end_line.saturating_sub(start_line - 1))
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 fn visible_byte_range(
@@ -335,20 +351,26 @@ fn language_for(file_path: &str) -> String {
 /// An explicit symbol-map request must not silently degrade: a handle can lack
 /// a resident PDG (fresh one-shot process, or an auto-index swapped in a new
 /// LeIndex whose graph was dropped at completion). Load it on demand in that
-/// case (audit #7: the flag was a no-op).
+/// case (audit #7: the flag was a no-op) — but WITHOUT holding the project
+/// write lock while doing it. §3.10: a read must never queue behind a
+/// background reindex that holds the write lock; the hydration itself is
+/// still serialized behind that lock, but this call neither waits for it nor
+/// takes the lock at all.
 async fn ensure_symbol_map_pdg(
     handle: Option<ProjectHandle>,
     wanted: bool,
 ) -> Option<ProjectHandle> {
     match handle {
         Some(handle) if wanted => {
-            let mut guard = handle.write().await;
-            if guard.pdg().is_none() {
+            if let Ok(mut guard) = handle.try_write()
+                && guard.pdg().is_none()
+            {
                 // The symbol map lists graph nodes only; the full engine
                 // load here added ~1s to every cold read with a map.
                 let _ = guard.ensure_pdg_loaded_graph_only();
             }
-            drop(guard);
+            // Lock busy (a reindex is running): serve without the map rather
+            // than block — the read itself is exact either way.
             Some(handle)
         }
         other => other,
@@ -356,12 +378,17 @@ async fn ensure_symbol_map_pdg(
 }
 
 /// The resident PDG, cloned for the blocking enrichment task.
+///
+/// §3.10: use `try_read` so a read never queues behind a background reindex
+/// holding the project write lock. A busy lock just means no PDG annotation
+/// for this response; the exact bytes are unaffected.
 async fn pdg_snapshot(handle: Option<&ProjectHandle>) -> Option<ProgramDependenceGraph> {
-    if let Some(handle) = handle {
-        let guard = handle.read().await;
-        guard.pdg().cloned()
-    } else {
-        None
+    match handle {
+        Some(handle) => {
+            let guard = handle.try_read().ok()?;
+            guard.pdg().cloned()
+        }
+        None => None,
     }
 }
 
@@ -407,20 +434,240 @@ async fn pdg_enrichment(
     Ok((symbol_map, context, "fresh"))
 }
 
-/// Attach the freshness badge from the resident handle when there is one, else
-/// the live-only badge for a project with no loaded index.
-async fn wrap_read_result(
-    result: Value,
-    handle: Option<&ProjectHandle>,
-    project_root: &Path,
+/// Attach the read-path freshness badge WITHOUT touching the project lock
+/// (§3.10). Reads the health snapshot file directly, so a background
+/// reindex holding the write lock cannot stall or gate a live read.
+fn wrap_read_result(result: Value, project_root: &Path) -> Value {
+    super::helpers::wrap_read_live_meta(result, project_root)
+}
+
+#[allow(missing_docs)]
+/// The retrieval block every exact, live read reports: no TF-IDF ranking, no
+/// neural scoring, and the PDG used only when it happens to be loaded.
+fn exact_retrieval(pdg_status: &str) -> Value {
+    serde_json::json!({
+        "tfidf_status": "not_used_exact",
+        "pdg_status": pdg_status,
+        "neural_status": "not_used_exact"
+    })
+}
+
+/// The `unchanged since read` answer: the whole requested range was already
+/// served in this session under the same content hash.
+#[allow(clippy::too_many_arguments)]
+fn unchanged_read_result(
+    handle: &read_paths::ReadHandle,
+    language: &str,
+    total_lines: usize,
+    since_ordinal: u64,
+    start_line: usize,
+    end_line: usize,
+    range_handle: String,
+    resolved_file_path: &Path,
+    project_root: Option<&Path>,
 ) -> Value {
-    match handle {
-        Some(handle) => {
-            let guard = handle.read().await;
-            wrap_with_meta(result, &guard)
+    let mut payload =
+        read_paths::unchanged_payload(&handle.file_path, since_ordinal, start_line, end_line);
+    payload["language"] = serde_json::json!(language);
+    payload["total_lines"] = serde_json::json!(total_lines);
+    payload["handle"] = serde_json::json!(range_handle);
+    payload["retrieval"] = exact_retrieval("not_needed_live");
+    let payload = super::read_paths::attach_range_diagnostics(
+        payload,
+        project_root,
+        resolved_file_path,
+        start_line,
+        end_line,
+    );
+    wrap_read_result(payload, project_root.unwrap_or(resolved_file_path))
+}
+
+/// The `partial overlap` answer: serve only the unseen lines, reference the
+/// rest, and record each served range so the next read is answered precisely.
+#[allow(clippy::too_many_arguments)]
+fn partial_overlap_result(
+    handle: &read_paths::ReadHandle,
+    language: &str,
+    total_lines: usize,
+    since_ordinal: u64,
+    start_line: usize,
+    end_line: usize,
+    unseen: &[(usize, usize)],
+    content: &str,
+    content_hash: &str,
+    range_handle: String,
+    resolved_file_path: &Path,
+    project_root: Option<&Path>,
+    session: &str,
+    ledger: &read_paths::SessionLedger,
+) -> Value {
+    let mut body = String::new();
+    let mut served_ranges: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in unseen {
+        let end = (*e).min(total_lines.max(1));
+        if let Ok(slice) = visible_slice(content, *s, end, total_lines) {
+            let numbered = read_paths::number_lines(&slice, *s);
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&numbered);
+            served_ranges.push((*s, end));
         }
-        None => wrap_live_with_meta(result, project_root),
     }
+    let mut result = serde_json::json!({
+        "file_path": handle.file_path,
+        "language": language,
+        "total_lines": total_lines,
+        "start_line": start_line,
+        "end_line": end_line,
+        "unchanged_since_read": since_ordinal,
+        "unchanged_ranges": format!("{start_line}-{end_line} minus served ranges below"),
+        "handle": range_handle,
+        "content": body,
+    });
+    for (s, e) in &served_ranges {
+        ledger.record(session, resolved_file_path, content_hash, *s, *e);
+    }
+    result["retrieval"] = exact_retrieval("not_needed_live");
+    let result = super::read_paths::attach_range_diagnostics(
+        result,
+        project_root,
+        resolved_file_path,
+        start_line,
+        end_line,
+    );
+    wrap_read_result(result, project_root.unwrap_or(resolved_file_path))
+}
+
+/// The inclusive 1-based window a read serves, plus the symbol anchor it
+/// resolved (reported back when one was used).
+///
+/// Precedence: explicit `start_line`/`end_line` args, then the `#L600-800`
+/// handle fragment, then a symbol anchor, then the whole file. No anchor and
+/// no explicit range means the WHOLE file — defaulting the end to 1 collapsed
+/// every plain read to its first line. The result is clamped to the file and
+/// to `max_lines`.
+async fn resolve_window(
+    args: &Value,
+    handle: &read_paths::ReadHandle,
+    focus_symbol: Option<&str>,
+    content: &str,
+    resolved_file_path: &Path,
+    total_lines: usize,
+    max_lines: usize,
+) -> Result<((usize, usize), Option<(usize, usize)>), JsonRpcError> {
+    let explicit_start = extract_usize(args, "start_line", 0)?;
+    let explicit_end = extract_usize(args, "end_line", 0)?;
+    let symbol_target = handle
+        .symbol
+        .clone()
+        .or_else(|| focus_symbol.map(str::to_string));
+
+    let mut anchor: Option<(usize, usize)> = None;
+    if let Some(target) = &symbol_target {
+        let live =
+            super::read_symbol_handler::parse_live_file(resolved_file_path.to_path_buf()).await?;
+        let spans = read_paths::spans_with_lines(content, &live.symbols);
+        let span = read_paths::find_span(&spans, target).ok_or_else(|| {
+            JsonRpcError::invalid_params(format!(
+                "Symbol '{target}' not found in {}",
+                resolved_file_path.display()
+            ))
+        })?;
+        anchor = Some((span.start_line, span.end_line));
+    }
+    let (anchor_start, anchor_end) = anchor.unwrap_or((1, total_lines.max(1)));
+    let start_line = if explicit_start > 0 {
+        explicit_start.max(1)
+    } else {
+        handle
+            .line_range
+            .map(|(start, _)| start)
+            .unwrap_or(anchor_start)
+    };
+    let end_line = if explicit_end > 0 {
+        explicit_end
+    } else {
+        handle.line_range.map(|(_, end)| end).unwrap_or(anchor_end)
+    }
+    .min(total_lines.max(1))
+    .min(start_line.saturating_add(max_lines).saturating_sub(1));
+    Ok(((start_line, end_line), anchor))
+}
+
+/// The elided view (§4.1): focus symbol in full, siblings collapsed.
+///
+/// Always served when a focus symbol was asked for — a view is not the same
+/// answer as the bytes. Records only the focus lines the body actually
+/// carried: when `max_lines` cut the body before or inside the focus item,
+/// the omitted lines were never sent, and recording the full range made a
+/// later read of them answer `unchanged since read`.
+#[allow(clippy::too_many_arguments)]
+async fn elided_view_result(
+    content: &str,
+    resolved_file_path: &Path,
+    focus: &str,
+    file_path: &str,
+    language: &str,
+    total_lines: usize,
+    range_handle: String,
+    max_lines: usize,
+    project_root: Option<&Path>,
+    session: &str,
+    content_hash: &str,
+    ledger: &read_paths::SessionLedger,
+) -> Result<Value, JsonRpcError> {
+    let live =
+        super::read_symbol_handler::parse_live_file(resolved_file_path.to_path_buf()).await?;
+    let file_label = project_root
+        .and_then(|root| resolved_file_path.strip_prefix(root).ok())
+        .map(|rel| rel.to_string_lossy().into_owned())
+        .unwrap_or_else(|| resolved_file_path.to_string_lossy().into_owned());
+    let elided = read_paths::elide_around(content, &live.symbols, focus, &file_label, max_lines)
+        .map_err(JsonRpcError::invalid_params)?;
+
+    let mut result = serde_json::json!({
+        "file_path": file_path,
+        "language": language,
+        "total_lines": total_lines,
+        "elided": true,
+        "focus_symbol": focus,
+        "focus_line_start": elided.focus_start_line,
+        "focus_line_end": elided.focus_end_line,
+        "expand": elided.expand,
+        "handle": range_handle,
+        "content": elided.body,
+        "collapsed": elided.collapsed.iter().map(|item| serde_json::json!({
+            "name": item.name,
+            "signature": item.signature,
+            "line": item.start_line,
+            "lines": item.line_count,
+            // Same escaping as the body's `[expand: …]` marker and as
+            // `ElidedOutput.expand`: a raw label would emit `a#b.rs#sym`,
+            // which `parse_read_handle` splits at the FIRST `#` into file
+            // `a` + symbol `b.rs#sym`.
+            "expand": format!("{}#{}", read_paths::escape_handle_path(&file_label), item.name),
+        })).collect::<Vec<_>>(),
+        "retrieval": exact_retrieval("not_needed_live"),
+    });
+    result = super::read_paths::attach_range_diagnostics(
+        result,
+        project_root,
+        resolved_file_path,
+        elided.focus_start_line,
+        elided.focus_end_line,
+    );
+    result = wrap_read_result(result, project_root.unwrap_or(resolved_file_path));
+    if elided.served_end_line > 0 {
+        ledger.record(
+            session,
+            resolved_file_path,
+            content_hash,
+            elided.served_start_line,
+            elided.served_end_line,
+        );
+    }
+    Ok(result)
 }
 
 #[allow(missing_docs)]
@@ -434,9 +681,10 @@ impl ReadFileHandler {
     }
 
     pub fn description(&self) -> &str {
-        "PRIMARY file reader — returns exact file contents with line numbers PLUS context \
-showing symbols, imports, and dependents. One call replaces Read + Grep for imports. \
-Works for any text file including configs and docs."
+        "PRIMARY file reader — live exact bytes with single line numbers, stable handles \
+(path#symbol, path#L600-800), optional elided views (focus_symbol) and session dedup \
+(re-reads of unchanged content answer `unchanged since read #N`; fresh:true bypasses). \
+Works for any absolute path, including outside the project — no index required."
     }
 
     pub fn argument_schema(&self) -> Value {
@@ -445,7 +693,7 @@ Works for any text file including configs and docs."
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "Absolute path to file to read"
+                    "description": "File to read: absolute path (anywhere on disk), project-relative path, or handle (path#symbol, path#L600-800)"
                 },
                 "start_line": {
                     "type": "integer",
@@ -465,6 +713,15 @@ Works for any text file including configs and docs."
                     "minimum": 1,
                     "maximum": 2000
                 },
+                "focus_symbol": {
+                    "type": "string",
+                    "description": "Elided read: this symbol in full, sibling top-level items collapsed to one-line signatures with [expand: path#item] handles"
+                },
+                "fresh": {
+                    "type": "boolean",
+                    "description": "Bypass session dedup and serve the bytes even if unchanged since a previous read",
+                    "default": false
+                },
                 "include_symbol_map": {
                     "type": "boolean",
                     "description": "Include PDG symbol annotations (default: false). \
@@ -473,7 +730,7 @@ Works for any text file including configs and docs."
                 },
                 "project_path": {
                     "type": "string",
-                    "description": "Project directory (omit to use current project). Indexing is NOT automatic: an unindexed project answers with a 'project not indexed' error until you run the index action."
+                    "description": "Project directory for relative paths and PDG annotations. Reads never require an index."
                 }
             },
             "required": ["file_path"]
@@ -485,27 +742,135 @@ Works for any text file including configs and docs."
         registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
-        let file_path = extract_string(&args, "file_path")?;
-        let start_line = extract_usize(&args, "start_line", 1)?.max(1);
+        let file_arg = extract_string(&args, "file_path")?;
         let max_lines = extract_usize(&args, "max_lines", 500)?.min(2000);
         let include_symbol_map = extract_bool(&args, "include_symbol_map", false);
+        let fresh = extract_bool(&args, "fresh", false);
+        let focus_symbol = args
+            .get("focus_symbol")
+            .and_then(Value::as_str)
+            .map(str::to_string);
 
-        // Resolve and validate against the live project without creating or
-        // hydrating a registry entry. Resident PDG data is enrichment only;
-        // an exact file read must remain useful before any index exists.
-        let project_root = resolve_project_root(registry, &args).await?;
-        let resolved_file_path = validate_file_within_project(&file_path, &project_root)?;
-        let maybe_handle = registry.try_get_loaded(&project_root).await;
+        // An unindexed or unresolved project is fine: absolute paths read
+        // live regardless (§6.1); only relative paths need the root.
+        let project_root = resolve_project_root(registry, &args).await;
 
-        let (content, total_lines, end_line, content_str) =
-            read_visible_content(&resolved_file_path, &args, start_line, max_lines).await?;
+        // Handle form: `path`, `path#symbol`, `path#L600-800` (§4.1).
+        let handle = read_paths::parse_read_handle(&file_arg, project_root.as_deref());
+        let resolved_file_path = resolve_read_target(&handle.file_path, project_root.as_deref())?;
 
-        let language = language_for(&file_path);
+        // THE read: live bytes, no index, no project lock (§3.10).
+        let (content, total_lines) = read_file_content(&resolved_file_path).await?;
+        let language = language_for(&handle.file_path);
 
-        let maybe_handle = ensure_symbol_map_pdg(maybe_handle, include_symbol_map).await;
+        // Window resolution. Precedence: explicit start/end args, then the
+        // #L600-800 fragment, then a symbol anchor, then the whole file.
+        let ((start_line, end_line), anchor) = resolve_window(
+            &args,
+            &handle,
+            focus_symbol.as_deref(),
+            &content,
+            &resolved_file_path,
+            total_lines,
+            max_lines,
+        )
+        .await?;
+
+        let session = args
+            .get("_session")
+            .and_then(Value::as_str)
+            .unwrap_or("__process__");
+        let ledger = read_paths::session_ledger();
+        let content_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
+        let range_handle = read_paths::handle_for_range(
+            &resolved_file_path,
+            project_root.as_deref(),
+            start_line,
+            end_line,
+        );
+
+        // Elided view (§4.1): focus symbol in full, siblings collapsed.
+        if let Some(focus) = &focus_symbol {
+            return elided_view_result(
+                &content,
+                &resolved_file_path,
+                focus,
+                &handle.file_path,
+                &language,
+                total_lines,
+                range_handle,
+                max_lines,
+                project_root.as_deref(),
+                session,
+                &content_hash,
+                ledger,
+            )
+            .await;
+        }
+
+        // Session dedup (§4.1): an unchanged re-read costs bytes, not tokens.
+        if !fresh {
+            match ledger.consult(
+                session,
+                &resolved_file_path,
+                &content_hash,
+                start_line,
+                end_line,
+            ) {
+                ConsultVerdict::Unchanged {
+                    since_ordinal,
+                    start_line,
+                    end_line,
+                } => {
+                    return Ok(unchanged_read_result(
+                        &handle,
+                        &language,
+                        total_lines,
+                        since_ordinal,
+                        start_line,
+                        end_line,
+                        range_handle,
+                        &resolved_file_path,
+                        project_root.as_deref(),
+                    ));
+                }
+                ConsultVerdict::PartialOverlap {
+                    unseen,
+                    since_ordinal,
+                } => {
+                    return Ok(partial_overlap_result(
+                        &handle,
+                        &language,
+                        total_lines,
+                        since_ordinal,
+                        start_line,
+                        end_line,
+                        &unseen,
+                        &content,
+                        &content_hash,
+                        range_handle,
+                        &resolved_file_path,
+                        project_root.as_deref(),
+                        session,
+                        ledger,
+                    ));
+                }
+                ConsultVerdict::New => {}
+            }
+        }
+
+        let content_str = visible_slice(&content, start_line, end_line, total_lines)?;
+
+        let maybe_handle = ensure_symbol_map_pdg(
+            registry
+                .try_get_loaded(project_root.as_deref().unwrap_or(Path::new("")))
+                .await,
+            include_symbol_map,
+        )
+        .await;
         let (symbol_map, context, pdg_status) = pdg_enrichment(
             maybe_handle.as_ref(),
-            &file_path,
+            &handle.file_path,
             &resolved_file_path,
             &content,
             start_line,
@@ -516,13 +881,26 @@ Works for any text file including configs and docs."
         .await?;
 
         let mut result = serde_json::json!({
-            "file_path": file_path,
+            "file_path": handle.file_path,
             "language": language,
             "total_lines": total_lines,
             "start_line": start_line,
-            "end_line": end_line.min(total_lines),
-            "content": content_str,
+            "end_line": end_line,
+            "handle": range_handle,
+            "content": read_paths::number_lines(&content_str, start_line),
         });
+
+        // Symbol-anchored reads report what they resolved to.
+        if let Some((s, e)) = anchor {
+            let symbol_target = handle
+                .symbol
+                .clone()
+                .or_else(|| focus_symbol.clone())
+                .unwrap_or_default();
+            result["anchor_symbol"] = serde_json::json!(symbol_target);
+            result["anchor_line_start"] = serde_json::json!(s);
+            result["anchor_line_end"] = serde_json::json!(e);
+        }
 
         // Always attach compact context when available
         if let Some(ctx) = context {
@@ -540,9 +918,520 @@ Works for any text file including configs and docs."
             result["symbol_map"] = serde_json::json!(symbol_map);
         }
 
-        // Add staleness warning only if we have an indexed project
-        result = wrap_read_result(result, maybe_handle.as_ref(), &project_root).await;
+        result = super::read_paths::attach_range_diagnostics(
+            result,
+            project_root.as_deref(),
+            &resolved_file_path,
+            start_line,
+            end_line,
+        );
+        result = wrap_read_result(
+            result,
+            project_root.as_deref().unwrap_or(&resolved_file_path),
+        );
+
+        ledger.record(
+            session,
+            &resolved_file_path,
+            &content_hash,
+            start_line,
+            end_line,
+        );
 
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::mcp::helpers::test_registry_for;
+    use tempfile::tempdir;
+
+    /// Isolated session key: tests must never share ledger state with each
+    /// other or with the process-default session.
+    fn test_session(name: &str) -> String {
+        format!("test-{name}-{}", std::process::id())
+    }
+
+    const SAMPLE: &str = "/// Doc.\n#[derive(Debug)]\npub fn alpha() -> u32 {\n    1\n}\n\n/// Beta doc.\npub fn beta(x: u32) -> u32 {\n    x + 1\n}\n\npub struct Gamma {\n    pub field: u32,\n}\n";
+
+    fn write_sample(dir: &std::path::Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, SAMPLE).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn test_read_file_numbers_lines_exactly_once() {
+        // §3.1 regression: the numbered body is `N code`, never `N: code` and
+        // never a second gutter.
+        let dir = tempdir().unwrap();
+        let path = write_sample(dir.path(), "sample.rs");
+        let registry = test_registry_for(dir.path());
+        let result = ReadFileHandler
+            .execute(
+                &registry,
+                serde_json::json!({
+                    "file_path": path.to_string_lossy(),
+                    "project_path": dir.path().to_string_lossy(),
+                    "_session": test_session("dedup-basic"),
+                }),
+            )
+            .await
+            .unwrap();
+        let content = result["content"].as_str().unwrap();
+        assert!(content.starts_with("1 /// Doc.\n"), "{content}");
+        assert!(content.contains("2 #[derive(Debug)]"), "{content}");
+        assert!(content.contains("8 pub fn beta"), "{content}");
+        assert!(!content.contains("│"), "no gutter bar: {content}");
+        assert!(!content.contains("1:"), "no colon number: {content}");
+    }
+
+    #[tokio::test]
+    async fn test_second_identical_read_returns_unchanged_marker() {
+        let dir = tempdir().unwrap();
+        let path = write_sample(dir.path(), "sample.rs");
+        let registry = test_registry_for(dir.path());
+        let session = test_session("unchanged");
+        let args = serde_json::json!({
+            "file_path": path.to_string_lossy(),
+            "project_path": dir.path().to_string_lossy(),
+            "_session": session,
+        });
+        let first = ReadFileHandler
+            .execute(&registry, args.clone())
+            .await
+            .unwrap();
+        assert!(first.get("status").is_none(), "first read serves bytes");
+        let second = ReadFileHandler.execute(&registry, args).await.unwrap();
+        assert_eq!(second["status"], "unchanged", "{}", second);
+        assert!(
+            second["note"]
+                .as_str()
+                .unwrap()
+                .contains("unchanged since read #1 (lines 1-"),
+            "{}",
+            second["note"].as_str().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fresh_opt_out_bypasses_dedup() {
+        let dir = tempdir().unwrap();
+        let path = write_sample(dir.path(), "sample.rs");
+        let registry = test_registry_for(dir.path());
+        let session = test_session("fresh");
+        let base = serde_json::json!({
+            "file_path": path.to_string_lossy(),
+            "project_path": dir.path().to_string_lossy(),
+            "_session": session,
+        });
+        ReadFileHandler
+            .execute(&registry, base.clone())
+            .await
+            .unwrap();
+        let mut fresh_args = base.clone();
+        fresh_args["fresh"] = serde_json::json!(true);
+        let again = ReadFileHandler
+            .execute(&registry, fresh_args)
+            .await
+            .unwrap();
+        assert!(
+            again.get("status").is_none() && again["content"].as_str().is_some(),
+            "fresh:true serves bytes: {}",
+            again
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_invalidates_dedup_and_next_read_serves_bytes() {
+        let dir = tempdir().unwrap();
+        let path = write_sample(dir.path(), "sample.rs");
+        let registry = test_registry_for(dir.path());
+        let session = test_session("edit");
+        let args = serde_json::json!({
+            "file_path": path.to_string_lossy(),
+            "project_path": dir.path().to_string_lossy(),
+            "_session": session,
+        });
+        ReadFileHandler
+            .execute(&registry, args.clone())
+            .await
+            .unwrap();
+        // External modification of the file changes the content hash — the
+        // ledger must serve the new bytes, never a stale `unchanged`.
+        std::fs::write(&path, SAMPLE.replace("x + 1", "x + 2")).unwrap();
+        let after = ReadFileHandler.execute(&registry, args).await.unwrap();
+        assert!(
+            after.get("status").is_none() && after["content"].as_str().is_some(),
+            "changed file must be re-served: {}",
+            after
+        );
+        assert!(after["content"].as_str().unwrap().contains("x + 2"));
+    }
+
+    #[tokio::test]
+    async fn test_read_outside_project_reads_live_without_index() {
+        // §6.1: logs, /tmp and other repos are readable — no index, no root.
+        let outside =
+            std::env::temp_dir().join(format!("leindex-lane-e-{}-sample.txt", std::process::id()));
+        std::fs::write(&outside, "alpha\nbeta\ngamma\n").unwrap();
+        let dir = tempdir().unwrap();
+        let registry = test_registry_for(dir.path());
+        let result = ReadFileHandler
+            .execute(
+                &registry,
+                serde_json::json!({
+                    "file_path": outside.to_string_lossy(),
+                    "project_path": dir.path().to_string_lossy(),
+                    "_session": test_session("outside"),
+                }),
+            )
+            .await
+            .unwrap();
+        let content = result["content"].as_str().unwrap();
+        assert!(content.contains("2 beta"), "{content}");
+        std::fs::remove_file(&outside).ok();
+    }
+
+    #[tokio::test]
+    async fn test_handle_expands_line_range_and_symbol() {
+        let dir = tempdir().unwrap();
+        let path = write_sample(dir.path(), "sample.rs");
+        let registry = test_registry_for(dir.path());
+        let range = ReadFileHandler
+            .execute(
+                &registry,
+                serde_json::json!({
+                    "file_path": format!("{}#L1-2", path.to_string_lossy()),
+                    "project_path": dir.path().to_string_lossy(),
+                    "_session": test_session("handle-range"),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(range["start_line"], 1);
+        assert_eq!(range["end_line"], 2);
+        assert_eq!(
+            range["content"].as_str().unwrap().lines().count(),
+            2,
+            "{}",
+            range
+        );
+
+        let symbol = ReadFileHandler
+            .execute(
+                &registry,
+                serde_json::json!({
+                    "file_path": format!("{}#alpha", path.to_string_lossy()),
+                    "project_path": dir.path().to_string_lossy(),
+                    "_session": test_session("handle-symbol"),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(symbol["anchor_symbol"], "alpha");
+        // Item spans start at the item keyword; the doc comment hangs above.
+        assert_eq!(symbol["anchor_line_start"], 3);
+        assert_eq!(symbol["anchor_line_end"], 5);
+    }
+
+    /// An elided focus read whose body was cut by `max_lines` must record
+    /// only the focus lines it actually sent. Recording the full range made
+    /// a later plain read of the omitted focus lines answer
+    /// `unchanged since read` although the session never received them.
+    #[tokio::test]
+    async fn test_truncated_elided_read_does_not_mark_omitted_focus_lines_as_served() {
+        let dir = tempdir().unwrap();
+        let path = write_sample(dir.path(), "sample.rs");
+        let registry = test_registry_for(dir.path());
+        let session = test_session("elide-truncated");
+        // alpha collapses to 1 line, then beta's doc + 2 body lines. A cap of
+        // 2 lines serves the doc line only; beta's body lines are cut.
+        let elided = ReadFileHandler
+            .execute(
+                &registry,
+                serde_json::json!({
+                    "file_path": path.to_string_lossy(),
+                    "project_path": dir.path().to_string_lossy(),
+                    "_session": session,
+                    "focus_symbol": "beta",
+                    "max_lines": 2,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(elided["elided"], true);
+        let content = elided["content"].as_str().unwrap();
+        assert!(
+            content.contains("more lines (elided view truncated"),
+            "{content}"
+        );
+        assert!(
+            !content.contains("x + 1"),
+            "beta body must be cut: {content}"
+        );
+
+        // A plain read of beta's body in the same session must return the
+        // lines, not `unchanged since read`.
+        let plain = ReadFileHandler
+            .execute(
+                &registry,
+                serde_json::json!({
+                    "file_path": path.to_string_lossy(),
+                    "project_path": dir.path().to_string_lossy(),
+                    "_session": session,
+                    "start_line": 9,
+                    "end_line": 9,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            plain["unchanged"], true,
+            "omitted focus lines must not read as already served: {plain}"
+        );
+        assert!(
+            plain["content"].as_str().unwrap().contains("x + 1"),
+            "{plain}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_elided_read_collapses_siblings_and_reports_handles() {
+        let dir = tempdir().unwrap();
+        let path = write_sample(dir.path(), "sample.rs");
+        let registry = test_registry_for(dir.path());
+        let result = ReadFileHandler
+            .execute(
+                &registry,
+                serde_json::json!({
+                    "file_path": path.to_string_lossy(),
+                    "project_path": dir.path().to_string_lossy(),
+                    "_session": test_session("elide"),
+                    "focus_symbol": "beta",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["elided"], true);
+        let content = result["content"].as_str().unwrap();
+        // The focus item is verbatim; siblings are one-line collapses with
+        // their own expand handles.
+        assert!(
+            content.contains("pub fn beta(x: u32) -> u32 {"),
+            "{content}"
+        );
+        assert!(
+            content.contains("[expand: sample.rs#alpha]"),
+            "sibling collapsed: {content}"
+        );
+        assert!(
+            content.contains("[expand: sample.rs#Gamma]"),
+            "struct collapsed: {content}"
+        );
+        assert!(!content.contains("pub field: u32"), "{content}");
+        assert_eq!(result["expand"], "sample.rs#beta");
+        let collapsed = result["collapsed"].as_array().unwrap();
+        assert_eq!(collapsed.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_read_never_reports_initializing_for_an_unindexed_project() {
+        // §3.10: a live filesystem read is exact bytes; it must never claim
+        // another file's reindex state — not `initializing`, on any path.
+        let dir = tempdir().unwrap();
+        let path = write_sample(dir.path(), "sample.rs");
+        let registry = test_registry_for(dir.path());
+        let result = ReadFileHandler
+            .execute(
+                &registry,
+                serde_json::json!({
+                    "file_path": path.to_string_lossy(),
+                    "project_path": dir.path().to_string_lossy(),
+                    "_session": test_session("freshness"),
+                }),
+            )
+            .await
+            .unwrap();
+        let serialized = result.to_string();
+        assert!(
+            !serialized.contains("initializing"),
+            "read must not report reindex state: {serialized}"
+        );
+        assert_eq!(result["_meta"]["read_source"], "live_bytes");
+        // An unindexed project has no health snapshot, so the index state is
+        // UNKNOWN. The read must not attach a `fresh` badge the index has not
+        // earned: no freshness status at all, rather than a guessed one.
+        assert!(
+            result["_meta"]["freshness"].get("status").is_none(),
+            "unknown index state must not read as fresh: {serialized}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_freshness_badge_reflects_a_known_index_state() {
+        use crate::cli::leindex::ComponentStatus;
+        use crate::cli::leindex::IndexHealth;
+        let dir = tempdir().unwrap();
+        let path = write_sample(dir.path(), "sample.rs");
+        let registry = test_registry_for(dir.path());
+        let storage = dir.path().join(".leindex");
+        std::fs::create_dir_all(&storage).unwrap();
+        for (status, expected) in [
+            (ComponentStatus::Fresh, "fresh"),
+            (ComponentStatus::Stale, "stale"),
+            (ComponentStatus::Partial, "stale"),
+            (ComponentStatus::Failed, "stale"),
+            (ComponentStatus::Unavailable, "_absent_"),
+            (ComponentStatus::NotLoaded, "_absent_"),
+        ] {
+            crate::cli::index_freshness::save_health(
+                &storage,
+                &IndexHealth {
+                    status,
+                    generation: 7,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let result = ReadFileHandler
+                .execute(
+                    &registry,
+                    serde_json::json!({
+                        "file_path": path.to_string_lossy(),
+                        "project_path": dir.path().to_string_lossy(),
+                        "_session": test_session("freshness-known"),
+                    }),
+                )
+                .await
+                .unwrap();
+            if expected == "_absent_" {
+                assert!(
+                    result["_meta"]["freshness"].get("status").is_none(),
+                    "{status:?} must not be labelled fresh or stale: {result}"
+                );
+            } else {
+                assert_eq!(
+                    result["_meta"]["freshness"]["status"], expected,
+                    "{status:?}"
+                );
+                assert_eq!(result["_meta"]["freshness"]["generation"], 7, "{status:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_partial_overlap_serves_only_unseen_lines() {
+        let dir = tempdir().unwrap();
+        let path = write_sample(dir.path(), "sample.rs");
+        let registry = test_registry_for(dir.path());
+        let session = test_session("overlap");
+        ReadFileHandler
+            .execute(
+                &registry,
+                serde_json::json!({
+                    "file_path": path.to_string_lossy(),
+                    "project_path": dir.path().to_string_lossy(),
+                    "_session": session,
+                    "start_line": 1,
+                    "end_line": 4,
+                }),
+            )
+            .await
+            .unwrap();
+        let wider = ReadFileHandler
+            .execute(
+                &registry,
+                serde_json::json!({
+                    "file_path": path.to_string_lossy(),
+                    "project_path": dir.path().to_string_lossy(),
+                    "_session": session,
+                    "start_line": 1,
+                    "end_line": 8,
+                }),
+            )
+            .await
+            .unwrap();
+        // Overlapping read: the new lines (5-8) are served, the overlap is
+        // referenced instead of repeated.
+        assert!(wider.get("unchanged_since_read").is_some(), "{}", wider);
+        let content = wider["content"].as_str().unwrap();
+        assert!(content.contains("8 pub fn beta"), "{content}");
+        assert!(
+            !content.contains("2 #[derive"),
+            "overlap re-served: {content}"
+        );
+    }
+
+    /// §6.6 overlay (cross-lane contract E→F): a read attaches the last-run
+    /// check's diagnostics for the requested range, filtered by file and
+    /// line, and emits nothing when none match.
+    #[tokio::test]
+    async fn test_read_overlay_attaches_range_diagnostics_from_last_check() {
+        let dir = tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let path = write_sample(&root, "sample.rs");
+        let session = test_session("overlay");
+        let storage = crate::cli::run::diagnostics::storage_for(&root);
+        crate::cli::run::diagnostics::record(
+            &storage,
+            &[
+                crate::cli::run::diagnostics::Diagnostic {
+                    file: path.clone(),
+                    line: 1,
+                    severity: crate::cli::run::diagnostics::Severity::Error,
+                    code: Some("E0001".to_string()),
+                    message: "first line error".to_string(),
+                },
+                crate::cli::run::diagnostics::Diagnostic {
+                    file: path.clone(),
+                    line: 20,
+                    severity: crate::cli::run::diagnostics::Severity::Warning,
+                    code: None,
+                    message: "out of requested range".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+
+        let registry = test_registry_for(&root);
+        let result = ReadFileHandler
+            .execute(
+                &registry,
+                serde_json::json!({
+                    "file_path": path.to_string_lossy(),
+                    "project_path": root.to_string_lossy(),
+                    "_session": session,
+                    "start_line": 1,
+                    "end_line": 4,
+                }),
+            )
+            .await
+            .unwrap();
+        let diagnostics = result["diagnostics"]
+            .as_array()
+            .expect("overlay must attach diagnostics for the requested range");
+        assert_eq!(diagnostics.len(), 1, "{result}");
+        assert_eq!(diagnostics[0]["line"], 1);
+        assert_eq!(diagnostics[0]["code"], "E0001");
+        assert_eq!(diagnostics[0]["severity"], "error");
+
+        // A range with no stored hits attaches nothing — sparse, zero bytes.
+        let wide = ReadFileHandler
+            .execute(
+                &registry,
+                serde_json::json!({
+                    "file_path": path.to_string_lossy(),
+                    "project_path": root.to_string_lossy(),
+                    "_session": test_session("overlay-wide"),
+                    "start_line": 10,
+                    "end_line": 14,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(wide.get("diagnostics").is_none(), "{wide}");
     }
 }

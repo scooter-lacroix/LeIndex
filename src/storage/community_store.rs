@@ -133,7 +133,10 @@ pub fn save_communities_by_node_id(
     )?;
     tx.execute(
         "UPDATE cache_telemetry SET community_recompute_ms = ?1 WHERE id = 1",
-        params![recompute_ms],
+        // `rusqlite` 0.41 dropped `ToSql for u64` (SQLite integers are signed
+        // 64-bit, so the old impl was lossy for values above i64::MAX). The
+        // column stores a millisecond duration, so the widening cast is exact.
+        params![recompute_ms as i64],
     )?;
     tx.commit()
 }
@@ -162,7 +165,9 @@ fn insert_labels(
             algorithm,
             quality_name,
             resolution,
-            node_count,
+            // `rusqlite` 0.41 dropped `ToSql for usize`; the count is a
+            // membership length, so widening to the SQLite integer is exact.
+            *node_count as i64,
             quality_score,
             label,
             computed_at,

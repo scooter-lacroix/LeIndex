@@ -139,6 +139,14 @@ pub(crate) fn trim_search(data: &Value) -> Value {
     if let Some(v) = data.get("has_more") {
         out.insert("has_more".to_string(), v.clone());
     }
+    // §6.8: the continuation token rides with the paging metadata so the
+    // model's follow-up call can pass `next` alone.
+    if let Some(v) = data.get("next_offset") {
+        out.insert("next_offset".to_string(), v.clone());
+    }
+    if let Some(v) = data.get("next") {
+        out.insert("next".to_string(), v.clone());
+    }
     if let Some(v) = data.get("suggestion") {
         out.insert("suggestion".to_string(), v.clone());
     }
@@ -173,6 +181,9 @@ pub(crate) fn trim_structural(data: &Value) -> Value {
         // an allowlist that dropped it made the note the only evidence.
         "stopped_by_deadline",
         "stats",
+        // §6.8: the continuation token rides with the paging metadata.
+        "next_offset",
+        "next",
         "note",
     ] {
         if let Some(v) = data.get(key) {
@@ -372,14 +383,22 @@ fn trim_symbol_lookup(data: &Value) -> Value {
 /// Per-symbol trimmer used by both the single-symbol and
 /// batch-result paths of `trim_symbol_lookup`.
 ///
-/// `leindex.symbol-lookup` returns the result built by
-/// `SymbolLookupHandler::lookup_single_symbol` with fields:
-///   symbol, type, file, byte_range, complexity, language,
-///   callers, callees, impact_radius, and optionally source
-/// (when `include_source` is set). The trim must use the same
-/// field names so the LLM-visible payload actually carries the
-/// file path, node type, source excerpt, and impact radius —
-/// not aliases that resolve to `null` from the raw handler.
+/// `leindex.symbol-lookup` returns one of THREE bodies, and all of them must
+/// survive the L1 trim or the default tier answers with metadata only:
+///
+/// * the relations body (`SymbolLookupHandler::lookup_single_symbol`):
+///   symbol, type, file, byte_range, complexity, language, callers, callees,
+///   impact_radius, optionally source;
+/// * the `construct` / `match` usage body (`usage_sites_body`): symbol, file,
+///   `kind`, `sites`, `sites_total`, `sites_truncated`, `languages_covered`,
+///   `files_scanned`, `language_coverage`;
+/// * the `tests` body (`tests_body`): symbol, file, `kind`, `tests`,
+///   `tests_total`, `tests_truncated`.
+///
+/// The alternate keys were previously outside this allowlist, so
+/// `kind:"construct"`, `kind:"match"` and `kind:"tests"` came back as
+/// symbol/file/source with no sites and no test commands — the answer was
+/// trimmed away entirely.
 fn trim_symbol_lookup_single(data: &Value) -> Value {
     let mut out = serde_json::Map::new();
     for k in [
@@ -391,11 +410,31 @@ fn trim_symbol_lookup_single(data: &Value) -> Value {
         "language",
         "callers",
         "callees",
+        // Caller continuation metadata: without these the L1 response showed a
+        // budget-page of callers with no total and no offset, so the client had
+        // neither an overflow warning nor the means to fetch the rest —
+        // `caller_offset` was unreachable from the answer that documented it.
+        "callers_total",
+        "callers_next_offset",
+        "callers_truncated",
+        "callees_truncated",
         "impact_radius",
         "impact_note",
         "index_freshness",
         "pdg_status",
         "source",
+        // Alternate usage-site / tests bodies (§6.3 / §6.4).
+        "kind",
+        "sites",
+        "sites_total",
+        "sites_truncated",
+        "languages_covered",
+        "files_scanned",
+        "language_coverage",
+        "tests",
+        "tests_total",
+        "tests_truncated",
+        "retrieval",
     ] {
         if let Some(v) = data.get(k) {
             out.insert(k.to_string(), v.clone());
@@ -516,6 +555,12 @@ fn trim_read_file(data: &Value) -> Value {
     // (start_line / end_line), so we keep it. Drop `symbol_map` unless
     // the handler populated it; the per-entry callers/callees arrays
     // can also be capped.
+    //
+    // §3.1/§4.1 (lane E): `content` now carries exactly one unpadded line
+    // number per line (`600 code`), a `handle` gives the stable
+    // `path#L…` read handle, and a session-dedup verdict may replace the
+    // bytes entirely (`status: unchanged` + `note`). Elided reads carry
+    // `collapsed` (sibling signatures with their own expand handles).
     let mut out = serde_json::Map::new();
     out.insert(
         "file_path".to_string(),
@@ -541,6 +586,36 @@ fn trim_read_file(data: &Value) -> Value {
         "content".to_string(),
         data.get("content").cloned().unwrap_or(Value::Null),
     );
+    // §4.1 (lane E): stable read handle, session-dedup verdict fields, and
+    // the elided-view projection. Only present when the handler set them.
+    //
+    // `diagnostics` rides here too: the read overlay attaches the scoped
+    // check's findings to the payload, and the L1 transport trims BEFORE
+    // rendering, so a field dropped here never reaches
+    // `render_read_diagnostics` (Codex round 7, id 4690978440 — the overlay
+    // silently disappeared on every normal MCP read).
+    for key in [
+        "handle",
+        "status",
+        "note",
+        "unchanged_since_read",
+        "unchanged_ranges",
+        "lines",
+        "elided",
+        "focus_symbol",
+        "focus_line_start",
+        "focus_line_end",
+        "expand",
+        "collapsed",
+        "anchor_symbol",
+        "anchor_line_start",
+        "anchor_line_end",
+        "diagnostics",
+    ] {
+        if let Some(v) = data.get(key) {
+            out.insert(key.to_string(), v.clone());
+        }
+    }
     if let Some(ctx) = data.get("context")
         && let Some(obj) = ctx.as_object()
     {
@@ -828,11 +903,18 @@ fn trim_edit(data: &Value) -> Value {
         "affected_symbols",
         "affected_files",
         "breaking_changes",
-        "risk_level",
-        "change_count",
+        // §3.6 real-signal risk object (absent entirely for low risk)
+        "risk",
+        // §3.6 validation artifact — syntax + semantic check outcomes the
+        // model needs to judge whether the edit is safe to apply.
+        "validation",
+        "syntax",
+        "check",
         // apply-shaped
         "success",
         "changes_applied",
+        // §4.3 one-line apply echo
+        "applied_lines",
         "dry_run",
         "file_path",
         "edit_region",

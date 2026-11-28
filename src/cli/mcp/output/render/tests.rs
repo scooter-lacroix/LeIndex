@@ -89,6 +89,223 @@ fn test_pdg_enrichment_line_survives_the_transport_trim() {
     );
 }
 
+/// The alternate lookup bodies must be RENDERED, not just trimmed through.
+///
+/// `kind:"construct"` / `kind:"match"` answer with `sites`, and
+/// `kind:"tests"` answers with test targets carrying the exact command that
+/// runs each one. The renderer used to read only the relations shape, so those
+/// kinds printed symbol/file/source and none of the actual answer. This goes
+/// through the transport entry point, so a trim regression fails here too.
+#[test]
+fn test_render_symbol_lookup_renders_usage_sites_and_test_commands() {
+    use crate::cli::mcp::output::trim::trim_llm_payload;
+    let args = v(r#"{"symbol": "Shade"}"#);
+
+    let construct = trim_llm_payload(
+        "leindex_symbol_lookup",
+        &v(r#"{
+            "symbol": "Shade",
+            "file": "src/shade.rs",
+            "kind": "construct",
+            "sites": [{"file": "src/a.rs", "line": 7, "site_line": "Shade::Dark { value: 1 }", "form": "struct literal", "enclosing": "build"}],
+            "sites_total": 1,
+            "sites_truncated": false
+        }"#),
+    );
+    let s = render_tool_output("leindex.symbol-lookup", &construct, &args);
+    assert!(s.contains("src/a.rs:7"), "usage site location missing: {s}");
+    assert!(s.contains("struct literal"), "site form missing: {s}");
+    assert!(s.contains("(in build)"), "enclosing fn missing: {s}");
+
+    let tests = trim_llm_payload(
+        "leindex_symbol_lookup",
+        &v(r#"{
+            "symbol": "helper",
+            "file": "src/lib.rs",
+            "kind": "tests",
+            "tests": [{"name": "test_helper", "file": "tests/h_test.rs", "type": "test", "call_depth": 1, "evidence": "direct call", "command": "cargo test --test h_test test_helper"}],
+            "tests_total": 1,
+            "tests_truncated": false
+        }"#),
+    );
+    let s = render_tool_output("leindex.symbol-lookup", &tests, &args);
+    assert!(s.contains("test_helper"), "test name missing: {s}");
+    assert!(
+        s.contains("cargo test --test h_test test_helper"),
+        "the executable command must be rendered: {s}"
+    );
+}
+
+/// The renderer must not impose a SECOND cap under the producer's.
+///
+/// `sites_truncated` is the producer's contract and the producer already fits
+/// the list inside the response budget. A renderer-side `take(10)` dropped the
+/// eleventh site while the heading still said eleven, so the answer read as
+/// complete when it was short by one.
+#[test]
+fn test_render_usage_sites_prints_every_budgeted_site() {
+    let sites: Vec<String> = (1..=11)
+        .map(|i| format!("{{\"file\": \"src/s{i}.rs\", \"line\": {i}, \"site_line\": \"Shade {{ }}\", \"form\": \"struct literal\"}}"))
+        .collect();
+    let data = v(&format!(
+        "{{\"symbol\": \"Shade\", \"file\": \"src/shade.rs\", \"kind\": \"construct\", \
+          \"sites\": [{}], \"sites_total\": 11, \"sites_truncated\": false}}",
+        sites.join(",")
+    ));
+    let s = render_tool_output("leindex.symbol-lookup", &data, &v(r#"{"symbol":"Shade"}"#));
+    assert!(s.contains("(11)"), "the heading counts eleven: {s}");
+    for i in 1..=11 {
+        assert!(
+            s.contains(&format!("src/s{i}.rs:{i}")),
+            "site {i} was dropped from the render: {s}"
+        );
+    }
+}
+
+/// …and the same for the §6.4 tests body, whose producer reports six.
+#[test]
+fn test_render_test_targets_prints_every_budgeted_entry() {
+    let entries: Vec<String> = (1..=6)
+        .map(|i| format!("{{\"name\": \"test_{i}\", \"file\": \"tests/t{i}.rs\", \"command\": \"cargo test test_{i}\"}}"))
+        .collect();
+    let data = v(&format!(
+        "{{\"symbol\": \"helper\", \"file\": \"src/lib.rs\", \"kind\": \"tests\", \
+          \"tests\": [{}], \"tests_total\": 6, \"tests_truncated\": false}}",
+        entries.join(",")
+    ));
+    let s = render_tool_output("leindex.symbol-lookup", &data, &v(r#"{"symbol":"helper"}"#));
+    assert!(s.contains("(6)"), "the heading counts six: {s}");
+    for i in 1..=6 {
+        assert!(
+            s.contains(&format!("cargo test test_{i}")),
+            "test target {i} was dropped from the render: {s}"
+        );
+    }
+}
+
+/// A budget-page of callers must tell the client how to fetch the rest.
+///
+/// The handler pages the list and reports `callers_total` +
+/// `callers_next_offset`, and documents `caller_offset` as the way to continue.
+/// The renderer printed the page with no total and no next-page instruction, so
+/// a partial list read as the complete set and the continuation argument was
+/// unreachable from the output that described it.
+#[test]
+fn test_render_callers_print_the_continuation_offset() {
+    let data = v(r#"{
+            "symbol": "hub",
+            "type": "function",
+            "file": "src/hub.rs",
+            "callers": [{"name": "a", "file": "src/a.rs"}, {"name": "b", "file": "src/b.rs"}],
+            "callers_total": 9,
+            "callers_next_offset": 2,
+            "callers_truncated": true,
+            "callees": [],
+            "callees_truncated": false
+        }"#);
+    let s = render_tool_output("leindex.symbol-lookup", &data, &v(r#"{"symbol":"hub"}"#));
+    assert!(s.contains("a"), "callers must render: {s}");
+    assert!(
+        s.contains("showing 2 of 9"),
+        "the page size and the total must both be stated: {s}"
+    );
+    assert!(
+        s.contains("caller_offset=2"),
+        "the continuation argument must be spelled out: {s}"
+    );
+}
+
+/// `tests_truncated` must disclose the producer's total, like the usage-site
+/// notice does. "(truncated)" alone leaves the client unable to tell a budgeted
+/// list from a short one.
+#[test]
+fn test_render_truncated_tests_state_the_total() {
+    let data = v(r#"{
+            "symbol": "helper",
+            "file": "src/lib.rs",
+            "kind": "tests",
+            "tests": [{"name": "test_a", "file": "tests/a.rs", "command": "cargo test test_a"}],
+            "tests_total": 40,
+            "tests_truncated": true
+        }"#);
+    let s = render_tool_output("leindex.symbol-lookup", &data, &v(r#"{"symbol":"helper"}"#));
+    assert!(
+        s.contains("(truncated, 40 total)"),
+        "the truncation notice must state the producer total: {s}"
+    );
+}
+
+/// A truncated list with NO continuation handle must say so, not imply the rest
+/// is retrievable. The producer pages only callers; there is no
+/// `callees_next_offset` in the handler at all.
+#[test]
+fn test_render_truncated_list_without_a_handle_is_honest_about_it() {
+    let data = v(r#"{
+            "symbol": "hub",
+            "type": "function",
+            "file": "src/hub.rs",
+            "callers": [],
+            "callees": [{"name": "a", "file": "src/a.rs"}],
+            "callees_truncated": true
+        }"#);
+    let s = render_tool_output("leindex.symbol-lookup", &data, &v(r#"{"symbol":"hub"}"#));
+    assert!(
+        s.contains("no continuation handle"),
+        "the notice must not promise a continuation that does not exist: {s}"
+    );
+    assert!(
+        !s.contains("caller_offset"),
+        "no offset may be invented for a callee page: {s}"
+    );
+}
+
+/// Phase 4 states the producer's full hotspot count while printing only the
+/// ranked top five. Without a label the numbered rows read as the whole set,
+/// so the sample must announce itself.
+#[test]
+fn test_render_phase_hotspots_label_the_ranked_sample() {
+    let hotspots: Vec<String> = (1..=9)
+        .map(|i| format!("{{\"node_id\": \"hot_{i}\", \"score\": 0.{i}, \"complexity\": {i}}}"))
+        .collect();
+    let data = v(&format!(
+        "{{\"phase4\": {{\"hotspots\": [{}]}}}}",
+        hotspots.join(",")
+    ));
+    let s = render_phase_section(&data, 4, false);
+    assert!(
+        s.contains("9 hotspots"),
+        "the full count must be stated: {s}"
+    );
+    assert!(
+        s.contains("(top 5 by score)"),
+        "the printed rows must be labelled a ranked sample: {s}"
+    );
+    assert!(
+        s.contains("hot_5") && !s.contains("hot_6"),
+        "exactly the top five rows are printed: {s}"
+    );
+}
+
+/// …and when every hotspot fits, no sample label appears — there is nothing
+/// withheld to disclose.
+#[test]
+fn test_render_phase_hotspots_do_not_label_a_complete_list() {
+    let hotspots: Vec<String> = (1..=3)
+        .map(|i| format!("{{\"node_id\": \"hot_{i}\", \"score\": 0.{i}, \"complexity\": {i}}}"))
+        .collect();
+    let data = v(&format!(
+        "{{\"phase4\": {{\"hotspots\": [{}]}}}}",
+        hotspots.join(",")
+    ));
+    let s = render_phase_section(&data, 4, false);
+    assert!(s.contains("3 hotspots"), "{s}");
+    assert!(
+        !s.contains("by score"),
+        "a complete list must not claim to be a sample: {s}"
+    );
+    assert!(s.contains("hot_3"), "all rows print: {s}");
+}
+
 #[test]
 fn test_render_tree_basic() {
     let tree = v(r#"[
@@ -359,9 +576,13 @@ fn test_render_diagnostics_plain_output() {
                 },
                 "issues": [{"severity": "warning", "message": "slow"}]
             }"#);
+    // Updated alongside the boilerplate audit (brief §7 / SPEC universal
+    // rules): `PDG loaded: true` is the always-true common case and carried
+    // no information, so `render_diagnostics_health` no longer renders it.
+    // The still-informative counters (pdg_nodes/edges) stay.
     assert_eq!(
         render_diagnostics(&payload, false),
-        "── Diagnostics ──\n  Project: /repo\n  Indexed files: 2\n\n  System Health:\n    Index health: healthy\n    PDG loaded: true\n    PDG nodes: 3\n    Embedding model: model\n\n  Issues:\n    warning slow\n"
+        "── Diagnostics ──\n  Project: /repo\n  Indexed files: 2\n\n  System Health:\n    Index health: healthy\n    PDG nodes: 3\n    Embedding model: model\n\n  Issues:\n    warning slow\n"
     );
 }
 
@@ -426,16 +647,44 @@ fn test_render_impact_plain_output() {
 
 #[test]
 fn test_render_edit_metadata_plain_output() {
+    // §3.4: the token leads the text surface. §3.6: the no-information
+    // lines (`Risk level: low`, `Change count: N`, `Breaking: none`)
+    // must NOT render even when the legacy fields are present.
     let preview = v(r#"{
+                "preview_token": "tok123",
                 "affected_symbols": ["alpha"],
                 "affected_files": ["src/lib.rs"],
                 "risk_level": "low",
                 "change_count": 1,
                 "breaking_changes": ["none"]
             }"#);
+    let s = render_edit_preview(&preview, false);
     assert_eq!(
-        render_edit_preview(&preview, false),
-        "  Affected symbols: alpha\n  Affected files: src/lib.rs\n  Risk level: low\n  Change count: 1\n  Breaking: none\n"
+        s,
+        "preview_token: tok123 — apply with preview_token + project_path\n  Affected symbols: alpha\n  Affected files: src/lib.rs\n"
+    );
+    assert!(
+        !s.contains("Risk level"),
+        "no-info risk line must be gone: {s}"
+    );
+    assert!(
+        !s.contains("Change count"),
+        "no-info count line must be gone: {s}"
+    );
+    assert!(
+        !s.contains("Breaking"),
+        "no-info breaking line must be gone: {s}"
+    );
+
+    // §3.6: a real finding renders with its reason.
+    let risky = v(r#"{
+                "affected_files": ["src/lib.rs"],
+                "risk": {"level": "high", "reason": "src/lib.rs: high — pub signature changed, 14 callers"}
+            }"#);
+    let s = render_edit_preview(&risky, false);
+    assert!(
+        s.contains("risk: high — src/lib.rs: high — pub signature changed, 14 callers"),
+        "real risk must render with reason: {s}"
     );
 
     let rename = v(r#"{
@@ -448,6 +697,47 @@ fn test_render_edit_metadata_plain_output() {
     assert_eq!(
         render_rename_symbol(&rename, false),
         "  Rename: alpha → beta\n  Files affected: 2\n  Additional diffs: 1 more (not shown)\n  Preview only: changes not applied\n"
+    );
+}
+
+#[test]
+fn test_render_edit_preview_renders_requested_validation() {
+    // §3.6/§6.x: when the handler includes a validation artifact, the
+    // renderer surfaces it — a "valid" summary or the concrete failures.
+    let valid = v(r#"{
+            "preview_token": "tok123",
+            "affected_files": ["src/lib.rs"],
+            "validation": {
+                "is_valid": true,
+                "syntax_errors": [],
+                "reference_issues": [],
+                "semantic_drift": []
+            }
+        }"#);
+    let s = render_edit_preview(&valid, false);
+    assert!(
+        s.contains("  Validation: valid"),
+        "valid validation must render: {s}"
+    );
+
+    let invalid = v(r#"{
+            "preview_token": "tok123",
+            "affected_files": ["src/lib.rs"],
+            "validation": {
+                "is_valid": false,
+                "syntax_errors": [{"line": 3, "column": 1, "message": "expected `;`"}],
+                "reference_issues": [{"message": "undefined symbol `foo`"}],
+                "semantic_drift": []
+            }
+        }"#);
+    let s = render_edit_preview(&invalid, false);
+    assert!(
+        s.contains("Validation: syntax: expected `;`"),
+        "syntax failure must render: {s}"
+    );
+    assert!(
+        s.contains("Validation: reference: undefined symbol `foo`"),
+        "reference failure must render: {s}"
     );
 }
 
@@ -879,4 +1169,244 @@ fn test_render_search_surfaces_system_one_footer() {
     }"#);
     let s2 = render_tool_output("leindex.search", &clean_payload, &args);
     assert!(!s2.contains("System-One:"), "footer leaked: {}", s2);
+}
+
+/// Brief §3.3 regression: a FRESH index must cost zero footer bytes. The old
+/// renderer emitted `\nFreshness: status=fresh, generation=N\n` on every
+/// response — per-call boilerplate the caller never asked for; the structured
+/// `_meta.freshness` badge already carries the same facts for machine readers.
+#[test]
+fn test_fresh_payload_renders_zero_footer_bytes() {
+    let args = v(r#"{"query": "foo"}"#);
+    let payload = v(r#"{
+        "count": 1,
+        "results": [{"file_path": "/p.rs", "symbol_name": "f", "score": 0.5}],
+        "_meta": {"freshness": {"generation": 695, "status": "fresh"}}
+    }"#);
+    let s = render_tool_output("leindex.search", &payload, &args);
+    assert!(!s.contains("[index:"), "fresh must render no footer: {s}");
+    assert!(
+        !s.contains("Freshness:"),
+        "the old Freshness line must stay gone: {s}"
+    );
+    assert!(
+        !s.contains("Advisory:"),
+        "fresh must never carry an advisory: {s}"
+    );
+}
+
+/// Brief §3.2 regression: a genuinely stale payload renders exactly ONE
+/// compact header-style line (plus the advisory when present), and the line
+/// never recommends `force_reindex` — the incremental `leindex_manage
+/// action=index` advisory text is the documented refresh path.
+#[test]
+fn test_stale_payload_renders_one_line_without_force() {
+    let args = v(r#"{"query": "foo"}"#);
+    let payload = v(r#"{
+        "count": 1,
+        "results": [{"file_path": "/p.rs", "symbol_name": "f", "score": 0.5}],
+        "_meta": {"freshness": {
+            "generation": 695,
+            "status": "stale",
+            "changed_unindexed_count": 3
+        }}
+    }"#);
+    let s = render_tool_output("leindex.search", &payload, &args);
+    assert!(
+        s.contains("\n[index: stale gen=695 changed=3]\n"),
+        "stale must render the one compact line: {s}"
+    );
+    assert_eq!(
+        s.matches("[index:").count(),
+        1,
+        "exactly one footer line, not a block: {s}"
+    );
+    assert!(
+        !s.contains("Freshness:"),
+        "the old Freshness line must stay gone: {s}"
+    );
+    // No advisory in the payload -> no advisory line, and no stale advisory
+    // text anywhere.
+    assert!(!s.contains("Advisory:"), "no advisory, no line: {s}");
+    assert!(
+        !s.contains("force"),
+        "the text surface must never say force: {s}"
+    );
+    assert!(
+        !s.contains(crate::cli::mcp::helpers::STALE_ADVISORY),
+        "a payload without an advisory must not grow one: {s}"
+    );
+}
+
+/// N-11: the `status_note` clarifier lives on the structured badge only; the
+/// fresh status means the renderer emits no footer at all, so the note can
+/// never reach the text surface as per-call boilerplate.
+#[test]
+fn test_n11_status_note_never_reaches_the_text_surface() {
+    let args = v(r#"{"query": "foo"}"#);
+    let payload = v(r#"{
+        "count": 1,
+        "results": [{"file_path": "/p.rs", "symbol_name": "f", "score": 0.5}],
+        "_meta": {"freshness": {
+            "generation": 2,
+            "status": "fresh",
+            "changed_unindexed_count": 1,
+            "status_note": "fresh = the last index run completed; 1 file(s) changed in the worktree since then"
+        }}
+    }"#);
+    let s = render_tool_output("leindex.search", &payload, &args);
+    assert!(
+        !s.contains("status_note"),
+        "the N-11 note must stay in _meta: {s}"
+    );
+    assert!(
+        !s.contains("changed in the worktree"),
+        "no per-call clarifier prose: {s}"
+    );
+    assert!(!s.contains("[index:"), "fresh: no footer at all: {s}");
+}
+
+/// §6.6 overlay: compact `file:line severity code message-first-line` lines
+/// for the diagnostics attached to a read.
+#[test]
+fn test_render_read_file_renders_attached_diagnostics_compact() {
+    let data = v(r#"{
+        "file_path": "/p/src/lib.rs",
+        "start_line": 1,
+        "end_line": 5,
+        "language": "rust",
+        "content": "1 fn a() {}\n2 fn b() {}\n",
+        "diagnostics": [
+            {"file": "/p/src/lib.rs", "line": 2, "severity": "error", "code": "E0308", "message": "mismatched types\nhelp: a hint"},
+            {"file": "/p/src/lib.rs", "line": 4, "severity": "warning", "code": null, "message": "unused variable"}
+        ]
+    }"#);
+    let s = render_tool_output("leindex.read_file", &data, &serde_json::json!({}));
+    assert!(
+        s.contains("/p/src/lib.rs:2 error E0308 mismatched types"),
+        "{s}"
+    );
+    assert!(s.contains("/p/src/lib.rs:4 warning unused variable"), "{s}");
+    assert!(
+        !s.contains("help: a hint"),
+        "only the first message line may render: {s}"
+    );
+}
+
+/// The overlay must cost zero bytes when a read has no diagnostics.
+#[test]
+fn test_render_read_file_emits_nothing_without_diagnostics() {
+    let data = v(r#"{
+        "file_path": "/p/src/lib.rs",
+        "start_line": 1,
+        "end_line": 5,
+        "content": "1 fn a() {}\n"
+    }"#);
+    let s = render_tool_output("leindex.read_file", &data, &serde_json::json!({}));
+    assert!(!s.contains("Diagnostics"), "{s}");
+}
+
+/// A paged project map must show its continuation on the default (text)
+/// tier too: the payload carries `next`/`next_offset`, and a client that
+/// renders text could otherwise never resume past the first page.
+#[test]
+fn test_render_project_map_shows_the_continuation_token() {
+    let data = v(r#"{
+        "project_root": "/p",
+        "scope": "/p",
+        "total_files_in_scope": 12,
+        "offset": 0,
+        "count": 2,
+        "has_more": true,
+        "next_offset": 2,
+        "next": "tok-123",
+        "files": [{"relative_path": "a.rs", "symbol_count": 1}]
+    }"#);
+    let s = render_tool_output("leindex.project_map", &data, &Value::Null);
+    assert!(s.contains("… more files: offset=2 next=tok-123"), "{s}");
+
+    // No continuation line when the page is complete.
+    let complete = v(r#"{
+        "project_root": "/p",
+        "scope": "/p",
+        "total_files_in_scope": 1,
+        "offset": 0,
+        "count": 1,
+        "has_more": false,
+        "files": [{"relative_path": "a.rs", "symbol_count": 1}]
+    }"#);
+    let s = render_tool_output("leindex.project_map", &complete, &Value::Null);
+    assert!(!s.contains("more files"), "{s}");
+}
+
+/// §4.3/§3.6: requested post-apply validation echoes (`validate:"syntax"` / `validate:"check"`)
+/// ride on every changed-file response. The applied-lines echo must not hide them: a validated
+/// edit that failed its check must render its failure, not look identical to a clean one
+/// (Codex round 1, id 4653371664).
+#[test]
+fn test_render_edit_apply_renders_requested_validation_echoes() {
+    let data = v(r#"{
+        "success": true,
+        "changes_applied": 1,
+        "applied_lines": ["Applied: src/a.rs:L1-5 (+4/-0) in fn a"],
+        "syntax": [
+            {"path": "src/a.rs", "summary": "1 error(s): 3:1 ERROR", "errors": ["3:1 ERROR"]}
+        ],
+        "check": {
+            "files": [
+                {"file": "src/a.rs", "exit_code": 1, "headline": "error[E0308]: mismatched types", "error_count": 2, "failures": [], "warning_counts": {}}
+            ]
+        }
+    }"#);
+    let s = render_edit_apply(&data, false);
+    assert!(s.contains("Applied: src/a.rs:L1-5 (+4/-0) in fn a"), "{s}");
+    assert!(
+        s.contains("Syntax src/a.rs: 1 error(s): 3:1 ERROR"),
+        "syntax outcome must render: {s}"
+    );
+    assert!(
+        s.contains("Check src/a.rs: error[E0308]: mismatched types (2 errors)"),
+        "check outcome must render: {s}"
+    );
+    assert!(s.contains("error[E0308]"), "{s}");
+}
+
+/// Without the validation keys the apply echo gains no extra lines.
+#[test]
+fn test_render_edit_apply_validation_echoes_are_absent_without_request() {
+    let data = v(r#"{
+        "success": true,
+        "changes_applied": 1,
+        "applied_lines": ["Applied: src/a.rs:L1-5 (+4/-0) in fn a"]
+    }"#);
+    let s = render_edit_apply(&data, false);
+    assert!(s.contains("Applied: src/a.rs:L1-5 (+4/-0) in fn a"), "{s}");
+    assert!(!s.contains("Syntax "), "{s}");
+    assert!(!s.contains("Check "), "{s}");
+}
+
+/// The syntax-validation echo must survive the L1 transport chain with the
+/// handler's REAL field name. `attach_syntax_validation` emits `{ path,
+/// summary, errors }`; an earlier renderer required `display_path`, so even a
+/// failing validated edit rendered only its success echo on the default MCP
+/// path. This test feeds a handler-shaped payload through trim → render, the
+/// exact route the LLM sees (Codex round 9).
+#[test]
+fn test_render_edit_apply_validation_echoes_survive_the_l1_transport_chain() {
+    use crate::cli::mcp::output::trim::trim_llm_payload;
+    let raw = v(r#"{
+        "success": true,
+        "changes_applied": 1,
+        "applied_lines": ["Applied: src/a.rs:L1-5 (+4/-0) in fn a"],
+        "syntax": [
+            {"path": "src/a.rs", "summary": "1 error(s): 3:1 ERROR", "errors": ["3:1 ERROR"]}
+        ]
+    }"#);
+    let trimmed = trim_llm_payload("leindex_edit_apply", &raw);
+    let s = render_tool_output_plain("leindex_edit_apply", &trimmed, &Value::Null);
+    assert!(
+        s.contains("Syntax src/a.rs: 1 error(s): 3:1 ERROR"),
+        "the syntax failure must reach the rendered payload: {s}"
+    );
+    assert!(s.contains("Applied: src/a.rs:L1-5 (+4/-0) in fn a"), "{s}");
 }

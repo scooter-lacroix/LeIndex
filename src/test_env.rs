@@ -52,3 +52,37 @@ impl EnvLock {
         ENV_LOCK.lock()
     }
 }
+
+/// Environment variable naming the REAL project root inside a re-run child.
+pub const SELF_TEST_PROJECT_ROOT: &str = "LEINDEX_SELF_TEST_PROJECT_ROOT";
+
+/// Environment variable naming the DECOY repository inside a re-run child.
+pub const SELF_TEST_DECOY_ROOT: &str = "LEINDEX_SELF_TEST_DECOY_ROOT";
+
+/// Re-run the test named `test_name` in a FRESH process, with `vars` set in
+/// that CHILD's environment only, and return the child's own harness output.
+///
+/// Why this exists at all: [`EnvLock`] serialises tests that MUTATE the
+/// environment, but it cannot serialise the READERS. Unrelated threads keep
+/// calling `getenv` — Rust's own runtime, native libraries, and every child
+/// process another test spawns — and Rust 1.88 documents concurrent
+/// `set_var`/`remove_var` as undefined behaviour precisely because of them.
+/// A lock around the writers does not fix a concurrent reader, so a test that
+/// needs a poisoned environment must not poison the runner's.
+///
+/// `Command::env` gives the child its own environment, so the assertions run
+/// against exactly the poisoned values while this process is never written to
+/// and nothing has to be restored afterwards. `output()` captures the child's
+/// report, so an assertion that fails inside the child fails the parent.
+pub fn run_self_test_with_env(
+    test_name: &str,
+    vars: &[(&str, &std::ffi::OsStr)],
+) -> std::process::Output {
+    let exe = std::env::current_exe().expect("the test binary path");
+    let mut command = std::process::Command::new(exe);
+    command.args(["--exact", test_name, "--test-threads=1"]);
+    for (key, value) in vars {
+        command.env(key, value);
+    }
+    command.output().expect("re-running this test in a child")
+}

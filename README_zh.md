@@ -4,11 +4,11 @@
 
 <img src="leindex.jpeg" alt="LeIndex" width="600"/>
 
-[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange?style=for-the-badge&logo=rust)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.89%2B-orange?style=for-the-badge&logo=rust)](https://www.rust-lang.org/)
 [![MCP Server](https://img.shields.io/badge/MCP-Server-blue?style=for-the-badge)](https://modelcontextprotocol.io)
 [![Tests](https://img.shields.io/badge/Tests-339%2F339-passing-success?style=for-the-badge)](https://github.com/scooter-lacroix/leindex)
 [![License](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-0.1.0-blue?style=for-the-badge)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/Version-2.2.0-blue?style=for-the-badge)](CHANGELOG.md)
 
 **纯 Rust 代码搜索与分析引擎**
 
@@ -52,7 +52,7 @@ LeIndex 由 5 个生产可用 Rust crate 组成：
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────────┐
-│                             LeIndex v0.1.0 Architecture                                 │
+│                             LeIndex 2.2.0 Architecture                                 │
 ├─────────────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                         │
 │  ┌──────────────────────┐  ┌──────────────────────┐                                     │
@@ -112,7 +112,7 @@ LeIndex 由 5 个生产可用 Rust crate 组成：
 
 ### 前置要求
 
-- **Rust 1.75+**（通过 [rustup.rs](https://rustup.rs/) 安装）
+- **Rust 1.89+**（通过 [rustup.rs](https://rustup.rs/) 安装）
 - **Cargo**（随 Rust 一起安装）
 
 ### 安装（推荐并列方式）
@@ -149,7 +149,7 @@ cargo build --release --bins
 
 ```bash
 leindex --version
-# Output: LeIndex 0.1.0
+# Output: leindex 2.2.0
 ```
 
 ### 基本使用

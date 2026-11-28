@@ -31,6 +31,20 @@ enum Commands {
         #[arg(long)]
         update_baseline: bool,
     },
+    /// Run the token-efficiency benchmark harness (native vs LeIndex).
+    ///
+    /// Delegates to the primary `tokbench` crate (`tools/tokbench`): a
+    /// pinned 7-task corpus replayed against byte-faithful native tool
+    /// emulations and the LeIndex MCP handlers in-process, counted with the
+    /// real embedder tokenizer. The former in-xtask 6-task/chars-4 harness
+    /// is superseded by it (TOK-BENCH-001 now lives at tools/tokbench).
+    /// Extra arguments (e.g. `--output report.json`) pass through; the
+    /// release gate is `cargo xtask tokbench gate`.
+    Tokbench {
+        /// Arguments forwarded verbatim to the tokbench binary.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 /// Workspace root — xtask lives at `<root>/tools/xtask`.
@@ -50,11 +64,29 @@ fn main() -> Result<()> {
 
     match args.command {
         Some(Commands::Memcheck { update_baseline }) => run_memcheck(update_baseline),
+        Some(Commands::Tokbench { args }) => run_tokbench_delegated(&args),
         None => {
             Args::parse_from(["xtask", "--help"]);
             Ok(())
         }
     }
+}
+
+/// Delegate `cargo xtask tokbench` to the primary `tokbench` crate so there
+/// is exactly one harness (tools/tokbench) behind the entrypoint.
+fn run_tokbench_delegated(args: &[String]) -> Result<()> {
+    let root = workspace_root()?;
+    let status = Command::new("cargo")
+        .arg("run")
+        .args(["-p", "tokbench", "--"])
+        .args(args)
+        .current_dir(&root)
+        .status()
+        .context("failed to run tokbench")?;
+    if !status.success() {
+        anyhow::bail!("tokbench exited with {}", status);
+    }
+    Ok(())
 }
 
 fn run_memcheck(update_baseline: bool) -> Result<()> {
